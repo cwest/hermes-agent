@@ -1737,6 +1737,100 @@ def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     assert reason is None
 
 
+# ---------------------------------------------------------------------------
+# Review tasks bypass the dup-PR guards (recent_success / active_pr) but a
+# build-lane task in the same shape must still be guarded. The invariant being
+# asserted: review spawns are never wedged by the build-only dup-PR guards,
+# while build spawns keep that protection. (rate_limit_cooldown / blocker_auth
+# are orthogonal and still apply to both — covered by the tests above.)
+# ---------------------------------------------------------------------------
+
+def test_respawn_guard_review_bypasses_active_pr_build_does_not(kanban_home):
+    """A PR-URL comment guards a build (ready) task but not a review task.
+
+    Same task, same comment — only the status differs. The reviewer never
+    opens a PR, so the active_pr guard must not apply to it; the builder
+    might re-open a duplicate PR, so the guard must still apply.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="pr-shipped", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+
+        # Build lane: dup-PR protection intact.
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (t,))
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+        # Review lane: same PR comment, guard bypassed.
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (t,))
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_review_bypasses_recent_success_build_does_not(kanban_home):
+    """A recent completed run guards a build (ready) task but not a review task.
+
+    The build run that produced the artifact under review IS a recent
+    completed run; without the bypass it would lock the reviewer out for
+    the whole success window.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="build-done", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+
+        # Build lane: recent_success guard intact.
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (t,))
+        assert kb.check_respawn_guard(conn, t) == "recent_success"
+
+        # Review lane: same completed run, guard bypassed.
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (t,))
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_review_with_pr_and_success_returns_none(kanban_home):
+    """Acceptance shape: a review task with BOTH a PR comment and a recent
+    completed run returns None (both dup-PR guards bypassed), while the same
+    task on the build lane is still guarded."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review-me", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        kb.add_comment(
+            conn, t, "worker",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+
+        # Build lane: still guarded (recent_success fires first, before active_pr).
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (t,))
+        assert kb.check_respawn_guard(conn, t) is not None
+
+        # Review lane: fully unguarded — reviewer can spawn.
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (t,))
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_review_still_honors_blocker_auth(kanban_home):
+    """Review status bypasses the dup-PR guards but NOT the auth blocker —
+    a rate-limited / auth-blocked reviewer should still defer."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review-but-authwall", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET status = 'review', last_failure_error = ? WHERE id = ?",
+            ("Authentication failed: invalid credentials", t),
+        )
+        assert kb.check_respawn_guard(conn, t) == "blocker_auth"
+
+
 def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
     kanban_home, all_assignees_spawnable
 ):
