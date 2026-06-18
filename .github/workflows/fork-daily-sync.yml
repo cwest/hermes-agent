@@ -12,9 +12,11 @@ name: Fork Daily Sync
 #      merged and shipped in the new base is dropped (scripts/fork_retire_patches.py).
 #   5. Runs the full suite the same way upstream CI does — per-file isolation
 #      via scripts/run_tests.sh, integration tests excluded.
-#   6. On a clean run, opens a pull request for human review. It never merges.
+#   6. Secret-scans the carried patch stack (gitleaks). No secrets reach the
+#      fork — ever — so a finding fails the run before anything is pushed.
+#   7. On a clean run, opens a pull request for human review. It never merges.
 #      This is the whole point: a person decides when the fork moves.
-#   7. On a rebase conflict or a test failure, opens (or updates) a tracking
+#   8. On a rebase conflict or a test failure, opens (or updates) a tracking
 #      issue instead, so the breakage is visible and nothing silently stalls.
 #
 # What it deliberately does NOT do:
@@ -57,6 +59,11 @@ env:
   UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
   ISSUE_LABEL: fork-sync
   ISSUE_TITLE_PREFIX: '[fork-sync]'
+  # Secret scanner used by the gate below. Pinned to a release version and
+  # verified against the published SHA-256, like the ripgrep install further
+  # down. Keep this in step with .github/workflows/fork-secret-scan.yml.
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
 
 jobs:
   sync:
@@ -238,6 +245,45 @@ jobs:
             echo "PATCHES.md unchanged — no patches retired this cycle."
           fi
 
+      - name: Secret-scan the carried patch stack (gate)
+        id: secrets
+        if: steps.already.outputs.skip != 'true' && steps.rebase.outputs.rebase_ok == 'true'
+        # No secrets in the fork — ever. Before this sync can become a pushable
+        # branch and a review PR, the rebased patch stack is scanned for anything
+        # secret-shaped. A finding fails the run here, which means no push and no
+        # PR: the secret never reaches a branch others can see. The scan is
+        # scoped to base-tag..HEAD, i.e. our carried commits including the
+        # PATCHES.md reconciliation just made, and not upstream history.
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          curl -sSfL -o "$tarball" "$url"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" gitleaks
+          chmod +x gitleaks
+          rm -f "$tarball"
+          ./gitleaks version
+
+          # After the rebase, our carried commits sit directly on top of the new
+          # base tag, so that tag is the fork point. Scanning tag..HEAD covers
+          # exactly our replayed patch stack plus the PATCHES.md reconciliation
+          # commit, and nothing from upstream history.
+          new_base="${{ steps.tag.outputs.tag }}"
+          echo "Scanning carried patch stack ${new_base}..HEAD for secrets."
+          git log --oneline "refs/tags/${new_base}..HEAD" || true
+          if ! ./gitleaks git . \
+              --redact \
+              --report-format sarif \
+              --report-path /tmp/gitleaks-sync.sarif \
+              --verbose \
+              --exit-code 1 \
+              --log-opts="refs/tags/${new_base}..HEAD"; then
+            echo "::error::Secret scan found secret-shaped content in the carried patch stack. Refusing to push or open a PR."
+            exit 1
+          fi
+          echo "Secret scan clean — safe to proceed."
+
       - name: Install ripgrep (prebuilt binary)
         if: steps.already.outputs.skip != 'true' && steps.rebase.outputs.rebase_ok == 'true'
         run: |
@@ -289,6 +335,7 @@ jobs:
         if: >-
           steps.already.outputs.skip != 'true' &&
           steps.rebase.outputs.rebase_ok == 'true' &&
+          steps.secrets.outcome == 'success' &&
           steps.tests.outcome == 'success' &&
           github.event.inputs.dry_run != 'true'
         run: |
@@ -300,6 +347,7 @@ jobs:
         if: >-
           steps.already.outputs.skip != 'true' &&
           steps.rebase.outputs.rebase_ok == 'true' &&
+          steps.secrets.outcome == 'success' &&
           steps.tests.outcome == 'success' &&
           github.event.inputs.dry_run != 'true'
         env:
@@ -416,6 +464,7 @@ jobs:
             echo "- Newest tag: \`${{ steps.tag.outputs.tag }}\`"
             echo "- Already current: \`${{ steps.already.outputs.skip }}\`"
             echo "- Rebase clean: \`${{ steps.rebase.outputs.rebase_ok }}\`"
+            echo "- Secret scan: \`${{ steps.secrets.outcome }}\`"
             echo "- Tests: \`${{ steps.tests.outcome }}\`"
             echo "- Dry run: \`${{ github.event.inputs.dry_run }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
