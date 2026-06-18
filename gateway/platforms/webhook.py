@@ -457,6 +457,28 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        # Check action filter (e.g. gate a pull_request route to just
+        # opened/reopened/synchronize so a single human operation doesn't
+        # spawn a run on every action GitHub emits).
+        #
+        # Fail-open on a missing/empty action: the `and action` clause means a
+        # delivery whose payload carries no `action` field is processed rather
+        # than ignored, even when an allow-list is configured. Real GitHub
+        # pull_request deliveries always carry an action; dropping an event we
+        # cannot classify would be worse than processing it.
+        allowed_actions = route_config.get("actions", [])
+        action = payload.get("action", "")
+        if allowed_actions and action and action not in allowed_actions:
+            logger.debug(
+                "[webhook] Ignoring action %s for route %s (allowed: %s)",
+                action,
+                route_name,
+                allowed_actions,
+            )
+            return web.json_response(
+                {"status": "ignored", "action": action}
+            )
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
