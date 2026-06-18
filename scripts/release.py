@@ -114,6 +114,7 @@ AUTHOR_MAP = {
     "github@aldo.pw": "aldoeliacim",
     "max@c60spaceship.com": "MaxFreedomPollard",
     "achaljhawar03@gmail.com": "achaljhawar",
+    "casey@geeknest.com": "cwest",
     "claytonchew@ClaytonMacMiniM4.local": "claytonchew",
     "hbentel@gmail.com": "hbentel",
     "JustinBao@outlook.com": "justinbao19",
