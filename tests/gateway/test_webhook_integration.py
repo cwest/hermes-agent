@@ -144,6 +144,152 @@ class TestGitHubPRWebhook:
 
 
 # ===================================================================
+# Test 1b: Action filter
+# ===================================================================
+
+class TestActionFilter:
+    """A route may declare an ``actions`` allow-list to gate which payload
+    actions trigger a run. This prevents a route subscribed to a whole event
+    (e.g. ``pull_request``) from firing on every action GitHub emits for one
+    human operation (opened, closed, reopened, synchronize, ...)."""
+
+    async def _post(self, routes, action):
+        """POST a PR payload with the given action; return (resp_json, events)."""
+        secret = "gh-webhook-test-secret"
+        adapter = _make_adapter(routes)
+
+        captured_events: list[MessageEvent] = []
+
+        async def _capture(event: MessageEvent):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+
+        app = _create_app(adapter)
+        payload = {**GITHUB_PR_PAYLOAD, "action": action}
+        body = json.dumps(payload).encode()
+        sig = _github_signature(body, secret)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/github-pr",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-GitHub-Event": "pull_request",
+                    "X-Hub-Signature-256": sig,
+                    "X-GitHub-Delivery": f"gh-delivery-{action}",
+                },
+            )
+            data = await resp.json()
+
+        # Let any asyncio.create_task fire
+        await asyncio.sleep(0.05)
+        return data, captured_events
+
+    @pytest.mark.asyncio
+    async def test_disallowed_action_is_ignored(self):
+        """An action absent from the allow-list is dropped before dispatch."""
+        routes = {
+            "github-pr": {
+                "secret": "gh-webhook-test-secret",
+                "events": ["pull_request"],
+                "actions": ["opened", "reopened", "synchronize"],
+                "prompt": "Review PR #{number}",
+                "deliver": "log",
+            }
+        }
+        data, events = await self._post(routes, "closed")
+        assert data["status"] == "ignored"
+        assert data["action"] == "closed"
+        assert len(events) == 0
+
+    @pytest.mark.asyncio
+    async def test_allowed_action_passes(self):
+        """An action on the allow-list passes through to dispatch."""
+        routes = {
+            "github-pr": {
+                "secret": "gh-webhook-test-secret",
+                "events": ["pull_request"],
+                "actions": ["opened", "reopened", "synchronize"],
+                "prompt": "Review PR #{number}",
+                "deliver": "log",
+            }
+        }
+        for action in ("opened", "synchronize"):
+            data, events = await self._post(routes, action)
+            assert data["status"] == "accepted", action
+            assert len(events) == 1, action
+
+    @pytest.mark.asyncio
+    async def test_no_actions_filter_allows_all(self):
+        """With no ``actions`` configured, every action passes (backward-compat)."""
+        routes = {
+            "github-pr": {
+                "secret": "gh-webhook-test-secret",
+                "events": ["pull_request"],
+                "prompt": "Review PR #{number}",
+                "deliver": "log",
+            }
+        }
+        for action in ("opened", "closed", "reopened"):
+            data, events = await self._post(routes, action)
+            assert data["status"] == "accepted", action
+            assert len(events) == 1, action
+
+    @pytest.mark.asyncio
+    async def test_missing_action_fails_open(self):
+        """A delivery with no ``action`` field is processed even when an
+        allow-list is set (fail-open). Real GitHub pull_request deliveries
+        always carry an action; dropping an unclassifiable event would be worse
+        than processing it. This pins the ``and action`` clause of the guard so
+        a future tightening to ``action not in allowed_actions`` can't silently
+        start dropping action-less deliveries."""
+        secret = "gh-webhook-test-secret"
+        routes = {
+            "github-pr": {
+                "secret": secret,
+                "events": ["pull_request"],
+                "actions": ["opened", "reopened", "synchronize"],
+                "prompt": "Review PR #{number}",
+                "deliver": "log",
+            }
+        }
+        adapter = _make_adapter(routes)
+
+        captured_events: list[MessageEvent] = []
+
+        async def _capture(event: MessageEvent):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+
+        app = _create_app(adapter)
+        # Payload with the action key removed entirely.
+        payload = {k: v for k, v in GITHUB_PR_PAYLOAD.items() if k != "action"}
+        assert "action" not in payload
+        body = json.dumps(payload).encode()
+        sig = _github_signature(body, secret)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/github-pr",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-GitHub-Event": "pull_request",
+                    "X-Hub-Signature-256": sig,
+                    "X-GitHub-Delivery": "gh-delivery-no-action",
+                },
+            )
+            data = await resp.json()
+
+        await asyncio.sleep(0.05)
+        assert data["status"] == "accepted"
+        assert len(captured_events) == 1
+
+
+# ===================================================================
 # Test 2: Skills injected into prompt
 # ===================================================================
 
