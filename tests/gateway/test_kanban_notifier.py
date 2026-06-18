@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 
 
@@ -39,7 +40,7 @@ def _make_runner(adapter):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
-    runner._kanban_sub_fail_counts = {}
+    runner._kanban_sub_fail_states = {}
     return runner
 
 
@@ -114,7 +115,7 @@ def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypa
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = DisconnectedAdapters({Platform.TELEGRAM: RecordingAdapter()})
-    runner._kanban_sub_fail_counts = {}
+    runner._kanban_sub_fail_states = {}
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
@@ -148,6 +149,19 @@ class FailingAdapter:
         raise RuntimeError("simulated send failure")
 
 
+class FalseResultAdapter:
+    """Adapter whose send() reports failure without raising."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    async def send(self, chat_id, text, metadata=None):
+        from gateway.platforms.base import SendResult
+
+        self.attempts += 1
+        return SendResult(success=False, error="simulated false result")
+
+
 def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     """A raising adapter rewinds the claim so the next tick can retry.
 
@@ -171,6 +185,131 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     # still returns the event for retry on the next tick.
     assert adapter.attempts >= 1, "send should have been attempted at least once"
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_rewinds_claim_on_send_false_result(tmp_path, monkeypatch):
+    """A SendResult(success=False) is a failed delivery, not a delivered ping.
+
+    Some platform adapters surface API-level delivery failures as a
+    SendResult instead of raising. The notifier must treat that exactly like
+    an exception: keep the subscription and rewind the pre-send claim so the
+    blocked/completed event is retryable instead of silently consumed.
+    """
+    db_path = tmp_path / "send-false-result.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = FalseResultAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.attempts >= 1, "send should have been attempted at least once"
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_keeps_subscription_after_repeated_send_failures(tmp_path, monkeypatch):
+    """Repeated failures must not silently unsubscribe a terminal notification.
+
+    Dropping the subscription after retries leaves the human with no visible
+    blocked/completed notification and no future retry path. Keep it and leave
+    the event unseen so delivery recovers when the adapter/chat recovers.
+    """
+    db_path = tmp_path / "send-repeated-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = FailingAdapter()
+    runner = _make_runner(adapter)
+
+    for _ in range(3):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+
+    assert adapter.attempts >= 3
+    assert len(subs) == 1
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_backs_off_after_repeated_send_failures(tmp_path, monkeypatch):
+    """After MAX_SEND_FAILURES, ticks inside the backoff window skip the send.
+
+    Without backoff a permanently dead chat (bot kicked, channel deleted)
+    would burn an adapter.send call and a warning log line every tick,
+    forever. The backoff window suppresses the attempt entirely — no claim,
+    no rewind, no log — while keeping the subscription and the unseen event
+    so delivery still recovers if the chat comes back.
+    """
+    db_path = tmp_path / "send-backoff.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = FailingAdapter()
+    runner = _make_runner(adapter)
+
+    # Burn through the transient-failure budget (MAX_SEND_FAILURES = 3).
+    for _ in range(3):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.attempts == 3
+
+    sub_key = (tid, "telegram", "chat-1", "")
+    state = runner._kanban_sub_fail_states[sub_key]
+    assert state["fails"] == 3
+    assert state["next_retry_at"] > time.monotonic()
+
+    # Ticks inside the backoff window must not attempt the send at all.
+    for _ in range(2):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.attempts == 3, "backoff window should suppress send attempts"
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+    # Once the window expires, retry resumes and backoff grows.
+    state["next_retry_at"] = time.monotonic() - 1
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.attempts == 4
+    assert runner._kanban_sub_fail_states[sub_key]["fails"] == 4
+
+
+def test_kanban_notifier_recovers_after_backoff_when_chat_comes_back(tmp_path, monkeypatch):
+    """A send success during a backoff retry delivers and clears the state."""
+    db_path = tmp_path / "send-backoff-recovery.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    failing = FailingAdapter()
+    runner = _make_runner(failing)
+    for _ in range(3):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    sub_key = (tid, "telegram", "chat-1", "")
+    assert runner._kanban_sub_fail_states[sub_key]["fails"] == 3
+
+    # Chat recovers: swap in a working adapter and expire the window.
+    recording = RecordingAdapter()
+    runner.adapters = {Platform.TELEGRAM: recording}
+    runner._kanban_sub_fail_states[sub_key]["next_retry_at"] = time.monotonic() - 1
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(recording.sent) == 1
+    assert tid in recording.sent[0]["text"]
+    assert sub_key not in runner._kanban_sub_fail_states
+    assert _unseen_terminal_events(tid) == []
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
