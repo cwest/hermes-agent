@@ -3619,6 +3619,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
 ):
     """Corrupt board DBs log one actionable error and stop retrying per tick."""
     import asyncio
+    import concurrent.futures
     import logging
     import sqlite3
 
@@ -3638,6 +3639,10 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
             "kanban": {
                 "dispatch_in_gateway": True,
                 "dispatch_interval_seconds": 1,
+                # Not exercising auto-decompose here; keep the offload stream to
+                # reaper + _tick_once + _ready_nonempty so the monotonic/connect
+                # call accounting below stays stable.
+                "auto_decompose": False,
             }
         },
     )
@@ -3653,7 +3658,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     )
     monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
 
-    calls = {"connect": 0, "to_thread": 0}
+    calls = {"connect": 0, "offload": 0}
 
     def _connect(*args, **kwargs):
         calls["connect"] += 1
@@ -3665,25 +3670,36 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
             )
         raise sqlite3.DatabaseError("file is not a database")
 
-    async def _to_thread(fn, *args, **kwargs):
-        # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
-        # the top of each tick via ``asyncio.to_thread(_kb.reap_worker_zombies)``
-        # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
-        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
-        # so this counter must reach 6 to allow the same 2 dispatch ticks the
-        # pre-reaper test expected at 4. Connect counts in the assertion below
-        # are unchanged.
-        calls["to_thread"] += 1
-        result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 6:
-            runner._running = False
-        return result
+    # The dispatcher now offloads its blocking work to a dedicated executor
+    # (not the shared default pool / asyncio.to_thread) to avoid agent-turn
+    # starvation. Drive the loop by stubbing that executor: run each submitted
+    # job synchronously, count it, and stop after 2 full ticks (3 offloads/tick
+    # with auto_decompose off → 6).
+    class _SyncExecutor:
+        def __init__(self, *a, **k):
+            pass
+
+        def submit(self, fn, *args, **kwargs):
+            calls["offload"] += 1
+            fut: concurrent.futures.Future = concurrent.futures.Future()
+            try:
+                fut.set_result(fn(*args, **kwargs))
+            except BaseException as exc:  # noqa: BLE001 — propagate to awaiter
+                fut.set_exception(exc)
+            if calls["offload"] >= 6:
+                runner._running = False
+            return fut
+
+        def shutdown(self, *a, **k):
+            pass
 
     async def _sleep(_delay):
         return None
 
     monkeypatch.setattr(_kb, "connect", _connect)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr(
+        "gateway.run.concurrent.futures.ThreadPoolExecutor", _SyncExecutor
+    )
     monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
 
     with caplog.at_level(logging.ERROR, logger="gateway.run"):
@@ -3698,13 +3714,18 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # Connect accounting across the two ticks the stub allows (it stops the
+    # loop after 6 offloads = 2 ticks × 3 offloads):
+    #   tick 1 `_tick_once`  → _kb.connect raises (corrupt) → board quarantined  (#1)
+    #   tick 1 `_ready_nonempty` → _kb.connect raises before either has_spawnable
+    #                              probe runs, so it connects ONCE, not twice    (#2)
+    #   tick 2 `_tick_once`  → board fingerprint still disabled → short-circuits
+    #                          *before* connecting (no connect this tick)
+    #   tick 2 `_ready_nonempty` → _kb.connect raises again                      (#3)
+    # The ready+review double-probe never doubles the connect count here because
+    # the connect itself raises on a corrupt board — `has_spawnable_ready` /
+    # `has_spawnable_review` are never reached. Total: 3 connects.
+    assert calls["connect"] == 3
 
 
 def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
@@ -3712,6 +3733,7 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
 ):
     """A corrupt-looking board is retried after the quarantine TTL expires."""
     import asyncio
+    import concurrent.futures
     import inspect
     import logging
     import sqlite3
@@ -3732,6 +3754,10 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
             "kanban": {
                 "dispatch_in_gateway": True,
                 "dispatch_interval_seconds": 1,
+                # Keep the per-tick offload count deterministic: reaper +
+                # _tick_once + _ready_nonempty = 3 offloads/tick. Auto-decompose
+                # would add a 4th; this test isn't exercising it.
+                "auto_decompose": False,
             }
         },
     )
@@ -3765,19 +3791,35 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
     def _connect(*args, **kwargs):
         raise sqlite3.DatabaseError("file is not a database")
 
-    async def _to_thread(fn, *args, **kwargs):
-        result = fn(*args, **kwargs)
-        if getattr(fn, "__name__", "") == "_tick_once":
-            calls["tick"] += 1
-            if calls["tick"] >= 3:
-                runner._running = False
-        return result
+    # Dispatcher offloads through its dedicated executor now; stub it to run
+    # each job synchronously and count `_tick_once` invocations so we can stop
+    # after 3 ticks (covering the quarantine-then-retry path).
+    class _SyncExecutor:
+        def __init__(self, *a, **k):
+            pass
+
+        def submit(self, fn, *args, **kwargs):
+            fut: concurrent.futures.Future = concurrent.futures.Future()
+            try:
+                fut.set_result(fn(*args, **kwargs))
+            except BaseException as exc:  # noqa: BLE001 — propagate to awaiter
+                fut.set_exception(exc)
+            if getattr(fn, "__name__", "") == "_tick_once":
+                calls["tick"] += 1
+                if calls["tick"] >= 3:
+                    runner._running = False
+            return fut
+
+        def shutdown(self, *a, **k):
+            pass
 
     async def _sleep(_delay):
         return None
 
     monkeypatch.setattr(_kb, "connect", _connect)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr(
+        "gateway.run.concurrent.futures.ThreadPoolExecutor", _SyncExecutor
+    )
     monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
 
     with caplog.at_level(logging.INFO, logger="gateway.run"):
@@ -3792,6 +3834,143 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 2
     assert any("database fingerprint unchanged" in msg for msg in messages)
     assert calls["tick"] == 3
+
+
+def test_gateway_dispatcher_tick_not_starved_by_busy_default_executor(
+    monkeypatch, tmp_path
+):
+    """A saturated *default* thread pool (busy agent turns) must not delay
+    the dispatcher tick beyond its configured interval.
+
+    Regression for the gateway-dispatcher starvation bug: agent turns run via
+    ``loop.run_in_executor(None, ...)`` (the default ``ThreadPoolExecutor``),
+    and ``asyncio.to_thread`` — what the dispatcher used to tick with — also
+    resolves to ``loop.run_in_executor(None, ...)``. When the default pool is
+    saturated by in-flight agent turns, a tick submitted via ``to_thread``
+    queues *behind* them and only fires when an agent turn frees a pool
+    thread (minutes), not after ``dispatch_interval_seconds``.
+
+    The fix routes the dispatcher's blocking work through its **own**
+    dedicated executor, which a busy default pool can never contend. This
+    test pins the default executor to a tiny pool, saturates it for longer
+    than the tick deadline, and asserts the real ``_tick_once`` still runs
+    promptly. With the shared-``to_thread`` behaviour the tick is starved and
+    the test times out; with the dedicated executor it passes.
+    """
+    import asyncio
+    import concurrent.futures
+    import threading
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    # How long the fake "agent turns" hold every default-pool thread. The
+    # watcher sleeps 5s at startup before its first tick, so the busy jobs
+    # must still be holding every pool thread *after* that delay plus the
+    # tick deadline — otherwise the busy jobs drain before the tick is even
+    # eligible and the contention never materialises.
+    STARTUP_DELAY = 5.0
+    BUSY_SECONDS = STARTUP_DELAY + 6.0
+    TICK_DEADLINE = 1.5
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                # Auto-decompose adds an extra to_thread call per tick; turn
+                # it off so the test isolates the dispatch tick path.
+                "auto_decompose": False,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(
+        _kb, "read_board_metadata", lambda slug: {"slug": slug}
+    )
+    monkeypatch.setattr(_kb, "reap_worker_zombies", lambda: [])
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: tmp_path / "kanban.db")
+
+    # Make the per-board tick cheap + observable: connecting returns a dummy,
+    # dispatch_once returns a no-spawn result, and we record when the real
+    # offloaded tick actually executed.
+    class _DummyConn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_kb, "connect", lambda *a, **k: _DummyConn())
+    monkeypatch.setattr(_kb, "has_spawnable_ready", lambda conn: False)
+    monkeypatch.setattr(_kb, "has_spawnable_review", lambda conn: False)
+
+    tick_ran = threading.Event()
+
+    def _dispatch_once(*args, **kwargs):
+        tick_ran.set()
+        return SimpleNamespace(
+            spawned=[], reclaimed=0, crashed=[], timed_out=[],
+            promoted=0, auto_blocked=[],
+        )
+
+    monkeypatch.setattr(_kb, "dispatch_once", _dispatch_once)
+
+    async def _scenario():
+        loop = asyncio.get_running_loop()
+        # Shrink + pin the default executor so two blocking jobs saturate it,
+        # mirroring concurrent agent turns occupying the shared pool.
+        busy_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        loop.set_default_executor(busy_pool)
+
+        def _busy_turn():
+            time.sleep(BUSY_SECONDS)
+
+        # Saturate every default-pool thread, then let them grab the threads.
+        busy_futs = [loop.run_in_executor(None, _busy_turn) for _ in range(2)]
+        await asyncio.sleep(0.2)
+
+        watcher = asyncio.ensure_future(runner._kanban_dispatcher_watcher())
+        try:
+            # The watcher sleeps 5s before its first tick (startup delay), so
+            # measure from first-tick eligibility, not from launch. Poll the
+            # event with our own clock once the startup delay has elapsed.
+            await asyncio.sleep(5.0)  # startup delay inside the watcher
+            t0 = time.monotonic()
+            while not tick_ran.is_set():
+                if time.monotonic() - t0 > TICK_DEADLINE:
+                    break
+                await asyncio.sleep(0.02)
+            elapsed = time.monotonic() - t0
+        finally:
+            runner._running = False
+            watcher.cancel()
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):
+                pass
+            busy_pool.shutdown(wait=False)
+            for f in busy_futs:
+                f.cancel()
+
+        assert tick_ran.is_set(), (
+            "dispatcher tick was starved by a saturated default executor: "
+            f"it did not run within {TICK_DEADLINE}s of being eligible while "
+            "fake agent turns held every default-pool thread"
+        )
+        assert elapsed < TICK_DEADLINE, (
+            f"dispatcher tick fired but only after {elapsed:.2f}s "
+            f"(deadline {TICK_DEADLINE}s) — it queued behind the busy pool"
+        )
+
+    asyncio.run(asyncio.wait_for(_scenario(), timeout=30.0))
 
 
 # ---------------------------------------------------------------------------
