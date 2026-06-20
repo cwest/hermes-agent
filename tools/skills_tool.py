@@ -599,30 +599,31 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
-    """Recursively find all skills in ~/.hermes/skills/ and external dirs.
+def _scan_skill_dirs(
+    local_dir: Optional[Path],
+    external_dirs: List[Path],
+    *,
+    disabled: Set[str],
+) -> List[Dict[str, Any]]:
+    """Scan *local_dir* then *external_dirs* and return skill metadata dicts.
 
-    Args:
-        skip_disabled: If True, return ALL skills regardless of disabled
-            state (used by ``hermes skills`` config UI). Default False
-            filters out disabled skills.
-
-    Returns:
-        List of skill metadata dicts (name, description, category).
+    This is the single source of truth for "what skills does this set of
+    directories provide" — used both for the active environment
+    (:func:`_find_all_skills`) and for enumerating an arbitrary profile
+    (:func:`count_profile_skills`). Local takes precedence over external on a
+    name collision; skills whose frontmatter ``name`` is in *disabled* or that
+    fail the platform/environment gates are skipped. Symlinked skill packages
+    are followed (via :func:`iter_skill_index_files`).
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from agent.skill_utils import iter_skill_index_files
 
-    skills = []
+    skills: List[Dict[str, Any]] = []
     seen_names: set = set()
 
-    # Load disabled set once (not per-skill)
-    disabled = set() if skip_disabled else _get_disabled_skill_names()
-
-    # Scan local dir first, then external dirs (local takes precedence)
-    dirs_to_scan = []
-    if SKILLS_DIR.exists():
-        dirs_to_scan.append(SKILLS_DIR)
-    dirs_to_scan.extend(get_external_skills_dirs())
+    dirs_to_scan: List[Path] = []
+    if local_dir is not None and local_dir.exists():
+        dirs_to_scan.append(local_dir)
+    dirs_to_scan.extend(external_dirs)
 
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
@@ -677,6 +678,45 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 continue
 
     return skills
+
+
+def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+    """Recursively find all skills in ~/.hermes/skills/ and external dirs.
+
+    Args:
+        skip_disabled: If True, return ALL skills regardless of disabled
+            state (used by ``hermes skills`` config UI). Default False
+            filters out disabled skills.
+
+    Returns:
+        List of skill metadata dicts (name, description, category).
+    """
+    from agent.skill_utils import get_external_skills_dirs
+
+    disabled = set() if skip_disabled else _get_disabled_skill_names()
+    return _scan_skill_dirs(
+        SKILLS_DIR,
+        list(get_external_skills_dirs()),
+        disabled=disabled,
+    )
+
+
+def count_profile_skills(profile_dir: Path) -> int:
+    """Count skills available to the profile rooted at *profile_dir*.
+
+    Resolves the profile's own local ``skills/`` directory plus its
+    ``skills.external_dirs`` grant (from that profile's ``config.yaml``) and
+    counts them through the same scanner the active-environment listing uses,
+    so a per-profile count (the dashboard, ``hermes profile list``) matches
+    what ``hermes -p <profile> skills list`` reports — including symlinked
+    grants and frontmatter-name dedup. Disabled skills are included, matching
+    the listing UI's ``skip_disabled=True`` semantics.
+    """
+    from agent.skill_utils import get_external_skills_dirs_for
+
+    local = profile_dir / "skills"
+    external = get_external_skills_dirs_for(profile_dir)
+    return len(_scan_skill_dirs(local, external, disabled=set()))
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

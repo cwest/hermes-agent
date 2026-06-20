@@ -31,8 +31,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional
 
-from agent.skill_utils import is_excluded_skill_path
-
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # Directories bootstrapped inside every new profile
@@ -621,16 +619,23 @@ def _check_gateway_running(profile_dir: Path) -> bool:
 
 
 def _count_skills(profile_dir: Path) -> int:
-    """Count installed skills in a profile."""
-    skills_dir = profile_dir / "skills"
-    if not skills_dir.is_dir():
+    """Count skills available to the profile at *profile_dir*.
+
+    Delegates to :func:`tools.skills_tool.count_profile_skills`, the single
+    source of truth for skill enumeration. That counts the profile's local
+    ``skills/`` directory **and** its ``skills.external_dirs`` grant through the
+    same scanner ``hermes skills list`` uses — so the dashboard's per-profile
+    count matches the CLI exactly, including symlinked shared grants and
+    frontmatter-name dedup. A profile that sources all its skills from a shared
+    external grant (with no local ``skills/`` dir) reports its true count, not 0.
+    """
+    try:
+        from tools.skills_tool import count_profile_skills
+
+        return count_profile_skills(profile_dir)
+    except Exception:
+        # Never let a counting failure break profile listing — degrade to 0.
         return 0
-    count = 0
-    for md in skills_dir.rglob("SKILL.md"):
-        if is_excluded_skill_path(md):
-            continue
-        count += 1
-    return count
 
 
 # ---------------------------------------------------------------------------

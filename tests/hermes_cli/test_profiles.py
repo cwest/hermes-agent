@@ -1400,6 +1400,96 @@ class TestInternalHelpers:
 
 
 # ===================================================================
+# TestCountSkills — skills.external_dirs resolution
+# ===================================================================
+
+def _write_skill(skills_dir: Path, name: str) -> None:
+    """Create a minimal valid skill package under *skills_dir*."""
+    pkg = skills_dir / name
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "SKILL.md").write_text(f"---\nname: {name}\n---\n")
+
+
+class TestCountSkills:
+    """_count_skills must mirror the runtime resolver: local skills/ UNION
+    every existing skills.external_dirs entry, deduped by skill name with
+    local precedence. The dashboard's per-profile count comes from here, so a
+    profile that gets all its skills via a shared external_dirs grant (the
+    durable multi-profile pattern) must not report 0."""
+
+    def _make_profile(self, root: Path, name: str, external_dirs=None) -> Path:
+        prof = root / ".hermes" / "profiles" / name
+        prof.mkdir(parents=True, exist_ok=True)
+        cfg = {}
+        if external_dirs is not None:
+            cfg = {"skills": {"external_dirs": [str(d) for d in external_dirs]}}
+        (prof / "config.yaml").write_text(yaml.safe_dump(cfg))
+        return prof
+
+    def test_local_only(self, profile_env):
+        from hermes_cli.profiles import _count_skills
+        prof = self._make_profile(profile_env, "p")
+        _write_skill(prof / "skills", "alpha")
+        _write_skill(prof / "skills", "beta")
+        assert _count_skills(prof) == 2
+
+    def test_no_local_dir_but_external_grant(self, profile_env):
+        """The exact eckert/lamport case: no profile-local skills/ dir, all
+        skills supplied via a shared external_dirs grant. Must NOT be 0."""
+        from hermes_cli.profiles import _count_skills
+        shared = profile_env / ".hermes" / "skills"
+        _write_skill(shared, "alpha")
+        _write_skill(shared, "beta")
+        _write_skill(shared, "gamma")
+        prof = self._make_profile(profile_env, "worker", external_dirs=[shared])
+        assert not (prof / "skills").is_dir()
+        assert _count_skills(prof) == 3
+
+    def test_local_plus_external_union(self, profile_env):
+        from hermes_cli.profiles import _count_skills
+        shared = profile_env / "shared-skills"
+        _write_skill(shared, "ext-one")
+        _write_skill(shared, "ext-two")
+        prof = self._make_profile(profile_env, "p", external_dirs=[shared])
+        _write_skill(prof / "skills", "local-one")
+        assert _count_skills(prof) == 3
+
+    def test_local_precedence_dedup_by_name(self, profile_env):
+        """A skill present in both local and external dirs counts once —
+        local wins, matching the runtime resolver's collision rule."""
+        from hermes_cli.profiles import _count_skills
+        shared = profile_env / "shared-skills"
+        _write_skill(shared, "dup")
+        _write_skill(shared, "ext-only")
+        prof = self._make_profile(profile_env, "p", external_dirs=[shared])
+        _write_skill(prof / "skills", "dup")
+        _write_skill(prof / "skills", "local-only")
+        # union of names: {dup, ext-only, local-only} == 3, not 4
+        assert _count_skills(prof) == 3
+
+    def test_nonexistent_external_dir_skipped(self, profile_env):
+        from hermes_cli.profiles import _count_skills
+        prof = self._make_profile(
+            profile_env, "p", external_dirs=[profile_env / "does-not-exist"]
+        )
+        _write_skill(prof / "skills", "alpha")
+        assert _count_skills(prof) == 1
+
+    def test_excluded_paths_not_counted_in_external(self, profile_env):
+        """Support/VCS dirs inside an external grant must be pruned, same as
+        for local skills."""
+        from hermes_cli.profiles import _count_skills
+        shared = profile_env / "shared-skills"
+        _write_skill(shared, "real")
+        # A SKILL.md buried under a support dir must NOT count.
+        buried = shared / "real" / "references" / "old-pkg"
+        buried.mkdir(parents=True, exist_ok=True)
+        (buried / "SKILL.md").write_text("---\nname: old-pkg\n---\n")
+        prof = self._make_profile(profile_env, "p", external_dirs=[shared])
+        assert _count_skills(prof) == 1
+
+
+# ===================================================================
 # Edge cases and additional coverage
 # ===================================================================
 

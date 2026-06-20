@@ -1370,3 +1370,89 @@ class TestSkillViewCollisionDetection:
         result = json.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]
+
+
+class TestCountProfileSkills:
+    """count_profile_skills resolves a profile's local + external_dirs grant.
+
+    Regression guard for the dashboard "0 skills" bug: a worker profile that
+    sources all skills from a shared external grant (no local ``skills/`` dir)
+    must report its true count — including symlinked skill packages — not 0.
+    """
+
+    @staticmethod
+    def _write_profile(profile_dir: Path, external_dirs):
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        lines = ["skills:", "  external_dirs:"]
+        for d in external_dirs:
+            lines.append(f"    - {d}")
+        (profile_dir / "config.yaml").write_text("\n".join(lines) + "\n")
+
+    def test_counts_external_dir_skills_with_no_local_dir(self, tmp_path):
+        from tools.skills_tool import count_profile_skills
+
+        shared = tmp_path / "shared-skills"
+        shared.mkdir()
+        _make_skill(shared, "alpha")
+        _make_skill(shared, "beta")
+        _make_skill(shared, "gamma", category="mlops")
+
+        profile = tmp_path / "profiles" / "worker"
+        self._write_profile(profile, [shared])
+
+        # No local skills/ dir at all — the exact worker-profile shape.
+        assert not (profile / "skills").exists()
+        assert count_profile_skills(profile) == 3
+
+    def test_follows_symlinked_skill_packages(self, tmp_path):
+        """The core bug: rglob misses symlinked packages; the scanner follows them."""
+        from tools.skills_tool import count_profile_skills
+
+        # A real skill living outside the grant, surfaced into it via symlink
+        # (how shared grants vendor categories like ``imported/``).
+        real_home = tmp_path / "forge"
+        real_home.mkdir()
+        _make_skill(real_home, "vendored")
+
+        shared = tmp_path / "shared-skills"
+        shared.mkdir()
+        _make_skill(shared, "native")
+        os.symlink(real_home / "vendored", shared / "vendored")
+
+        profile = tmp_path / "profiles" / "worker"
+        self._write_profile(profile, [shared])
+
+        # native + the symlinked vendored package = 2.
+        assert count_profile_skills(profile) == 2
+
+    def test_local_takes_precedence_over_external_on_name_collision(self, tmp_path):
+        from tools.skills_tool import count_profile_skills
+
+        shared = tmp_path / "shared-skills"
+        shared.mkdir()
+        _make_skill(shared, "dup")
+        _make_skill(shared, "only-external")
+
+        profile = tmp_path / "profiles" / "worker"
+        self._write_profile(profile, [shared])
+        local = profile / "skills"
+        local.mkdir()
+        _make_skill(local, "dup")  # same name — counted once
+        _make_skill(local, "only-local")
+
+        # dup (deduped) + only-external + only-local = 3.
+        assert count_profile_skills(profile) == 3
+
+    def test_no_config_returns_zero(self, tmp_path):
+        from tools.skills_tool import count_profile_skills
+
+        profile = tmp_path / "profiles" / "worker"
+        profile.mkdir(parents=True)
+        assert count_profile_skills(profile) == 0
+
+    def test_nonexistent_external_dir_skipped(self, tmp_path):
+        from tools.skills_tool import count_profile_skills
+
+        profile = tmp_path / "profiles" / "worker"
+        self._write_profile(profile, [tmp_path / "does-not-exist"])
+        assert count_profile_skills(profile) == 0
