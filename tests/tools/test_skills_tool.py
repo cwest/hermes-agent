@@ -1370,3 +1370,88 @@ class TestSkillViewCollisionDetection:
         result = json.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]
+
+
+class TestCountProfileSkills:
+    """count_profile_skills resolves a profile's external_dirs grant.
+
+    Regression guard for the dashboard/`hermes profile list` counter that
+    showed 0 for profiles whose skills come entirely from a shared
+    external_dirs grant (and undercounted symlinked skill packages).
+    """
+
+    def _write_config(self, profile_dir: Path, external_dirs: list) -> None:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        lines = "\n".join(f"    - {d}" for d in external_dirs)
+        (profile_dir / "config.yaml").write_text(
+            "skills:\n  external_dirs:\n" + lines + "\n"
+        )
+
+    def test_counts_skills_from_external_dirs(self, tmp_path):
+        """A profile with no local skills/ but an external grant counts them."""
+        from tools.skills_tool import count_profile_skills
+
+        shared = tmp_path / "shared"
+        _make_skill(shared, "alpha")
+        _make_skill(shared, "beta")
+        _make_skill(shared, "gamma")
+
+        profile = tmp_path / "profiles" / "worker"
+        self._write_config(profile, [str(shared)])
+
+        assert count_profile_skills(profile) == 3
+
+    def test_external_grant_with_no_local_dir_is_not_zero(self, tmp_path):
+        """Regression: the exact bug — external-only profile must not report 0."""
+        from tools.skills_tool import count_profile_skills
+
+        shared = tmp_path / "shared"
+        _make_skill(shared, "only-skill")
+        profile = tmp_path / "profiles" / "eckert"
+        self._write_config(profile, [str(shared)])
+
+        assert not (profile / "skills").exists()
+        assert count_profile_skills(profile) == 1
+
+    def test_counts_symlinked_skill_packages(self, tmp_path):
+        """Symlinked skill packages in the grant are followed (rglob missed these)."""
+        from tools.skills_tool import count_profile_skills
+
+        shared = tmp_path / "shared"
+        shared.mkdir(parents=True, exist_ok=True)
+        _make_skill(shared, "direct")
+        # A category symlink pointing outside the shared tree.
+        external_real = _symlink_category(shared, tmp_path / "elsewhere", "imported")
+        _make_skill(external_real, "linked-one")
+        _make_skill(external_real, "linked-two")
+
+        profile = tmp_path / "profiles" / "lamport"
+        self._write_config(profile, [str(shared)])
+
+        # 1 direct + 2 behind the symlink = 3; rglob (no followlinks) would see 1.
+        assert count_profile_skills(profile) == 3
+
+    def test_local_takes_precedence_and_dedups_by_name(self, tmp_path):
+        """Local skills/ wins over external on a name collision; no double count."""
+        from tools.skills_tool import count_profile_skills
+
+        shared = tmp_path / "shared"
+        _make_skill(shared, "dup")
+        _make_skill(shared, "external-only")
+
+        profile = tmp_path / "profiles" / "worker"
+        local = profile / "skills"
+        _make_skill(local, "dup")
+        _make_skill(local, "local-only")
+        self._write_config(profile, [str(shared)])
+
+        # dup (deduped) + external-only + local-only = 3
+        assert count_profile_skills(profile) == 3
+
+    def test_missing_config_returns_zero(self, tmp_path):
+        """A profile dir with no config.yaml and no skills/ counts 0, no error."""
+        from tools.skills_tool import count_profile_skills
+
+        profile = tmp_path / "profiles" / "empty"
+        profile.mkdir(parents=True, exist_ok=True)
+        assert count_profile_skills(profile) == 0

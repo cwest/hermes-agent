@@ -413,6 +413,65 @@ def _external_dirs_cache_clear() -> None:
     _raw_config_cache_clear()
 
 
+def get_external_skills_dirs_for(profile_dir: Path) -> List[Path]:
+    """Resolve ``skills.external_dirs`` from *profile_dir*'s ``config.yaml``.
+
+    The per-profile-directory form of :func:`get_external_skills_dirs`: it reads
+    the config of an *arbitrary* profile instead of the active environment, so
+    callers that enumerate other profiles (the dashboard, ``hermes profile
+    list``) resolve each profile's own grant. *profile_dir* doubles as that
+    profile's HERMES_HOME for relative-path resolution. Entries are expanded
+    (``~``, ``${VAR}``), resolved to absolute paths, deduped, and dropped if
+    they don't exist or point back at the profile's own local ``skills/``.
+
+    Not cached — callers enumerate a handful of profiles at most, and each has
+    a distinct config path.
+    """
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        return []
+    try:
+        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return []
+    raw_dirs = skills_cfg.get("external_dirs")
+    if not raw_dirs:
+        return []
+    if isinstance(raw_dirs, str):
+        raw_dirs = [raw_dirs]
+    if not isinstance(raw_dirs, list):
+        return []
+
+    local_skills = (profile_dir / "skills").resolve()
+    seen: Set[Path] = set()
+    result: List[Path] = []
+    for entry in raw_dirs:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(entry))
+        p = Path(expanded)
+        # Resolve relative paths against the profile's own home, not cwd.
+        if not p.is_absolute():
+            p = (profile_dir / p).resolve()
+        else:
+            p = p.resolve()
+        if p == local_skills or p in seen:
+            continue
+        if p.is_dir():
+            seen.add(p)
+            result.append(p)
+        else:
+            logger.debug("External skills dir does not exist, skipping: %s", p)
+    return result
+
+
 def get_external_skills_dirs() -> List[Path]:
     """Read ``skills.external_dirs`` from config.yaml and return validated paths.
 
