@@ -103,6 +103,22 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
+# The skill that marks a card as a PR review card. The GitHub PR-creation
+# webhook stages a review card carrying this skill; hand-built chains must NOT
+# file one manually (the webhook owns review-card creation). See
+# ``_review_pr_url`` and the PR-URL dedup guard in ``create_task``.
+REVIEW_SKILL = "github-code-review"
+
+# Matches a GitHub pull-request URL and captures owner/repo/number so two
+# spellings of the same PR (trailing path, query string, or surrounding prose)
+# collapse to one canonical identity. The host is matched case-insensitively;
+# the path segments are kept verbatim (GitHub repo names are case-sensitive).
+_PR_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/"
+    r"(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/(?P<number>\d+)",
+    re.IGNORECASE,
+)
+
 # A running task's claim is valid for 15 minutes by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
 # call ``heartbeat_claim(task_id)`` periodically. In practice most kanban
@@ -2059,6 +2075,44 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _canonical_pr_url(text: Optional[str]) -> Optional[str]:
+    """Return the canonical ``github.com/<owner>/<repo>/pull/<n>`` URL in *text*.
+
+    Normalises host casing/``www.`` and strips any trailing path, query, or
+    fragment so ``.../pull/43``, ``.../pull/43/files`` and ``.../pull/43?w=1``
+    all collapse to one identity. Returns ``None`` when no PR URL is present.
+    """
+    if not text:
+        return None
+    m = _PR_URL_RE.search(text)
+    if not m:
+        return None
+    return (
+        f"https://github.com/{m.group('owner')}/{m.group('repo')}"
+        f"/pull/{m.group('number')}"
+    )
+
+
+def _review_pr_url(
+    skills_list: Optional[Iterable[str]],
+    title: Optional[str],
+    body: Optional[str],
+) -> Optional[str]:
+    """Canonical PR URL iff this card is a review card naming a PR, else None.
+
+    A review card is identified by the ``github-code-review`` skill. The PR URL
+    is read from the title first (the webhook puts it there), then the body.
+    Used to dedup duplicate review cards for the same PR regardless of how the
+    card was filed (webhook auto-card vs. a manually-filed card with a
+    different/absent idempotency key).
+    """
+    if not skills_list:
+        return None
+    if REVIEW_SKILL not in skills_list:
+        return None
+    return _canonical_pr_url(title) or _canonical_pr_url(body)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2184,6 +2238,35 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+
+    # Review-card PR dedup — a stronger guard than the idempotency key for the
+    # one case it can't cover: a *manually* filed review card for a PR that the
+    # webhook also auto-files. The webhook keys its card on the PR URL, but a
+    # hand-built card carries a different (or no) key, so the key check above
+    # misses it and two review cards strand the pipeline (the phantom looks
+    # "stuck" and its bogus gate blocks the downstream merge card). Here we key
+    # on the PR identity itself: if a non-archived review card already exists
+    # for the same PR, no-op and return it. Archived cards don't block, so a
+    # deliberate re-review (archive the old card, file a new one) still works —
+    # mirroring the idempotency-key semantics above. Candidate set is just the
+    # review cards, so the in-Python canonicalisation stays cheap.
+    pr_url = _review_pr_url(skills_list, title, body)
+    if pr_url:
+        # The ``skills`` column stores a JSON array, so the review skill appears
+        # as a quoted token (e.g. ``["github-code-review"]``). Matching the
+        # quoted form keeps the prefilter from catching a skill that merely
+        # *contains* the name as a substring; the PR-URL compare below is the
+        # authoritative check.
+        rows = conn.execute(
+            "SELECT id, title, body FROM tasks "
+            "WHERE status != 'archived' AND skills LIKE ? "
+            "ORDER BY created_at DESC",
+            (f'%"{REVIEW_SKILL}"%',),
+        ).fetchall()
+        for r in rows:
+            existing = _canonical_pr_url(r["title"]) or _canonical_pr_url(r["body"])
+            if existing == pr_url:
+                return r["id"]
 
     now = int(time.time())
 
