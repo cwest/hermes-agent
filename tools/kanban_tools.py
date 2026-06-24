@@ -872,6 +872,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     We never want a notification bookkeeping failure to fail the
     kanban_create that the agent is mid-conversation about.
     """
+    cfg: Any = None
     try:
         cfg = load_config()
         if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
@@ -906,7 +907,44 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
             if not session_key:
-                return False  # CLI / cron / test — no persistent channel
+                # CLI / cron / webhook — no per-session delivery channel.
+                # Fall back to a statically configured report-back target so
+                # cards created without session context (notably the webhook
+                # stage-pr-review review cards spawned via
+                # gateway/platforms/webhook.py) still subscribe a chat. When
+                # Lamport later completes the review card, the existing
+                # terminal-kind notifier delivers the verdict to this target.
+                #
+                # Config (config.yaml only — never a HERMES_ env var, per
+                # AGENTS.md, since this is behavioral config, not a secret):
+                #
+                #   kanban:
+                #     report_back_target:
+                #       platform: telegram
+                #       chat_id: "-1001234567"
+                #       thread_id: "42"   # optional
+                #
+                # Absent or incomplete (missing platform or chat_id) -> no
+                # subscription, identical to the pre-fallback behaviour.
+                rbt = cfg_get(cfg, "kanban", "report_back_target", default=None)
+                rbt = rbt if isinstance(rbt, dict) else {}
+                rbt_platform = str(rbt.get("platform") or "").strip()
+                rbt_chat_id = str(rbt.get("chat_id") or "").strip()
+                if not (rbt_platform and rbt_chat_id):
+                    return False  # CLI / cron / test — no persistent channel
+                platform = rbt_platform
+                chat_id = rbt_chat_id
+                rbt_thread = rbt.get("thread_id")
+                thread_id = str(rbt_thread).strip() or None if rbt_thread else None
+                user_id = None
+                from hermes_cli import kanban_db as _kb
+                _kb.add_notify_sub(
+                    conn, task_id=task_id,
+                    platform=platform, chat_id=chat_id,
+                    thread_id=thread_id, user_id=user_id,
+                    notifier_profile=os.environ.get("HERMES_PROFILE"),
+                )
+                return True
             platform = "tui"
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
