@@ -28,9 +28,6 @@ Use this as the structure for PR review summary comments. Copy and fill in the s
 ### ✅ Looks Good
 <!-- Call out things done well — positive reinforcement -->
 - [aspect that was done well]
-
----
-*Reviewed by Hermes Agent*
 ```
 
 ## Severity Guide
