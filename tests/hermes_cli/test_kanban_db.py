@@ -2215,6 +2215,111 @@ def test_dispatch_max_spawn_fills_remaining_capacity(
         assert kb.get_task(conn, ready_b).status == "ready"
 
 
+def test_dispatch_reclaims_when_worker_would_spawn_toolless(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """E2E: a degenerate toolset resolution must reclaim the card, not block it.
+
+    Exercises the REAL ``_default_spawn`` path (not a stub) against the temp
+    HERMES_HOME. When toolset resolution comes up degenerate (the burst-race
+    failure mode), ``_default_spawn`` raises, ``dispatch_once`` records a spawn
+    failure with ``release_claim=True``, and the card returns to ``ready`` for
+    a clean retry on the next tick — never a running worker with only
+    ``kanban_*`` tools.
+    """
+    # Force the burst-race failure mode at the resolution seam.
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda home: None)
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    import subprocess as _subprocess
+
+    def fail_popen(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("toolless worker must not be spawned")
+
+    monkeypatch.setattr(_subprocess, "Popen", fail_popen)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="needs-tools", assignee="alice")
+        res = kb.dispatch_once(conn)  # real _default_spawn
+        # Card must NOT have launched a worker; it must be back in ready.
+        assert res.spawned == []
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+
+
+def test_dispatch_max_spawn_per_tick_caps_burst(
+    kanban_home, all_assignees_spawnable
+):
+    """A single tick must not dump the whole ready queue.
+
+    Defense-in-depth against the 2026-06-26 burst (stuck 16 ticks then
+    spawned=20 in one tick). ``max_spawn_per_tick`` bounds spawns per tick
+    distinct from ``max_spawn`` (a live concurrency cap). With N ready cards
+    and a per-tick cap of C, at most C spawn this tick; the rest stay ready.
+    """
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        ready_ids = [
+            kb.create_task(conn, title=f"r{i}", assignee="alice")
+            for i in range(5)
+        ]
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn_per_tick=2)
+
+        assert len(res.spawned) == 2
+        assert len(spawns) == 2
+        still_ready = [
+            tid for tid in ready_ids
+            if kb.get_task(conn, tid).status == "ready"
+        ]
+        assert len(still_ready) == 3
+
+
+def test_dispatch_max_spawn_per_tick_none_is_unbounded(
+    kanban_home, all_assignees_spawnable
+):
+    """Omitting max_spawn_per_tick preserves the historical unbounded behavior."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        for i in range(4):
+            kb.create_task(conn, title=f"r{i}", assignee="alice")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert len(res.spawned) == 4
+
+
+def test_dispatch_max_spawn_per_tick_counts_review_spawns(
+    kanban_home, all_assignees_spawnable
+):
+    """Review spawns count against the per-tick cap alongside ready spawns."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        # 2 ready + 1 review task; per-tick cap of 2 means the review task
+        # cannot also spawn this tick.
+        kb.create_task(conn, title="r0", assignee="alice")
+        kb.create_task(conn, title="r1", assignee="alice")
+        rev = kb.create_task(conn, title="rev", assignee="alice")
+        kb.claim_task(conn, rev)
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (rev,))
+        conn.execute("UPDATE tasks SET claim_lock = NULL WHERE id = ?", (rev,))
+        conn.commit()
+
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn_per_tick=2)
+        assert len(res.spawned) == 2
+        assert kb.get_task(conn, rev).status == "review"
+
+
 def test_dispatch_reclaims_stale_before_spawning(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="alice")

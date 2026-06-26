@@ -6593,6 +6593,7 @@ def dispatch_once(
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
+    max_spawn_per_tick: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
@@ -6624,6 +6625,15 @@ def dispatch_once(
     intent ("limit concurrent kanban tasks"). With a per-tick interpretation
     a 60-second tick interval could grow concurrency by N every minute on a
     busy board and accumulate without bound.
+
+    ``max_spawn_per_tick`` is a **per-tick burst bound** (distinct from
+    ``max_spawn``): it caps how many workers a single tick may launch,
+    counting ready + review spawns together. Defense-in-depth against the
+    stuck->mass-spawn recovery pattern (incident 2026-06-26: the dispatcher
+    sat stuck for 16 ticks, then spawned all 20 ready cards in ONE tick).
+    Dumping the whole ready queue at once is the condition under which workers
+    raced and came up tool-less. ``None`` (the default) preserves the
+    historical unbounded per-tick behavior; both caps apply when set.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
@@ -6700,6 +6710,18 @@ def dispatch_once(
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
     spawned = 0
+    # Per-tick burst bound (#incident-2026-06-26). When set, no single tick
+    # launches more than this many workers (ready + review combined). Normalize
+    # invalid/<1 values to None (= unbounded) so a typo in config can't wedge
+    # the dispatcher into never spawning.
+    _per_tick_cap: Optional[int] = None
+    if max_spawn_per_tick is not None:
+        try:
+            _candidate = int(max_spawn_per_tick)
+        except (TypeError, ValueError):
+            _candidate = 0
+        if _candidate >= 1:
+            _per_tick_cap = _candidate
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -6737,6 +6759,8 @@ def dispatch_once(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
+        if _per_tick_cap is not None and spawned >= _per_tick_cap:
+            break
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]
@@ -6922,6 +6946,8 @@ def dispatch_once(
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
+        if _per_tick_cap is not None and spawned >= _per_tick_cap:
+            break
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         if not row["assignee"]:
@@ -7480,9 +7506,28 @@ def _default_spawn(
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
+    # Resolve the assignee profile's CLI toolset and pin it explicitly so the
+    # worker never falls back to a stale root/active-profile config. This MUST
+    # succeed: a worker spawned without its toolset comes up with only the
+    # base kanban_* coordination tools (no web/shell/file/git), can't do its
+    # job, and self-blocks — wasting a full LLM cycle. Under a stuck->mass-spawn
+    # burst (incident 2026-06-26) resolution can come up degenerate; rather
+    # than silently launching a crippled worker, FAIL the spawn so the caller
+    # (dispatch_once) records a spawn failure and RECLAIMS the card to ``ready``
+    # for a clean retry on the next tick. _resolve_worker_cli_toolsets always
+    # recovers at least the kanban lifecycle surface for a real profile home,
+    # so a None/empty result here is a genuine resolution failure, not a
+    # legitimately tool-less profile.
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    if not worker_toolsets:
+        raise RuntimeError(
+            f"kanban worker spawn aborted for task {task.id} (profile "
+            f"{profile_arg!r}): could not resolve a non-empty CLI toolset from "
+            f"HERMES_HOME={env.get('HERMES_HOME')!r}. Refusing to spawn a "
+            "tool-less worker (only kanban_* coordination tools); the card will "
+            "be reclaimed for a clean retry."
+        )
+    cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
         "-q", prompt,
