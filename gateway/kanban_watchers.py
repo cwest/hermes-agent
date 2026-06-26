@@ -736,6 +736,17 @@ class GatewayKanbanWatchersMixin:
         if max_spawn is not None:
             logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
 
+        # Read max_spawn_per_tick — the per-tick burst bound (distinct from
+        # max_spawn, which is a live concurrency cap). Caps how many workers a
+        # single tick may launch so a stuck->recovery tick can't dump the whole
+        # ready queue at once (incident 2026-06-26). Invalid/<1 values are
+        # normalized to None (= unbounded) inside dispatch_once.
+        max_spawn_per_tick = kanban_cfg.get("max_spawn_per_tick", None)
+        if max_spawn_per_tick is not None:
+            logger.info(
+                f"kanban dispatcher: max_spawn_per_tick={max_spawn_per_tick}"
+            )
+
         # Cap the number of simultaneously running tasks so slow workers
         # (local LLMs, resource-constrained hosts) don't pile up and time
         # out. When set, the dispatcher skips spawning when the board
@@ -922,6 +933,7 @@ class GatewayKanbanWatchersMixin:
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
+                    max_spawn_per_tick=max_spawn_per_tick,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,

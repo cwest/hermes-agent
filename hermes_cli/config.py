@@ -2343,6 +2343,15 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Per-tick spawn burst bound (incident 2026-06-26). Distinct from
+        # max_spawn (a live concurrency cap counting all running workers):
+        # this caps how many workers a SINGLE dispatcher tick may launch
+        # (ready + review combined). Prevents a stuck->recovery tick from
+        # dumping the whole ready queue at once — the burst that raced
+        # workers into spawning tool-less. Unset (None) means "no per-tick
+        # bound" (historical behavior). Invalid/<1 values are treated as
+        # None. Both caps apply together when set.
+        "max_spawn_per_tick": None,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
