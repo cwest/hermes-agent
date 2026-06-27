@@ -251,6 +251,47 @@ def test_run_slash_assign_reassigns(kanban_home):
     assert "bob" in show
 
 
+def test_run_slash_move_changes_lane_and_assignee(kanban_home):
+    """`kanban move <id> --lane <status> --assignee <p>` is the one-card
+    outer/inner loop affordance: it moves the SAME card to a new lane and owner
+    in one command."""
+    import re
+    out = kc.run_slash("create 'x' --assignee lamport")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    moved = kc.run_slash(f"move {tid} --lane review --assignee eckert")
+    assert tid in moved
+    show = kc.run_slash(f"show {tid}")
+    assert "review" in show.lower()
+    assert "eckert" in show
+
+
+def test_run_slash_move_lane_only(kanban_home):
+    """`move` with only --lane changes status without touching ownership."""
+    import re
+    out = kc.run_slash("create 'x' --assignee eckert")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    kc.run_slash(f"move {tid} --lane review")
+    show = kc.run_slash(f"show {tid}")
+    assert "review" in show.lower()
+    assert "eckert" in show
+
+
+def test_run_slash_move_unknown_task_reports_error(kanban_home):
+    out = kc.run_slash("move t_nonexistent --lane review")
+    assert "no such task" in out.lower() or "t_nonexistent" in out
+
+
+def test_run_slash_move_bad_lane_reports_error(kanban_home):
+    import re
+    out = kc.run_slash("create 'x'")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    res = kc.run_slash(f"move {tid} --lane not_a_lane")
+    # move_task raises ValueError("status must be one of [...]"), surfaced by the
+    # shared CLI error handler; the card must NOT have moved.
+    assert "status must be one of" in res.lower()
+    assert "not_a_lane" not in kc.run_slash(f"show {tid}").lower()
+
+
 def test_run_slash_link_unlink(kanban_home):
     a = kc.run_slash("create 'a'")
     b = kc.run_slash("create 'b'")

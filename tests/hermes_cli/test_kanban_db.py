@@ -1465,6 +1465,143 @@ def test_assignee_normalized_to_lowercase_on_create_and_assign(kanban_home):
         assert kb.get_task(conn, tid).assignee == "librarian"
 
 
+# ---------------------------------------------------------------------------
+# move_task — the sanctioned status-transition helper (one-card model)
+# ---------------------------------------------------------------------------
+
+def _event_kinds(conn, tid):
+    return [e.kind for e in kb.list_events(conn, tid)]
+
+
+def test_move_task_changes_status_only(kanban_home):
+    """move_task transitions status without touching assignee, and emits a
+    status_changed event (the audit trail the one-card model relies on)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="eckert")
+        assert kb.move_task(conn, t, status="review") is True
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.assignee == "eckert"  # unchanged
+        kinds = _event_kinds(conn, t)
+        assert "status_changed" in kinds
+        # No assigned event when the assignee did not change.
+        assert "assigned" not in kinds
+
+
+def test_move_task_changes_status_and_reassigns(kanban_home):
+    """move_task moves a card to a new lane AND a new owner in one call,
+    emitting both status_changed and assigned events."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="lamport")
+        # create defaults to status=ready, so move to a DIFFERENT lane (review)
+        # to exercise the status transition alongside the reassign.
+        assert kb.move_task(conn, t, status="review", assignee="eckert") is True
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.assignee == "eckert"
+        kinds = _event_kinds(conn, t)
+        assert "status_changed" in kinds
+        assert "assigned" in kinds
+
+
+def test_move_task_reassign_without_status_change_emits_only_assigned(kanban_home):
+    """When the target status equals the current status, move_task reassigns
+    without emitting a spurious status_changed event."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="lamport")  # status=ready
+        assert kb.move_task(conn, t, status="ready", assignee="eckert") is True
+        assert kb.get_task(conn, t).assignee == "eckert"
+        kinds = _event_kinds(conn, t)
+        assert "assigned" in kinds
+        assert "status_changed" not in kinds
+
+
+def test_move_task_records_reason_in_status_changed_event(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="eckert")
+        kb.move_task(conn, t, status="review", reason="outer loop: back to review")
+        events = kb.list_events(conn, t)
+        sc = [e for e in events if e.kind == "status_changed"]
+        assert sc, "expected a status_changed event"
+        payload = sc[-1].payload
+        assert payload["to"] == "review"
+        assert payload["from"] == "ready"
+        assert payload["reason"] == "outer loop: back to review"
+
+
+def test_move_task_validates_status(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="eckert")
+        with pytest.raises(ValueError):
+            kb.move_task(conn, t, status="not_a_real_status")
+        # The bad call must not have mutated the card.
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_move_task_unknown_task_returns_false(kanban_home):
+    with kb.connect() as conn:
+        assert kb.move_task(conn, "t_does_not_exist", status="review") is False
+
+
+def test_move_task_refuses_while_running(kanban_home):
+    """A card claimed by a live worker must not be yanked to another lane —
+    same safety as assign_task."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="eckert")
+        kb.claim_task(conn, t)
+        with pytest.raises(RuntimeError, match="currently running"):
+            kb.move_task(conn, t, status="review")
+
+
+def test_move_task_is_idempotent(kanban_home):
+    """Moving a card to the lane+owner it already occupies is a no-op success
+    that emits no spurious status_changed/assigned events (re-fired webhook /
+    repeated CLI converges)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="lamport")
+        assert kb.move_task(conn, t, status="review", assignee="lamport") is True
+        kinds_after_first = _event_kinds(conn, t)
+        n_status = kinds_after_first.count("status_changed")
+        n_assigned = kinds_after_first.count("assigned")
+        # Second identical move: still True, but no new events.
+        assert kb.move_task(conn, t, status="review", assignee="lamport") is True
+        kinds_after_second = _event_kinds(conn, t)
+        assert kinds_after_second.count("status_changed") == n_status
+        assert kinds_after_second.count("assigned") == n_assigned
+
+
+def test_move_task_resets_failure_streak_on_reassign(kanban_home):
+    """Reassigning via move_task gives the new owner a fresh retry budget,
+    mirroring assign_task's operator-intervention reset."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="eckert")
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 3, "
+            "last_failure_error = 'boom' WHERE id = ?",
+            (t,),
+        )
+        conn.commit()
+        assert kb.move_task(conn, t, status="ready", assignee="lamport") is True
+        row = conn.execute(
+            "SELECT consecutive_failures, last_failure_error FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        assert row["consecutive_failures"] == 0
+        assert row["last_failure_error"] is None
+
+
+def test_move_task_unassign_with_none(kanban_home):
+    """assignee=None leaves the assignee untouched (status-only move); to
+    UNASSIGN, callers pass an explicit sentinel handled at the CLI layer.
+
+    move_task treats assignee=None as 'do not touch assignee' so a pure
+    status move never clobbers ownership."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="eckert")
+        kb.move_task(conn, t, status="review", assignee=None)
+        assert kb.get_task(conn, t).assignee == "eckert"
+
+
 def test_list_tasks_assignee_filter_case_insensitive(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="q", assignee="jules")

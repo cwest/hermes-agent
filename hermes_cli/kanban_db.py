@@ -2499,6 +2499,99 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         return True
 
 
+def move_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    status: str,
+    assignee: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Move a task to a new lane (``status``), optionally reassigning it.
+
+    This is the sanctioned home for the status transition the one-card review
+    model performs as a card physically moves through lanes
+    (``todo -> doing -> review -> merge -> done`` and the inner/outer loops back).
+    Before this helper existed, the homestead webhook skills did the move inline
+    with an ``UPDATE tasks SET status=?`` inside ``write_txn`` plus hand-emitted
+    ``status_changed``/``assigned`` events; ``move_task`` formalises that pattern
+    so a CLI move (``hermes kanban move``) and a webhook move share one audited
+    transition path. It is a library + CLI affordance, NOT a new model tool — the
+    core tool schema is unchanged (AGENTS.md narrow-waist rule).
+
+    Semantics, mirroring :func:`assign_task`:
+
+    * ``status`` is validated against :data:`VALID_STATUSES` (``ValueError`` on a
+      bad value), so a typo can never strand a card in an unscannable lane.
+    * Refuses to move a task that is currently running (``claim_lock`` set AND
+      ``status == 'running'``), raising ``RuntimeError`` — we never yank a card
+      out from under a live worker. Move after the run completes (or reclaim the
+      stale lock first).
+    * ``assignee=None`` leaves ownership untouched (a pure status move). When an
+      assignee IS given it is canonicalised; if it actually changes, the
+      per-profile failure streak is reset (operator-intervention semantics,
+      identical to :func:`assign_task`) and an ``assigned`` event is emitted.
+    * Idempotent: moving a card to the lane+owner it already occupies returns
+      ``True`` but emits no spurious events, so a re-fired webhook or a repeated
+      CLI invocation converges cleanly.
+    * Returns ``False`` for an unknown ``task_id``; ``True`` when the task was
+      found (and transitioned, or already in the target state).
+
+    A successful status change emits a ``status_changed`` event with
+    ``{"from", "to", "by": "cli:move", "reason"}`` — the same event kind the
+    homestead move skills emit, so the audit trail is uniform regardless of which
+    edge drove the move.
+    """
+    if status not in VALID_STATUSES:
+        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+    new_assignee = _canonical_assignee(assignee)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return False
+        if row["claim_lock"] is not None and row["status"] == "running":
+            raise RuntimeError(
+                f"cannot move {task_id}: currently running (claimed). "
+                "Wait for completion or reclaim the stale lock first."
+            )
+        old_status = row["status"]
+        old_assignee = row["assignee"]
+
+        # Reassign (only when an explicit assignee was supplied AND it changes).
+        if new_assignee is not None and new_assignee != old_assignee:
+            # Operator intervention resets the previous profile's retry streak,
+            # exactly as assign_task does, so the moved card claims cleanly under
+            # its new owner.
+            conn.execute(
+                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
+                "last_failure_error = NULL WHERE id = ?",
+                (new_assignee, task_id),
+            )
+            _append_event(conn, task_id, "assigned", {"assignee": new_assignee})
+
+        # Transition status (only when it actually changes).
+        if status != old_status:
+            conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?",
+                (status, task_id),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "status_changed",
+                {
+                    "from": old_status,
+                    "to": status,
+                    "by": "cli:move",
+                    "reason": reason,
+                },
+            )
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------

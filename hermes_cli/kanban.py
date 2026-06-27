@@ -440,6 +440,31 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
 
+    # --- move (one-card lane transition: the inner/outer review loop) ---
+    p_move = sub.add_parser(
+        "move",
+        help="Move a task to a new lane (status), optionally reassigning it",
+        description=(
+            "Move the SAME card to a new lane and (optionally) a new owner in one "
+            "command — the one-card review model's loop affordance. Example: "
+            "`hermes kanban move t_abc123 --lane ready --assignee eckert` returns a "
+            "card from the merge lane to doing+eckert (Casey's outer loop)."
+        ),
+    )
+    p_move.add_argument("task_id")
+    p_move.add_argument(
+        "--lane", required=True,
+        help="Target status/lane (e.g. ready, review, blocked, done)",
+    )
+    p_move.add_argument(
+        "--assignee", default=None,
+        help="Optional new owner (profile name, or 'none' to unassign)",
+    )
+    p_move.add_argument(
+        "--reason", default=None,
+        help="Optional human-readable reason recorded on the status_changed event",
+    )
+
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
         "reclaim",
@@ -928,6 +953,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "ls":       _cmd_list,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
+            "move":     _cmd_move,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1623,6 +1649,38 @@ def _cmd_assign(args: argparse.Namespace) -> int:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
     print(f"Assigned {args.task_id} to {profile or '(unassigned)'}")
+    return 0
+
+
+def _cmd_move(args: argparse.Namespace) -> int:
+    """Move a card to a new lane (status), optionally reassigning it.
+
+    The one-card review model's loop affordance: one command moves the SAME
+    card to a new lane and owner. ``--assignee none|-|null`` unassigns; omitting
+    ``--assignee`` leaves ownership untouched. ``ValueError`` (bad lane) and
+    ``RuntimeError`` (task still running) propagate to the shared CLI error
+    handler.
+    """
+    raw = getattr(args, "assignee", None)
+    unassign = raw is not None and raw.lower() in {"none", "-", "null"}
+    # move_task treats assignee=None as "don't touch"; the CLI's explicit
+    # unassign sentinel is honored with a follow-up assign_task(None).
+    move_assignee = None if (raw is None or unassign) else raw
+    with kb.connect_closing() as conn:
+        ok = kb.move_task(
+            conn,
+            args.task_id,
+            status=args.lane,
+            assignee=move_assignee,
+            reason=getattr(args, "reason", None),
+        )
+        if not ok:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+        if unassign:
+            kb.assign_task(conn, args.task_id, None)
+    owner = "(unassigned)" if unassign else (move_assignee or "(unchanged)")
+    print(f"Moved {args.task_id} to lane {args.lane} (assignee: {owner})")
     return 0
 
 
