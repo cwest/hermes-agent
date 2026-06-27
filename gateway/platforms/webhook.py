@@ -571,6 +571,33 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "action": action}
             )
 
+        # Check author allow-list (SECURITY hard gate).
+        #
+        # This is the one filter that gates on the *identity* of whoever
+        # triggered the event, so it runs BEFORE prompt render / skill load /
+        # agent spawn — a non-allow-listed author is ignored at the HTTP layer
+        # and never starts a worker on untrusted external input.
+        #
+        # Fail-CLOSED, deliberately the OPPOSITE of the action filter above:
+        # when an allow-list is configured but the author cannot be resolved
+        # from the payload, the delivery is IGNORED rather than processed. For
+        # a security boundary an unattributable event must not spawn a run; the
+        # action filter fails open because it is a convenience gate, not a
+        # trust boundary.
+        allowed_authors = route_config.get("authors", [])
+        if allowed_authors:
+            author = self._resolve_author(payload, event_type)
+            if not author or author not in allowed_authors:
+                logger.info(
+                    "[webhook] Ignoring author %r for route %s (allowed: %s)",
+                    author,
+                    route_name,
+                    allowed_authors,
+                )
+                return web.json_response(
+                    {"status": "ignored", "author": author}
+                )
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
@@ -745,6 +772,44 @@ class WebhookAdapter(BasePlatformAdapter):
             },
             status=202,
         )
+
+    # ------------------------------------------------------------------
+    # Author resolution (for the author allow-list security gate)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_author(payload: dict, event_type: str) -> str:
+        """Resolve the triggering account's login from a webhook *payload*.
+
+        Used by the author allow-list gate. Resolution is per event type and
+        matches GitHub's real payload shapes:
+
+        - ``pull_request`` / ``pull_request_review`` ->
+          ``payload["pull_request"]["user"]["login"]`` (the PR author, not the
+          reviewer — the allow-list gates on whose code/PR we act on).
+        - ``push`` -> ``payload["sender"]["login"]``, falling back to
+          ``payload["pusher"]["name"]``.
+        - anything else -> ``payload["sender"]["login"]`` (GitHub stamps a
+          ``sender`` on virtually every event).
+
+        Returns ``""`` when no author can be extracted; the caller treats an
+        empty result as fail-CLOSED (ignore the delivery).
+        """
+
+        def _dig(*keys: str) -> str:
+            node = payload
+            for key in keys:
+                if not isinstance(node, dict):
+                    return ""
+                node = node.get(key)
+            return node if isinstance(node, str) else ""
+
+        if event_type in ("pull_request", "pull_request_review"):
+            return _dig("pull_request", "user", "login")
+        if event_type == "push":
+            return _dig("sender", "login") or _dig("pusher", "name")
+        # Generic fallback: most GitHub events carry a top-level sender.
+        return _dig("sender", "login")
 
     # ------------------------------------------------------------------
     # Signature validation
