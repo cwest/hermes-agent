@@ -6917,6 +6917,45 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _resolve_worker_git_identity() -> Optional[tuple[str, str]]:
+    """Resolve the canonical git author identity for dispatched workers.
+
+    A worker clones/branches a repo and commits its work; the canonical author
+    for every such commit is the host's configured git identity (the repo
+    maintainer), NOT a per-profile persona. We read ``git config user.name`` /
+    ``user.email`` from the dispatcher's environment and return them so the
+    spawn can pin them into the worker's env. If the worker authored under a
+    per-profile identity instead, a squash-merge would auto-append a
+    ``Co-authored-by:`` trailer for that distinct author into the merge commit
+    body — leaking the author into git metadata.
+
+    Returns ``(name, email)`` when BOTH are non-empty, else ``None`` (so the
+    caller can omit the pin rather than inject empty identity env vars, which
+    would author commits as an empty name/email).
+    """
+    import subprocess
+
+    def _git_config(key: str) -> str:
+        try:
+            proc = subprocess.run(
+                ["git", "config", "--get", key],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            return ""
+        if proc.returncode != 0:
+            return ""
+        return (proc.stdout or "").strip()
+
+    name = _git_config("user.name")
+    email = _git_config("user.email")
+    if name and email:
+        return name, email
+    return None
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -7011,6 +7050,24 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+
+    # Pin the canonical git author/committer identity into the worker env so
+    # every commit the worker makes is authored as the host's git identity (the
+    # repo maintainer), never a per-profile persona. Env-level git identity
+    # overrides repo-local and global config, so the worker cannot author under
+    # any other name regardless of what its runtime would otherwise synthesize.
+    # Without this, a worker that authors a branch commit under a persona
+    # identity causes a squash-merge to auto-append a `Co-authored-by: <persona>`
+    # trailer into the merge commit body — leaking the author into git metadata.
+    # Omitted (not set empty) when the host identity can't be resolved, so git's
+    # own config chain still applies.
+    _git_identity = _resolve_worker_git_identity()
+    if _git_identity is not None:
+        _git_name, _git_email = _git_identity
+        env["GIT_AUTHOR_NAME"] = _git_name
+        env["GIT_AUTHOR_EMAIL"] = _git_email
+        env["GIT_COMMITTER_NAME"] = _git_name
+        env["GIT_COMMITTER_EMAIL"] = _git_email
 
     cmd = [
         *_resolve_hermes_argv(),
