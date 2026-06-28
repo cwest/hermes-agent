@@ -6076,8 +6076,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds) at or after the latest explicit
+        unblock.  A prior worker already opened a PR; re-spawning risks a
+        duplicate PR on the same task — unless an operator/orchestrator
+        unblocked it to resume work on that same PR (e.g. to address review
+        feedback), in which case only PR URLs added at/after the unblock guard.
         **Skipped when the task is in status ``review``** — a reviewer
         never opens a PR, and the PR-URL comment is exactly what it needs
         to act on, not a duplicate-PR risk.
@@ -6161,8 +6164,20 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     #    Skipped for review tasks: the PR-URL comment is exactly what the
     #    reviewer needs to act on, not a signal of a duplicate-PR risk.
+    #    If the task was explicitly unblocked after the PR handoff, honor that
+    #    as operator/orchestrator intent to resume work on the SAME PR (e.g.
+    #    addressing review feedback) and only guard on PR URLs added at or after
+    #    that unblock. Timestamps are second-granular, so a same-second PR URL is
+    #    still guarded conservatively. (Carried from upstream PR #46204.)
     if not is_review:
         pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        latest_unblock = conn.execute(
+            "SELECT MAX(created_at) AS ts FROM task_events "
+            "WHERE task_id = ? AND kind = 'unblocked'",
+            (task_id,),
+        ).fetchone()
+        if latest_unblock and latest_unblock["ts"] is not None:
+            pr_cutoff = max(pr_cutoff, int(latest_unblock["ts"]))
         for c in conn.execute(
             "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
             (task_id, pr_cutoff),
