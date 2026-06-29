@@ -2971,6 +2971,186 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+# The reviewer's clean-block contract for a review-bounce (the sdlc-review skill
+# emits ``kanban_block(reason="review-changes-requested: <gist>; see PR <url>. …")``
+# when a review needs rework). The dispatcher routes ONLY this prefix back to the
+# author. The acceptance/PASS block (``awaiting-casey-signoff: …``) is parked for
+# Casey and must NEVER auto-route — matching on this prefix excludes it by design.
+_REVIEW_BOUNCE_REASON_PREFIX = "review-changes-requested"
+
+
+def _latest_sticky_block_reason(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return the reason of the most recent sticky ``blocked`` event, or None.
+
+    Sticky == the most recent ``{blocked, unblocked}`` event is a ``blocked``
+    (the same predicate :func:`_has_sticky_block` uses). A circuit-breaker block
+    emits ``gave_up`` (not ``blocked``) and therefore has no reason here.
+    """
+    if not _has_sticky_block(conn, task_id):
+        return None
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (ValueError, TypeError):
+        return None
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return reason if isinstance(reason, str) else None
+
+
+def _is_review_bounce_reason(reason: Optional[str]) -> bool:
+    """True iff ``reason`` is the reviewer's review-changes-requested bounce.
+
+    Matched on the ``review-changes-requested`` prefix (leading whitespace
+    tolerated). Deliberately does NOT match ``awaiting-casey-signoff`` (the PASS
+    acceptance block) nor any other block reason.
+    """
+    return bool(reason) and reason.lstrip().startswith(_REVIEW_BOUNCE_REASON_PREFIX)
+
+
+def _resolve_review_author(
+    conn: sqlite3.Connection, task_id: str, *, reviewer: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the original author a review-bounce card should route back to.
+
+    The card reached ``review`` via a MOVE that emitted an ``assigned`` event
+    carrying ``{"from": <author>, "to": <reviewer>}`` (see ``onecard.move_card``).
+    The author is the ``from`` of the most recent move whose ``to`` is the current
+    reviewer (the build→review hop) — keying on ``to == reviewer`` ignores this
+    router's OWN later ``assigned`` event (``from=reviewer, to=author``), so a
+    re-block→re-route loop can never resolve the author back to the reviewer.
+    Falls back to the most recent ``from``-bearing move whose ``from`` differs
+    from ``to`` when the reviewer is unknown. Resolving from event history — never
+    a literal profile name baked into core — keeps this consistent with the
+    existing ``bounce_review_to_author`` path. Returns None when unresolvable (so
+    the caller leaves the card for a human rather than guessing).
+    """
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'assigned' "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+
+    def _move(payload_str):
+        if not payload_str:
+            return None, None
+        try:
+            payload = json.loads(payload_str)
+        except (ValueError, TypeError):
+            return None, None
+        if not isinstance(payload, dict):
+            return None, None
+        frm = payload.get("from")
+        to = payload.get("to")
+        frm = frm.strip() if isinstance(frm, str) and frm.strip() else None
+        to = to.strip() if isinstance(to, str) and to.strip() else None
+        return frm, to
+
+    # Preferred: the move INTO the reviewer's hands (to == current reviewer).
+    if reviewer:
+        for row in rows:
+            frm, to = _move(row["payload"])
+            if frm and to == reviewer and frm != reviewer:
+                return frm
+    # Fallback: the most recent genuine reassignment (from != to).
+    for row in rows:
+        frm, to = _move(row["payload"])
+        if frm and frm != to:
+            return frm
+    return None
+
+
+def auto_route_review_bounce(
+    conn: sqlite3.Connection, *, enabled: bool = True,
+) -> int:
+    """Auto-route reviewer ``review-changes-requested`` blocks back to the author.
+
+    Closes the reviewer→author hop the GitHub ``pull_request_review`` webhook
+    cannot close when reviewer and author share one GitHub identity (the reviewer
+    falls back to a ``COMMENT`` event, which is not ``changes_requested``, so the
+    webhook router never bounces). The fix is board-internal: on the housekeeping
+    tick, a ``blocked`` card whose most-recent sticky block carries the
+    ``review-changes-requested`` reason is transitioned ``blocked → ready`` +
+    assignee = the original author, with an audit comment.
+
+    The reviewer's terminal action stays a clean ``kanban_block`` — this function
+    does the routing in the dispatcher, never the reviewer (which would reintroduce
+    the lane-corruption risk the clean-block design avoids).
+
+    Idempotency (load-bearing): the route flips the card off ``blocked``, so the
+    detector naturally won't re-fire for the same block on a later tick — two
+    consecutive ticks produce exactly one route and one audit comment.
+
+    The transition reuses :func:`unblock_task` so the routed card clears the same
+    respawn guards (``active_pr`` / ``recent_success``) a manual block→unblock
+    cutoff clears — the card is genuinely dispatchable, not a ``ready`` card the
+    guard skips. The audit comment is authored as ``dispatcher`` (a distinct
+    identity from the reviewer/author) and names the PR + verdict gist.
+
+    Returns the number of cards routed this call. ``enabled=False`` (config
+    ``kanban.auto_route_review_bounce: false``) makes it a no-op.
+    """
+    if not enabled:
+        return 0
+    routed = 0
+    blocked_rows = conn.execute(
+        "SELECT id, assignee FROM tasks WHERE status = 'blocked'"
+    ).fetchall()
+    for row in blocked_rows:
+        task_id = row["id"]
+        reason = _latest_sticky_block_reason(conn, task_id)
+        if not _is_review_bounce_reason(reason):
+            continue
+        author = _resolve_review_author(conn, task_id, reviewer=row["assignee"])
+        if not author or author == row["assignee"]:
+            # Unresolvable author, or the card is already assigned to the author
+            # (nothing to route) — leave it for a human rather than guessing.
+            continue
+        # Reassign to the author, then unblock. unblock_task emits the
+        # ``unblocked`` cutoff event (clears the active_pr guard) and resets
+        # consecutive_failures, exactly like a manual block→unblock cutoff.
+        with write_txn(conn):
+            upd = conn.execute(
+                "UPDATE tasks SET assignee = ? WHERE id = ? AND status = 'blocked'",
+                (author, task_id),
+            )
+            if upd.rowcount != 1:
+                # Card changed status between the scan and here — skip.
+                continue
+            _append_event(
+                conn, task_id, "assigned",
+                {"from": row["assignee"], "to": author, "by": "dispatcher:auto-route"},
+            )
+        if not unblock_task(conn, task_id):
+            continue
+        # Audit comment recording the auto-route, authored as the dispatcher so
+        # the trail attributes the action to a distinct identity. Mirrors the
+        # §9.1 ``[audit]`` shape used by the one-card move helpers.
+        gist = (reason or "").strip()
+        pr_match = _RESPAWN_GUARD_PR_URL_RE.search(gist)
+        pr = pr_match.group(0) if pr_match else None
+        body_lines = ["[audit] actor=dispatcher stage=rework"]
+        if pr:
+            body_lines.append(f"pr={pr}")
+        body_lines.append(f"notes: auto-routed review-changes-requested bounce back "
+                          f"to author {author}; {gist}")
+        try:
+            add_comment(conn, task_id, author="dispatcher", body="\n".join(body_lines))
+        except ValueError:
+            pass
+        routed += 1
+    return routed
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -4967,6 +5147,9 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    routed_review_bounce: int = 0
+    """Count of review-changes-requested blocks auto-routed back to their author
+    this tick (the reviewer→author hop). See :func:`auto_route_review_bounce`."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -6259,11 +6442,27 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    Skipped for review tasks: the build run that produced the artifact
     #    under review is itself a recent ``completed`` run, which would
     #    otherwise block the reviewer from ever spawning.
+    #    Honors an explicit unblock the same way the active_pr guard does
+    #    (below): when a card is deliberately unblocked to resume work (e.g. a
+    #    review-changes-requested bounce auto-routed back to the author, or any
+    #    operator block→unblock cutoff), the build run that triggered the
+    #    bounce/block is the very work being reworked — it must not veto the
+    #    respawn. An unblock causally FOLLOWS the completion that triggered the
+    #    review (complete → move-to-review → reviewer block → unblock), so a
+    #    completed run is "superseded" by any ``unblocked`` event recorded at or
+    #    after that run's completion (``created_at >= ended_at`` — second-granular,
+    #    so a same-second unblock clears it, matching the causal order). A run
+    #    with no such trailing unblock still guards (the normal post-build case).
     if not is_review:
         cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
         if conn.execute(
-            "SELECT id FROM task_runs "
-            "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
+            "SELECT r.id FROM task_runs r "
+            "WHERE r.task_id = ? AND r.outcome = 'completed' AND r.ended_at >= ? "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM task_events e "
+            "  WHERE e.task_id = r.task_id AND e.kind = 'unblocked' "
+            "  AND e.created_at >= r.ended_at"
+            ")",
             (task_id, cutoff),
         ).fetchone():
             return "recent_success"
@@ -6276,6 +6475,13 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    addressing review feedback) and only guard on PR URLs added at or after
     #    that unblock. Timestamps are second-granular, so a same-second PR URL is
     #    still guarded conservatively. (Carried from upstream PR #46204.)
+    #    The dispatcher's OWN auto-route audit comment (authored ``dispatcher``)
+    #    records the EXISTING PR being reworked — it is posted in the same second
+    #    as the routing unblock, so the same-second-conservative rule above would
+    #    otherwise re-trip the guard on the dispatcher's own audit. The dispatcher
+    #    never opens a PR, so its audit is excluded from the dup-PR scan (analogous
+    #    to the review-status carve-out): a real builder/worker PR comment still
+    #    guards normally.
     if not is_review:
         pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
         latest_unblock = conn.execute(
@@ -6286,7 +6492,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         if latest_unblock and latest_unblock["ts"] is not None:
             pr_cutoff = max(pr_cutoff, int(latest_unblock["ts"]))
         for c in conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            "SELECT body FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ? AND author != 'dispatcher'",
             (task_id, pr_cutoff),
         ).fetchall():
             if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
@@ -6365,6 +6572,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    auto_route_review_bounce_enabled: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -6421,6 +6629,13 @@ def dispatch_once(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Auto-route reviewer review-changes-requested blocks back to the author
+    # (close the reviewer→author hop the GitHub webhook can't when reviewer and
+    # author share one identity). Runs BEFORE recompute_ready so a routed card —
+    # left in ``ready`` by unblock_task — is eligible to spawn this same tick.
+    result.routed_review_bounce = auto_route_review_bounce(
+        conn, enabled=auto_route_review_bounce_enabled,
+    )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
