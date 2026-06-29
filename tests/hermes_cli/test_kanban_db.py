@@ -913,6 +913,199 @@ def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Stale-claim cleanup for dead workers in NON-running lanes (review wedge).
+#
+# A worker can die (or be killed) while its card sits in a non-``running``
+# lane — e.g. ``review`` after the implementer opened a PR and moved it on.
+# The dead worker leaves ``claim_lock`` + ``worker_pid`` populated. Because
+# the review-column dispatch query gates on ``claim_lock IS NULL``, the next
+# worker (the reviewer) can't spawn until the 1h stale-claim TTL frees it —
+# the lane wedges. ``detect_crashed_workers`` is the fast path that should
+# clear it, but it historically scanned only ``status='running'`` and so
+# never inspected the review card. The fix: clear a dead host-local
+# ``worker_pid``'s claim regardless of lane, WITHOUT a spurious lane change
+# (a dead worker in ``review`` keeps status=``review`` so the reviewer
+# re-spawns; it is NOT yanked back to ``ready``).
+# ---------------------------------------------------------------------------
+
+
+def test_reaper_clears_stale_claim_on_dead_worker_in_review_lane(
+    kanban_home, monkeypatch,
+):
+    """A dead host-local worker_pid on a ``review`` card has its claim
+    cleared in place, with status STAYING ``review`` (no lane change), so the
+    next reviewer can spawn on the following tick instead of waiting out the
+    1h TTL."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    # No grace suppression: started_at far in the past.
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="review wedge", assignee="reviewer")
+        # Card sits in ``review`` with a dead host-local worker still holding
+        # the claim (the exact state an exited rework worker leaves behind).
+        conn.execute(
+            "UPDATE tasks SET status='review', worker_pid=?, claim_lock=?, "
+            "claim_expires=?, started_at=? WHERE id=?",
+            (
+                64646,
+                f"{host}:dead-worker",
+                int(time.time()) + 3600,  # TTL not yet expired
+                int(time.time()) - 3600,  # outside any launch grace
+                tid,
+            ),
+        )
+        conn.commit()
+
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        # Claim state fully cleared so review dispatch can re-claim it.
+        assert task.claim_lock is None, "claim_lock must be cleared"
+        assert task.worker_pid is None, "worker_pid must be cleared"
+        assert task.claim_expires is None, "claim_expires must be cleared"
+        # CRITICAL: no spurious lane change — stays in review.
+        assert task.status == "review", (
+            f"dead worker in review must STAY review, got {task.status}"
+        )
+        # The clear is not a crash against the work item: the failure
+        # counter / breaker must not be touched for a non-running clear.
+        assert task.consecutive_failures == 0, (
+            "clearing a non-running stale claim must not count a failure"
+        )
+
+
+def test_reaper_clears_stale_claim_then_review_dispatch_permitted(
+    kanban_home, monkeypatch,
+):
+    """After the reaper clears a dead worker's claim on a ``review`` card, the
+    card matches the review-column dispatch query (``status='review' AND
+    claim_lock IS NULL``) — i.e. a fresh reviewer spawn is now permitted."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="review respawn", assignee="reviewer")
+        conn.execute(
+            "UPDATE tasks SET status='review', worker_pid=?, claim_lock=?, "
+            "claim_expires=?, started_at=? WHERE id=?",
+            (
+                64647,
+                f"{host}:dead-worker",
+                int(time.time()) + 3600,
+                int(time.time()) - 3600,
+                tid,
+            ),
+        )
+        conn.commit()
+
+        # Before the reaper: the stale claim hides the card from review
+        # dispatch (this is the wedge).
+        wedged = conn.execute(
+            "SELECT id FROM tasks "
+            "WHERE status = 'review' AND claim_lock IS NULL AND id = ?",
+            (tid,),
+        ).fetchone()
+        assert wedged is None, "precondition: stale claim wedges review dispatch"
+
+        kb.detect_crashed_workers(conn)
+
+        # After the reaper: the card is eligible for review dispatch again.
+        eligible = conn.execute(
+            "SELECT id FROM tasks "
+            "WHERE status = 'review' AND claim_lock IS NULL AND id = ?",
+            (tid,),
+        ).fetchone()
+        assert eligible is not None, (
+            "after reaper, review card must be re-claimable (claim cleared)"
+        )
+
+
+def test_reaper_respects_launch_grace_for_nonrunning_card(
+    kanban_home, monkeypatch,
+):
+    """A freshly-spawned worker on a ``review`` card (within the launch-grace
+    window) must NOT have its claim cleared, even if its PID isn't visible
+    yet — same protection as the running path."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.delenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", raising=False)
+
+    now = 3_000_000.0
+    monkeypatch.setattr(_kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="grace review", assignee="reviewer")
+        conn.execute(
+            "UPDATE tasks SET status='review', worker_pid=?, claim_lock=?, "
+            "claim_expires=?, started_at=? WHERE id=?",
+            (64648, f"{host}:fresh", int(now) + 3600, int(now), tid),
+        )
+        conn.commit()
+
+        # Within the default 30s grace: claim must be preserved.
+        kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.claim_lock is not None, (
+            "within launch grace, claim must NOT be cleared"
+        )
+        assert task.worker_pid == 64648
+        assert task.status == "review"
+
+        # Past the grace window: now the stale claim is cleared.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 60)
+        kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.claim_lock is None, "past grace, stale claim must clear"
+        assert task.status == "review", "still no lane change after grace clear"
+
+
+def test_reaper_ignores_other_host_claim_in_nonrunning_lane(
+    kanban_home, monkeypatch,
+):
+    """A claim owned by a DIFFERENT host on a ``review`` card is left alone —
+    its PID is meaningless to this host's liveness check."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="other host", assignee="reviewer")
+        conn.execute(
+            "UPDATE tasks SET status='review', worker_pid=?, claim_lock=?, "
+            "claim_expires=?, started_at=? WHERE id=?",
+            (
+                64649,
+                "some-other-host:worker",
+                int(time.time()) + 3600,
+                int(time.time()) - 3600,
+                tid,
+            ),
+        )
+        conn.commit()
+
+        kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.claim_lock == "some-other-host:worker", (
+            "foreign-host claim must not be touched"
+        )
+        assert task.worker_pid == 64649
+
+
+# ---------------------------------------------------------------------------
 # Rate-limit requeue: a worker that bails on a provider quota wall must be
 # released back to ``ready`` WITHOUT counting a failure, so a long (e.g.
 # 5-hour) quota window can't trip the circuit breaker and permanently block
