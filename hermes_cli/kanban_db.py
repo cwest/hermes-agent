@@ -821,6 +821,14 @@ class Task:
     # Goal-loop turn budget for ``goal_mode`` workers. ``None`` falls
     # through to the goals engine default (``goals.DEFAULT_MAX_TURNS``).
     goal_max_turns: Optional[int] = None
+    # Per-task override for the inner agent iteration budget
+    # (``agent.max_turns``). When set, the dispatcher exports it to the
+    # worker as ``HERMES_MAX_ITERATIONS`` (an env var ``cli.py`` already
+    # honors in its budget fallback chain). ``None`` (the common case)
+    # leaves the worker env clean so the global default (90) applies. This
+    # is distinct from ``goal_max_turns``, which bounds the OUTER goal loop,
+    # not the inner per-turn tool-call budget.
+    max_iterations: Optional[int] = None
     # Originating chat/agent session id, when the task was created from
     # within an agent loop that propagated ``HERMES_SESSION_ID``. NULL for
     # tasks created from the CLI, the dashboard, or any path that doesn't
@@ -898,6 +906,9 @@ class Task:
             ),
             goal_max_turns=(
                 row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
+            ),
+            max_iterations=(
+                row["max_iterations"] if "max_iterations" in keys and row["max_iterations"] else None
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
@@ -1058,6 +1069,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
+    -- Per-task override for the inner agent iteration budget
+    -- (``agent.max_turns``). When set, the dispatcher exports it to the
+    -- worker as ``HERMES_MAX_ITERATIONS`` (already honored by cli.py's
+    -- budget fallback chain). NULL (the common case) leaves the worker env
+    -- clean so the global default (90) applies. Distinct from
+    -- ``goal_max_turns`` (the outer goal-loop budget).
+    max_iterations       INTEGER,
     -- Originating chat/agent session id when the task was created from
     -- inside an agent loop that propagated ``HERMES_SESSION_ID``. NULL
     -- for tasks created from the CLI, dashboard, or any path that doesn't
@@ -1710,6 +1728,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "goal_max_turns", "goal_max_turns INTEGER"
         )
 
+    if "max_iterations" not in cols:
+        # Per-task inner agent iteration budget. NULL = global default (90).
+        _add_column_if_missing(
+            conn, "tasks", "max_iterations", "max_iterations INTEGER"
+        )
+
     if "session_id" not in cols:
         # Originating agent/chat session id, populated when the task is
         # created from within an agent loop that propagated
@@ -2133,6 +2157,7 @@ def create_task(
     max_retries: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    max_iterations: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -2329,8 +2354,9 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns,
+                        max_iterations, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2351,6 +2377,7 @@ def create_task(
                         int(max_retries) if max_retries is not None else None,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
+                        int(max_iterations) if max_iterations is not None else None,
                         session_id,
                     ),
                 )
@@ -7357,6 +7384,15 @@ def _default_spawn(
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
         if task.goal_max_turns is not None:
             env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
+    # Per-task inner iteration budget. Wire the task's value into the
+    # existing HERMES_MAX_ITERATIONS env var, which cli.py already honors in
+    # its budget fallback chain (config.yaml agent.max_turns wins over it,
+    # which is fine — a pinned profile budget is intentional). Set only when
+    # the card carries a value so a plain task keeps a clean env and falls
+    # through to the global default (90). Independent of goal_mode: this
+    # bounds the inner per-turn tool-call budget, not the outer goal loop.
+    if task.max_iterations is not None:
+        env["HERMES_MAX_ITERATIONS"] = str(int(task.max_iterations))
     terminal_timeout = _worker_terminal_timeout_env(
         task.max_runtime_seconds,
         env.get("TERMINAL_TIMEOUT"),
