@@ -5648,12 +5648,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
+        # Scan ANY card carrying a worker_pid, not just ``running`` ones. A
+        # worker can die while its card sits in a non-``running`` lane (e.g.
+        # ``review`` after the implementer opened a PR and the card moved on),
+        # leaving a stale ``claim_lock`` + ``worker_pid``. Those cards must
+        # have the dead claim cleared too — otherwise the lane wedges for the
+        # full stale-claim TTL because dispatch gates on ``claim_lock IS
+        # NULL``. The status drives WHAT we do (running -> crash/requeue;
+        # non-running -> in-place claim clear, no lane change), not WHETHER we
+        # look. See the per-status branch below.
         rows = conn.execute(
-            "SELECT t.id, t.worker_pid, t.claim_lock, "
+            "SELECT t.id, t.status, t.worker_pid, t.claim_lock, "
             "       COALESCE(r.started_at, t.started_at) AS active_started_at "
             "FROM tasks t "
             "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
+            "WHERE t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -5681,6 +5690,37 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if time.time() - active_started_at < grace:
                     continue
             if _pid_alive(row["worker_pid"]):
+                continue
+
+            # Non-``running`` lane: the worker that held this card died while
+            # it was parked somewhere other than ``running`` (most commonly
+            # ``review`` after a PR was opened). Clear the dead claim IN PLACE
+            # so the next worker for that lane can spawn on the following tick
+            # — but do NOT change the lane (a dead worker in ``review`` must
+            # STAY in ``review`` so the reviewer re-spawns; yanking it back to
+            # ``ready`` would lose the lane and re-trip respawn guards). This
+            # is a stale-claim cleanup, NOT a crash against the work item: it
+            # does not open/close a run, emit a ``crashed`` event, or touch
+            # the failure counter / circuit breaker (all of which are
+            # ``running``-crash semantics). The launch-grace and host-local
+            # checks above already protect a freshly-spawned worker here.
+            if row["status"] != "running":
+                cleared = conn.execute(
+                    "UPDATE tasks SET claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = ? AND worker_pid = ?",
+                    (row["id"], row["status"], row["worker_pid"]),
+                )
+                if cleared.rowcount == 1:
+                    _append_event(
+                        conn, row["id"], "stale_claim_cleared",
+                        {
+                            "pid": int(row["worker_pid"]),
+                            "claimer": row["claim_lock"],
+                            "lane": row["status"],
+                            "reason": "dead_worker_in_nonrunning_lane",
+                        },
+                    )
                 continue
 
             pid = int(row["worker_pid"])
