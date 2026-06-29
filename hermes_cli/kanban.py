@@ -76,6 +76,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        "max_iterations": t.max_iterations,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -355,6 +356,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--max-iterations", type=int, default=None,
+                          metavar="N", dest="max_iterations",
+                          help="Per-task inner agent iteration budget "
+                               "(agent.max_turns). Overrides the global "
+                               "default (90) for this card's worker. Use for "
+                               "large tasks that would otherwise exhaust the "
+                               "budget and time out. Distinct from "
+                               "--goal-max-turns (the outer goal-loop budget).")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1345,6 +1354,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            max_iterations=getattr(args, "max_iterations", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
@@ -1536,6 +1546,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
             print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
         else:
             print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+    # Per-task inner iteration budget. Only shown when overridden — an
+    # absent value means the worker uses the global default (90).
+    if task.max_iterations is not None:
+        print(f"  max-iterations: {task.max_iterations} (task)")
     print(f"  created:   {_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics section — surface active distress signals at the top
