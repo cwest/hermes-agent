@@ -163,6 +163,20 @@ class GatewayKanbanWatchersMixin:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
+        # 4c — transition emit bridge (event-driven orchestration). When enabled
+        # (config kanban.transition_emit.enabled, default OFF / restart-gated), a
+        # delivered transition of a configured kind ALSO POSTs to a loopback
+        # webhook route so the orchestrator wakes as an agent RUN (not just a chat
+        # ping). Default-off means this block is a no-op until Casey enables it;
+        # the chat-ping delivery above is unchanged either way.
+        transition_emit_cfg = (
+            kanban_cfg.get("transition_emit", {}) if isinstance(kanban_cfg, dict) else {}
+        )
+        transition_emit_secret = None
+        if transition_emit_cfg.get("enabled") is True:
+            # Secret bridges to an internal var; never a user-facing HERMES_* knob.
+            transition_emit_secret = os.environ.get("HERMES_KANBAN_TRANSITION_SECRET")
+
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
@@ -406,6 +420,38 @@ class GatewayKanbanWatchersMixin:
                                     )
                             # Reset the failure state on success.
                             sub_fail_states.pop(sub_key, None)
+
+                            # 4c — agent-run bridge: after the chat ping is
+                            # delivered, ALSO wake the orchestrator as an agent
+                            # run for configured transition kinds (default OFF).
+                            if transition_emit_secret:
+                                try:
+                                    from gateway.kanban_transition_emit import (
+                                        should_emit_transition,
+                                        build_transition_payload,
+                                        emit_transition,
+                                    )
+                                    if should_emit_transition(transition_emit_cfg, kind):
+                                        reason_val = None
+                                        if ev.payload and ev.payload.get("reason"):
+                                            reason_val = str(ev.payload["reason"])
+                                        payload = build_transition_payload(
+                                            task_id=sub["task_id"],
+                                            board=board_slug or "default",
+                                            kind=kind,
+                                            reason=reason_val,
+                                            event_id=int(getattr(ev, "id", 0) or 0),
+                                            title=title,
+                                        )
+                                        await emit_transition(
+                                            transition_emit_cfg, payload,
+                                            transition_emit_secret,
+                                        )
+                                except Exception as emit_exc:
+                                    logger.debug(
+                                        "kanban transition emit for %s failed: %s",
+                                        sub["task_id"], emit_exc,
+                                    )
                         except Exception as exc:
                             state = sub_fail_states.setdefault(sub_key, {})
                             fails = state.get("fails", 0) + 1

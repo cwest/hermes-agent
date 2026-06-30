@@ -1,0 +1,155 @@
+"""Kanban → loopback-webhook transition emit bridge (event-driven orchestration 4c).
+
+Purpose
+-------
+The native gateway notifier (`_kanban_notifier_watcher`) delivers a kanban
+lifecycle event as a *chat message* to subscribed sources. That covers
+"ping Casey when a card reaches acceptance / done." It does NOT wake the
+orchestrator as an *agent run* — i.e. let a transition trigger reasoning
+(verify the head SHA, compose the exact merge command, post acceptance context).
+
+This module is the thin, additive bridge that turns a transition into an agent
+run by POSTing to a loopback webhook route (`/webhooks/kanban-transition`),
+mirroring exactly how a GitHub `pull_request` event triggers `stage-pr-review`.
+
+Footprint / safety
+------------------
+- **Pure decision logic** (`should_emit_transition`, `build_transition_payload`)
+  lives here and is fully unit-testable without a gateway or HTTP server.
+- The actual POST is a tiny coroutine (`emit_transition`) the notifier calls.
+- **Config-flagged, default OFF.** `kanban.transition_emit.enabled` defaults to
+  False, so this ships dark and goes live only when Casey enables it + restarts
+  (restart-gated, like every gateway-loop config). Until then the notifier path
+  is byte-for-byte unchanged.
+- **No new core tool**, no new model surface. It reuses the existing webhook
+  adapter (the route + its skill), HMAC-signed and loopback-bound, with an
+  idempotency key so a retry never double-triggers an agent run.
+
+The route + its orchestrator skill are wired separately (see
+``scripts/webhook-ensure-kanban-transition-route.py`` and the
+``kanban-transition-orchestrate`` skill); this module is the gateway-side emitter.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import logging
+from typing import Any, Optional
+
+logger = logging.getLogger("gateway.run")
+
+# Kinds that should wake an AGENT RUN (not merely a chat ping). The acceptance
+# signal (`blocked` = block+casey) is the high-value, proven-painful case: a card
+# reaching Casey's lane should let the orchestrator post the exact merge context.
+# `completed`/done is deliberately NOT here — done is a close-loop chat ping, not a
+# reasoning task. Override via config `kanban.transition_emit.emit_kinds`.
+DEFAULT_EMIT_KINDS: tuple[str, ...] = ("blocked",)
+
+DEFAULT_ROUTE = "kanban-transition"
+# The webhook adapter binds loopback by default; the bridge POSTs to itself.
+DEFAULT_WEBHOOK_HOST = "127.0.0.1"
+DEFAULT_WEBHOOK_PORT = 8644
+
+
+def should_emit_transition(cfg: Optional[dict], kind: str) -> bool:
+    """True when a transition of ``kind`` should POST to the orchestrator route.
+
+    Disabled (falsy cfg or ``enabled`` not True) => always False, so the feature
+    ships dark. Enabled => emit only for the configured kinds (default:
+    ``DEFAULT_EMIT_KINDS``).
+    """
+    if not cfg or not isinstance(cfg, dict):
+        return False
+    if cfg.get("enabled") is not True:
+        return False
+    kinds = cfg.get("emit_kinds")
+    if not kinds:
+        kinds = DEFAULT_EMIT_KINDS
+    return kind in set(kinds)
+
+
+def build_transition_payload(
+    *,
+    task_id: str,
+    board: str,
+    kind: str,
+    reason: Optional[str],
+    event_id: int,
+    title: str = "",
+) -> dict[str, Any]:
+    """Build the JSON body POSTed to the kanban-transition route.
+
+    The idempotency key is stable per ``(board, task_id, kind, event_id)`` so a
+    webhook retry or a duplicate notifier tick converges on one agent run.
+    """
+    return {
+        "task_id": task_id,
+        "board": board,
+        "kind": kind,
+        "reason": reason or "",
+        "title": title or "",
+        "event_id": event_id,
+        "idempotency_key": (
+            f"kanban-transition:{board}:{task_id}:{kind}:{event_id}"
+        ),
+    }
+
+
+def _sign(secret: str, body: bytes) -> str:
+    """GitHub-style HMAC-SHA256 hex signature (``sha256=<hex>``)."""
+    mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256)
+    return "sha256=" + mac.hexdigest()
+
+
+def route_url(cfg: dict) -> str:
+    host = cfg.get("webhook_host", DEFAULT_WEBHOOK_HOST)
+    port = int(cfg.get("webhook_port", DEFAULT_WEBHOOK_PORT))
+    route = cfg.get("route", DEFAULT_ROUTE)
+    return f"http://{host}:{port}/webhooks/{route}"
+
+
+async def emit_transition(cfg: dict, payload: dict, secret: str) -> bool:
+    """POST the transition payload to the loopback webhook route.
+
+    Returns True on a 2xx response, False otherwise. Never raises — a bridge
+    failure must not break the notifier tick (the chat-ping delivery already
+    happened; this is the additive agent-run leg). Requires ``aiohttp`` (the
+    same dependency the webhook adapter already needs); if unavailable, logs and
+    returns False.
+    """
+    try:
+        from aiohttp import ClientSession, ClientTimeout
+    except Exception:  # pragma: no cover - aiohttp present wherever webhook runs
+        logger.warning("kanban transition emit: aiohttp unavailable; skipping")
+        return False
+
+    url = route_url(cfg)
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        # The route's HMAC validation header (the webhook adapter accepts the
+        # GitHub-style X-Hub-Signature-256). The route also filters on event type.
+        "X-Hub-Signature-256": _sign(secret, body),
+        "X-Kanban-Event": payload.get("kind", ""),
+        "X-Idempotency-Key": payload.get("idempotency_key", ""),
+    }
+    try:
+        timeout = ClientTimeout(total=float(cfg.get("timeout_seconds", 10)))
+        async with ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=body, headers=headers) as resp:
+                if 200 <= resp.status < 300:
+                    logger.info(
+                        "kanban transition emit: POST %s -> %s (task %s, %s)",
+                        url, resp.status, payload.get("task_id"), payload.get("kind"),
+                    )
+                    return True
+                logger.warning(
+                    "kanban transition emit: POST %s -> %s (task %s)",
+                    url, resp.status, payload.get("task_id"),
+                )
+                return False
+    except Exception as exc:
+        logger.warning("kanban transition emit: POST %s failed: %s", url, exc)
+        return False
