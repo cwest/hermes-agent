@@ -218,7 +218,11 @@ async def test_notifier_second_blocked_delivers(kanban_home):
             timeout=10.0,
         )
 
-    blocked_deliveries = [m for m in delivered_msgs if "blocked" in m]
+    # Filter to the *blocked* deliveries only. The notifier now also delivers
+    # the intervening `unblocked` transition (a card changing lanes at all is
+    # notifiable), so match the whole word " blocked" — a bare "blocked"
+    # substring would also catch "unblocked".
+    blocked_deliveries = [m for m in delivered_msgs if " blocked" in m]
     assert "second block" not in blocked_deliveries[0]
     assert "second block" in blocked_deliveries[1]
     assert len(blocked_deliveries) == 2, (

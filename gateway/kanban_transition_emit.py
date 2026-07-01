@@ -40,12 +40,15 @@ from typing import Any, Optional
 
 logger = logging.getLogger("gateway.run")
 
-# Kinds that should wake an AGENT RUN (not merely a chat ping). The acceptance
-# signal (`blocked` = block+casey) is the high-value, proven-painful case: a card
-# reaching Casey's lane should let the orchestrator post the exact merge context.
-# `completed`/done is deliberately NOT here — done is a close-loop chat ping, not a
-# reasoning task. Override via config `kanban.transition_emit.emit_kinds`.
-DEFAULT_EMIT_KINDS: tuple[str, ...] = ("blocked",)
+# Kinds that should wake an AGENT RUN (not merely a chat ping). Two proven-painful
+# cases lead: the acceptance signal (`blocked` = block+casey), where the
+# orchestrator posts the exact merge context; and `block_loop_detected` — the
+# auto-escalate-to-`triage` signal, i.e. the system asking for a human. That
+# escalation is the HIGHEST-value wake (a card gave up retrying and needs a
+# decision), and it used to fire NOTHING at all. `completed`/done is deliberately
+# NOT here — done is a close-loop chat ping, not a reasoning task. Override via
+# config `kanban.transition_emit.emit_kinds`.
+DEFAULT_EMIT_KINDS: tuple[str, ...] = ("blocked", "block_loop_detected")
 
 DEFAULT_ROUTE = "kanban-transition"
 # The webhook adapter binds loopback by default; the bridge POSTs to itself.
