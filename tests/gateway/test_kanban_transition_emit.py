@@ -91,6 +91,60 @@ def test_missing_reason_yields_empty_string_not_none():
     assert payload["reason"] == ""
 
 
+def test_payload_event_type_is_extractable_by_the_webhook_adapter():
+    """Regression: the built payload MUST carry the transition kind in a field
+    the webhook adapter's event-type extraction reads, or the route ignores it.
+
+    The adapter (gateway/platforms/webhook.py) resolves the incoming event type
+    from, in precedence order:
+
+        X-GitHub-Event header -> X-GitLab-Event header
+        -> payload["event_type"] -> payload["type"] -> "unknown"
+
+    The loopback emitter sends no GitHub/GitLab header, so the ONLY way the
+    adapter can classify a kanban transition is a body field. If the payload
+    lacks ``event_type``/``type``, extraction falls through to ``"unknown"``,
+    which is not in the route's ``events`` allowlist ([blocked, completed]) —
+    so the adapter returns ``{"status": "ignored"}`` with a 200 and NEVER
+    spawns the orchestrator run. That is the exact production symptom this
+    guards against (200 received, no agent run).
+
+    This test replicates the adapter's extraction precedence against the built
+    payload (no HTTP headers, mirroring the loopback POST) and asserts the
+    transition kind is recovered — i.e. the emitter and the adapter agree on
+    the wire contract.
+    """
+    kind = "blocked"
+    payload = build_transition_payload(
+        task_id="t_evt", board="default", kind=kind, reason="r", event_id=7,
+    )
+
+    # Replicate the adapter's exact extraction chain with NO request headers,
+    # which is how the loopback bridge POSTs (it uses X-Kanban-Event, a header
+    # the adapter does not consult for event classification).
+    headers: dict[str, str] = {}
+    event_type = (
+        headers.get("X-GitHub-Event", "")
+        or headers.get("X-GitLab-Event", "")
+        or payload.get("event_type", "")
+        or payload.get("type", "")
+        or "unknown"
+    )
+
+    assert event_type == kind, (
+        "adapter would classify the transition as %r, so a route filtering on "
+        "[blocked, completed] ignores it and no orchestrator run spawns" % event_type
+    )
+
+    # And an explicit allowlist check mirroring the adapter's filter:
+    allowed_events = ["blocked", "completed"]
+    assert event_type in allowed_events, (
+        "extracted event %r must be in the route allowlist so the POST "
+        "dispatches an agent run instead of returning {'status': 'ignored'}"
+        % event_type
+    )
+
+
 # --- Integration: the wired notifier loop actually invokes the bridge ----------
 
 import asyncio  # noqa: E402
