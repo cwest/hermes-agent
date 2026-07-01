@@ -121,3 +121,33 @@ def test_origin_source_none_when_fields_absent():
 def test_origin_source_unknown_platform_falls_back():
     adapter = _make_adapter(_kt_route())
     assert adapter._build_origin_source("nope", "123", "123") is None
+
+
+@pytest.mark.asyncio
+async def test_wake_event_is_tagged_for_busy_bypass():
+    """Defect 1: the origin-routed wake event must be TAGGED so the adapter's
+    busy path never text-merges/debounces it (it produces its own turn)."""
+    adapter = _make_adapter(_kt_route())
+    captured = {}
+
+    async def _capture(event):
+        captured["event"] = event
+
+    adapter.handle_message = AsyncMock(side_effect=_capture)
+
+    async with TestClient(TestServer(_app(adapter))) as cli:
+        resp = await cli.post(
+            "/webhooks/kanban-transition",
+            json={
+                "event_type": "status_changed",
+                "task_id": "t_abc",
+                "title": "probe card",
+                "origin_platform": "discord",
+                "origin_chat_id": "1520255822704152666",
+                "origin_thread_id": "1520255822704152666",
+            },
+        )
+        assert resp.status == 202
+
+    ev = captured["event"]
+    assert ev.metadata.get("kanban_transition_wake") is True
