@@ -160,7 +160,13 @@ class GatewayKanbanWatchersMixin:
         self._kanban_sub_fail_states = sub_fail_states
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
-            notifier_profile = self._active_profile_name()
+            # Resolve via the shared canonical resolver so the notifier's
+            # owner-profile gate and every subscribe site agree on ONE value
+            # (config kanban.notifier_profile → active profile → "default").
+            try:
+                notifier_profile = _kb.notifier_delivery_profile()
+            except Exception:
+                notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
         # 4c — transition emit bridge (event-driven orchestration). When enabled
@@ -435,6 +441,13 @@ class GatewayKanbanWatchersMixin:
                                         reason_val = None
                                         if ev.payload and ev.payload.get("reason"):
                                             reason_val = str(ev.payload["reason"])
+                                        # Carry the ORIGIN (session + thread) so the
+                                        # woken orchestrator reports back to the
+                                        # thread this work was born in, not a
+                                        # contextless webhook session. session_id
+                                        # comes from the card; the thread source
+                                        # from the subscription being delivered.
+                                        origin_sid = getattr(task, "session_id", None) if task else None
                                         payload = build_transition_payload(
                                             task_id=sub["task_id"],
                                             board=board_slug or "default",
@@ -442,6 +455,10 @@ class GatewayKanbanWatchersMixin:
                                             reason=reason_val,
                                             event_id=int(getattr(ev, "id", 0) or 0),
                                             title=title,
+                                            origin_session_id=origin_sid,
+                                            origin_platform=sub.get("platform"),
+                                            origin_chat_id=sub.get("chat_id"),
+                                            origin_thread_id=sub.get("thread_id"),
                                         )
                                         await emit_transition(
                                             transition_emit_cfg, payload,

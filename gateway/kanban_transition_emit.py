@@ -78,13 +78,23 @@ def build_transition_payload(
     reason: Optional[str],
     event_id: int,
     title: str = "",
+    origin_session_id: Optional[str] = None,
+    origin_platform: Optional[str] = None,
+    origin_chat_id: Optional[str] = None,
+    origin_thread_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build the JSON body POSTed to the kanban-transition route.
 
     The idempotency key is stable per ``(board, task_id, kind, event_id)`` so a
     webhook retry or a duplicate notifier tick converges on one agent run.
+
+    The ``origin_*`` fields carry the thread/session this work was born in, so
+    the woken orchestrator reports back to that origin thread (the autonomy
+    contract) instead of a contextless webhook session. They are omitted from
+    the body when unknown (cron/webhook/direct-origin work), and the route's
+    handler falls back to the default channel.
     """
-    return {
+    body: dict[str, Any] = {
         "task_id": task_id,
         "board": board,
         "kind": kind,
@@ -104,12 +114,64 @@ def build_transition_payload(
             f"kanban-transition:{board}:{task_id}:{kind}:{event_id}"
         ),
     }
+    # Origin routing (only when known — keeps the body byte-stable for the
+    # no-origin case and lets the route fall back to the default channel).
+    if origin_session_id:
+        body["origin_session_id"] = origin_session_id
+    if origin_platform:
+        body["origin_platform"] = origin_platform
+    if origin_chat_id:
+        body["origin_chat_id"] = origin_chat_id
+    if origin_thread_id:
+        body["origin_thread_id"] = origin_thread_id
+    return body
 
 
 def _sign(secret: str, body: bytes) -> str:
     """GitHub-style HMAC-SHA256 hex signature (``sha256=<hex>``)."""
     mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256)
     return "sha256=" + mac.hexdigest()
+
+
+def resolve_transition_target(
+    *,
+    session_id: Optional[str],
+    sub: Optional[dict],
+    default_channel: str,
+) -> dict[str, Any]:
+    """Resolve WHERE a transition wake should be delivered.
+
+    The autonomy contract: work born in a thread reports back to THAT thread and
+    wakes THAT session (so both Casey sees it in the open AND Hollis resumes with
+    context). Only when a card has no origin (cron/webhook/direct work) do we
+    fall back to the default channel.
+
+    Precedence:
+      1. The card's origin session + its subscribed thread source (the thread it
+         was born in). ``is_fallback=False``.
+      2. The default channel (Casey's #5), when there is no origin session and no
+         subscribed thread. ``is_fallback=True``.
+
+    Never targets a throwaway ``webhook:kanban-transition:*`` session — that is
+    the F3 bug this replaces (the wake fired into a contextless session and died
+    in the log).
+    """
+    if session_id or sub:
+        s = sub or {}
+        return {
+            "session_id": session_id or None,
+            "platform": s.get("platform") or None,
+            "chat_id": s.get("chat_id") or None,
+            "thread_id": s.get("thread_id") or None,
+            "is_fallback": False,
+        }
+    return {
+        "session_id": None,
+        "platform": None,
+        "chat_id": default_channel,
+        "thread_id": None,
+        "is_fallback": True,
+    }
 
 
 def route_url(cfg: dict) -> str:

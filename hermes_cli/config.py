@@ -2330,6 +2330,13 @@ DEFAULT_CONFIG = {
         # decomposer prompt, model, or skills; configure that LLM path under
         # auxiliary.kanban_decomposer.
         "orchestrator_profile": "",
+        # Profile of the gateway that DELIVERS kanban terminal-event
+        # notifications. A notify-subscription must be owned by this profile or
+        # the notifier's owner-profile gate silently drops it (a sub stamped
+        # with a worker's profile never reaches the shared gateway). When unset,
+        # resolves to the active profile, then "default". Subscribe sites default
+        # to this via kanban_db.notifier_delivery_profile().
+        "notifier_profile": "",
         # Where a child task lands if the orchestrator can't match an
         # assignee to any installed profile. When unset, falls back to the
         # default profile. A task never ends up with assignee=None.

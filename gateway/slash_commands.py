@@ -45,6 +45,31 @@ from utils import (
 logger = logging.getLogger("gateway.run")
 
 
+def _origin_session_key(source: SessionSource, config_extra: dict) -> str:
+    """Derive the origin session key EXACTLY as the live inbound path does.
+
+    A card created from a thread stamps this key so a later terminal transition
+    can wake the originating session and report back to its thread. That wake
+    only lands if the stamped key is byte-identical to the key the inbound path
+    (``base.handle_message`` -> :func:`build_session_key`) builds for the same
+    source. So this mirrors inbound precisely:
+
+    - read ``group_sessions_per_user`` / ``thread_sessions_per_user`` from the
+      platform's ``extra`` config (same source, same defaults), and
+    - pass NO profile — inbound omits it, so the namespace is ``agent:main``.
+
+    Injecting a profile namespace or assuming default per-user flags (as an
+    earlier version did) makes the stamped key diverge under
+    ``thread_sessions_per_user: true`` or a non-default notifier profile, and
+    the transition then wakes a session that never existed.
+    """
+    return build_session_key(
+        source,
+        group_sessions_per_user=config_extra.get("group_sessions_per_user", True),
+        thread_sessions_per_user=config_extra.get("thread_sessions_per_user", False),
+    )
+
+
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
@@ -310,7 +335,6 @@ class GatewaySlashCommandsMixin:
         """
         import asyncio
         import re
-        import shlex
         from hermes_cli.kanban import run_slash
 
         text = (event.text or "").strip()
@@ -340,6 +364,22 @@ class GatewaySlashCommandsMixin:
             break
 
         is_create = action == "create"
+
+        # F2 — stamp the ORIGIN session on a card created from a thread, so a
+        # later terminal transition can wake THAT session and report back to its
+        # origin thread (the autonomy contract). Only for `create`, only when the
+        # caller didn't already pass --session-id, and only when we can derive a
+        # session key from the message source.
+        if is_create and "--session-id" not in tokens and "--session-id" not in text:
+            try:
+                origin_session = _origin_session_key(
+                    event.source,
+                    getattr(getattr(self, "config", None), "extra", None) or {},
+                )
+                if origin_session:
+                    text = f"{text} --session-id {shlex.quote(origin_session)}"
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("kanban create origin-session stamp failed: %s", exc)
 
         try:
             output = await asyncio.to_thread(run_slash, text)
@@ -373,7 +413,13 @@ class GatewaySlashCommandsMixin:
                                     platform=platform_str, chat_id=chat_id,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
-                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                                    # Own the sub with the DELIVERING gateway's
+                                    # profile (canonical resolver), not the
+                                    # creator's — else the notifier drops it.
+                                    notifier_profile=(
+                                        getattr(self, "_kanban_notifier_profile", None)
+                                        or _kb.notifier_delivery_profile()
+                                    ),
                                 )
                             finally:
                                 conn.close()

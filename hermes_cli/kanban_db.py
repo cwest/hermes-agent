@@ -7943,6 +7943,40 @@ def task_age(task: Task) -> dict:
 # Notification subscriptions (used by the gateway kanban-notifier)
 # ---------------------------------------------------------------------------
 
+def notifier_delivery_profile() -> str:
+    """The profile of the gateway that will DELIVER kanban notifications.
+
+    This is the single source of truth for notification ownership. A
+    notify-subscription must be stamped with THIS profile (not the profile of
+    whoever created the sub), because the notifier's owner-profile gate only
+    delivers subs whose ``notifier_profile`` matches the running notifier's
+    profile. A sub created under a worker profile (``salton``/``avram``/…) but
+    intended for the shared gateway must be owned by the delivering gateway, or
+    it is silently dropped.
+
+    Resolution order (never raises, never returns empty):
+      1. config ``kanban.notifier_profile`` (explicit operator setting), else
+      2. the active profile (``get_active_profile_name()``), else
+      3. ``"default"``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        val = kanban_cfg.get("notifier_profile") if isinstance(kanban_cfg, dict) else None
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
