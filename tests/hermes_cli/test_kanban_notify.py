@@ -45,7 +45,7 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
-    runner._kanban_sub_fail_counts = {}
+    runner._kanban_sub_fail_states = {}
 
     fake_adapter = MagicMock()
 
@@ -105,7 +105,7 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
-    runner._kanban_sub_fail_counts = {}
+    runner._kanban_sub_fail_states = {}
 
     fake_adapter = MagicMock()
 
@@ -160,7 +160,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
-    runner._kanban_sub_fail_counts = {}
+    runner._kanban_sub_fail_states = {}
 
     delivered_msgs: list[str] = []
 
@@ -255,7 +255,7 @@ async def test_notifier_does_not_call_init_db(kanban_home):
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
-    runner._kanban_sub_fail_counts = {}
+    runner._kanban_sub_fail_states = {}
 
     fake_adapter = MagicMock()
     fake_adapter.send = AsyncMock()
@@ -353,7 +353,7 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
-    runner._kanban_sub_fail_counts = {}
+    runner._kanban_sub_fail_states = {}
     runner._kanban_notifier_profile = "business-partner"
 
     fake_adapter = MagicMock()
@@ -409,7 +409,7 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
-    runner._kanban_sub_fail_counts = {}
+    runner._kanban_sub_fail_states = {}
     runner._kanban_notifier_profile = "default"
 
     fake_adapter = MagicMock()
@@ -538,7 +538,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
-    runner._kanban_sub_fail_counts = {}
+    runner._kanban_sub_fail_states = {}
 
     fake_adapter = MagicMock()
     fake_adapter.name = "telegram"
@@ -622,7 +622,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
-    runner._kanban_sub_fail_counts = {}
+    runner._kanban_sub_fail_states = {}
 
     fake_adapter = MagicMock()
     fake_adapter.name = "telegram"

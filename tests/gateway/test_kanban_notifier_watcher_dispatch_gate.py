@@ -16,7 +16,7 @@ def _make_runner(with_adapter=False):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: MagicMock()} if with_adapter else {}
-    runner._kanban_sub_fail_counts = {}
+    runner._kanban_sub_fail_states = {}
     return runner
 
 
