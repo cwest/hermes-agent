@@ -6789,12 +6789,18 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
         seconds.  Useful work already succeeded for this task; wait for
-        human review rather than immediately re-spawning.
+        human review rather than immediately re-spawning.  **Skipped when
+        the task is in status ``review``** — the build run that produced
+        the artifact under review is itself a recent ``completed`` run, so
+        this guard would otherwise wedge the reviewer out for the window.
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        **Skipped when the task is in status ``review``** — a reviewer
+        never opens a PR, and the PR-URL comment is exactly what it needs
+        to act on, not a duplicate-PR risk.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -6802,13 +6808,21 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, status FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return None
 
     now = int(time.time())
+
+    # A reviewer never opens a PR, so the dup-PR (step 4) and recent-success
+    # (step 3) guards are irrelevant to a review pass — yet they'd wedge a
+    # review-status card for up to 24h, because the BUILD run that shipped the
+    # PR counts as a recent ``completed`` run AND left a PR-URL comment. The
+    # rate-limit cooldown (step 1) and auth blocker (step 2) still apply: a
+    # rate-limited or auth-blocked reviewer should defer like any other spawn.
+    is_review = row["status"] == "review"
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
@@ -6852,22 +6866,29 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "blocker_auth"
 
     # 3. Completed run within guard window — proof of recent success.
-    cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
-    if conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
-        (task_id, cutoff),
-    ).fetchone():
-        return "recent_success"
+    #    Skipped for review tasks: the build run that produced the artifact
+    #    under review is itself a recent ``completed`` run, which would
+    #    otherwise block the reviewer from ever spawning.
+    if not is_review:
+        cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
+        if conn.execute(
+            "SELECT id FROM task_runs "
+            "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
+            (task_id, cutoff),
+        ).fetchone():
+            return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    #    Skipped for review tasks: the PR-URL comment is exactly what the
+    #    reviewer needs to act on, not a signal of a duplicate-PR risk.
+    if not is_review:
+        pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        for c in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            (task_id, pr_cutoff),
+        ).fetchall():
+            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+                return "active_pr"
 
     return None
 
