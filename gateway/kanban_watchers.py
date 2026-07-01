@@ -162,6 +162,21 @@ class GatewayKanbanWatchersMixin:
             return
 
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        # A card changing lanes AT ALL is a notifiable event — not only the five
+        # terminal kinds. The old gate delivered TERMINAL_KINDS and silently
+        # dropped every other transition (`assigned`, `unblocked`, and critically
+        # `block_loop_detected` — the auto-escalate-to-`triage` signal, i.e. the
+        # system asking for a human). A card could escalate to triage and sit
+        # silent. NOTIFY_KINDS is the delivery gate: the terminal five PLUS the
+        # meaningful lane changes. It deliberately EXCLUDES high-frequency
+        # bookkeeping kinds (heartbeat/claimed/commented/spawned/created/
+        # scheduled/edited/linked/...) so a lane change pings but routine churn
+        # does not. TERMINAL_KINDS is retained below only for the per-kind
+        # message wording and the unsub-on-final-status decision.
+        NOTIFY_KINDS = TERMINAL_KINDS + (
+            "block_loop_detected", "unblocked", "assigned",
+            "promoted", "reclaimed", "stale", "dependency_wait",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -214,6 +229,23 @@ class GatewayKanbanWatchersMixin:
         if transition_emit_cfg.get("enabled") is True:
             # Secret bridges to an internal var; never a user-facing HERMES_* knob.
             transition_emit_secret = os.environ.get("HERMES_KANBAN_TRANSITION_SECRET")
+
+        # Fallback delivery target — so a transition on a card that carries NO
+        # origin subscription is NEVER silent. When a task has an unseen
+        # notifiable event but no subscription at all, the notifier lazily
+        # registers a fallback subscription to the default channel (Casey's #5),
+        # then the normal claim/cursor/dedup machinery delivers it. Both the
+        # channel and its platform are config-overridable
+        # (kanban.notify_fallback.{chat_id,platform}); the default is the
+        # thread-origin-autonomy default channel. Empty chat_id disables the
+        # fallback entirely (opt-out).
+        notify_fallback_cfg = (
+            kanban_cfg.get("notify_fallback", {}) if isinstance(kanban_cfg, dict) else {}
+        )
+        if not isinstance(notify_fallback_cfg, dict):
+            notify_fallback_cfg = {}
+        fallback_chat_id = notify_fallback_cfg.get("chat_id", "1515879019269197885")
+        fallback_platform = (notify_fallback_cfg.get("platform") or "discord").lower()
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -307,7 +339,7 @@ class GatewayKanbanWatchersMixin:
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=NOTIFY_KINDS,
                                 )
                                 if not events:
                                     continue
@@ -324,6 +356,131 @@ class GatewayKanbanWatchersMixin:
                                     "task": task,
                                     "board": slug,
                                 })
+
+                            # Fallback pass: a card can transition with NO
+                            # subscription at all (cron/webhook/direct-origin
+                            # work, or a card whose origin was never stamped).
+                            # Such a transition used to sit completely silent.
+                            # For every task with an unseen notifiable event and
+                            # no real subscription, lazily register a fallback
+                            # sub to the default channel so the SAME cursor/dedup
+                            # machinery delivers it exactly once. Skipped when the
+                            # fallback is disabled (empty chat_id) or no adapter
+                            # is connected to carry it.
+                            if fallback_chat_id:
+                                fb_platform = (
+                                    fallback_platform
+                                    if fallback_platform in active_platforms
+                                    else (next(iter(active_platforms), None))
+                                )
+                                if fb_platform:
+                                    subscribed_task_ids = {
+                                        s.get("task_id") for s in subs
+                                    }
+                                    try:
+                                        board_tasks = _kb.list_tasks(conn)
+                                    except Exception:
+                                        board_tasks = []
+                                    for t in board_tasks:
+                                        t_id = getattr(t, "id", None)
+                                        if not t_id or t_id in subscribed_task_ids:
+                                            continue
+                                        # Skip tasks in a FINAL status
+                                        # (done/archived). For a subscribed task
+                                        # the terminal ping already fired and its
+                                        # sub was removed on completion — a
+                                        # fallback here would RE-DELIVER it (the
+                                        # sub no longer appears in
+                                        # subscribed_task_ids). For a never-subbed
+                                        # done/archived task, replaying its
+                                        # historical terminal event to the
+                                        # fallback channel is backfill noise, not
+                                        # a live transition. The high-value case
+                                        # this fallback exists for — a card
+                                        # escalating to triage / changing lanes —
+                                        # is always non-final.
+                                        t_status = getattr(t, "status", None)
+                                        if t_status in {"done", "archived"}:
+                                            continue
+                                        # Seed the fallback sub's cursor so it
+                                        # delivers only the LATEST transition, not
+                                        # the task's entire history. Without a seed
+                                        # a fresh sub starts at cursor 0 and would
+                                        # replay every past notifiable event —
+                                        # a mass backfill flood on the live board.
+                                        try:
+                                            notifiable = [
+                                                e for e in _kb.list_events(conn, t_id)
+                                                if e.kind in NOTIFY_KINDS
+                                            ]
+                                        except Exception:
+                                            notifiable = []
+                                        if not notifiable:
+                                            continue
+                                        # Deliver only the newest notifiable
+                                        # event: seed just below it (the second
+                                        # newest id, or one below the sole event).
+                                        newest_id = int(notifiable[-1].id)
+                                        seed_cursor = (
+                                            int(notifiable[-2].id)
+                                            if len(notifiable) >= 2
+                                            else newest_id - 1
+                                        )
+                                        # Register (idempotent) then claim via
+                                        # the normal path so the cursor advances
+                                        # and we never re-deliver. The seed only
+                                        # applies on INSERT; an existing fallback
+                                        # sub keeps its live cursor.
+                                        _kb.add_notify_sub(
+                                            conn,
+                                            task_id=t_id,
+                                            platform=fb_platform,
+                                            chat_id=fallback_chat_id,
+                                            notifier_profile=notifier_profile,
+                                            initial_cursor=seed_cursor,
+                                        )
+                                        fb_fail = sub_fail_states.get(
+                                            (t_id, fb_platform, fallback_chat_id, "")
+                                        )
+                                        if fb_fail and time.monotonic() < fb_fail.get(
+                                            "next_retry_at", 0.0
+                                        ):
+                                            continue
+                                        (
+                                            fb_old_cursor, fb_cursor, fb_events
+                                        ) = _kb.claim_unseen_events_for_sub(
+                                            conn,
+                                            task_id=t_id,
+                                            platform=fb_platform,
+                                            chat_id=fallback_chat_id,
+                                            thread_id="",
+                                            kinds=NOTIFY_KINDS,
+                                        )
+                                        if not fb_events:
+                                            continue
+                                        fb_task = _kb.get_task(conn, t_id)
+                                        logger.info(
+                                            "kanban notifier: no subscription for %s; "
+                                            "delivering %d transition event(s) to "
+                                            "fallback channel %s/%s on board %s",
+                                            t_id, len(fb_events), fb_platform,
+                                            fallback_chat_id, slug,
+                                        )
+                                        deliveries.append({
+                                            "sub": {
+                                                "task_id": t_id,
+                                                "platform": fb_platform,
+                                                "chat_id": fallback_chat_id,
+                                                "thread_id": "",
+                                                "notifier_profile": notifier_profile,
+                                                "is_fallback": True,
+                                            },
+                                            "old_cursor": fb_old_cursor,
+                                            "cursor": fb_cursor,
+                                            "events": fb_events,
+                                            "task": fb_task,
+                                            "board": slug,
+                                        })
                         finally:
                             conn.close()
                     return deliveries
@@ -413,8 +570,43 @@ class GatewayKanbanWatchersMixin:
                                 f"⏱ {tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
+                        elif kind == "block_loop_detected":
+                            # The highest-value ping: the loop breaker escalated
+                            # the card to `triage` for a human decision. This is
+                            # the exact transition that used to sit silent.
+                            reason = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                reason = f": {str(ev.payload['reason'])[:160]}"
+                            msg = (
+                                f"⚠ {tag}Kanban {sub['task_id']} escalated to "
+                                f"triage (block loop){reason}"
+                            )
+                        elif kind == "unblocked":
+                            msg = (
+                                f"▶ {tag}Kanban {sub['task_id']} unblocked "
+                                f"— {title}"
+                            )
+                        elif kind == "assigned":
+                            who_now = ""
+                            if ev.payload and ev.payload.get("assignee"):
+                                who_now = f" → @{ev.payload['assignee']}"
+                            msg = (
+                                f"➡ {tag}Kanban {sub['task_id']} reassigned"
+                                f"{who_now} — {title}"
+                            )
                         else:
-                            continue
+                            # Any other lane-change kind in NOTIFY_KINDS
+                            # (promoted / reclaimed / stale / dependency_wait):
+                            # a generic transition ping so a card moving lanes
+                            # is NEVER silent. A kind NOT in NOTIFY_KINDS was
+                            # already filtered out by the claim query above, so
+                            # this only fires for intended transitions.
+                            status_now = getattr(task, "status", None) if task else None
+                            where = f" → {status_now}" if status_now else ""
+                            msg = (
+                                f"• {tag}Kanban {sub['task_id']} {kind}"
+                                f"{where} — {title}"
+                            )
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]

@@ -8841,18 +8841,29 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    initial_cursor: Optional[int] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    for ``task_id``. Idempotent on (task, platform, chat, thread).
+
+    ``initial_cursor`` seeds ``last_event_id`` on INSERT ONLY. A subscription
+    created without it starts at 0 and would replay the task's ENTIRE event
+    history on first delivery. The lazily-created fallback subscription (for a
+    card that transitioned with no origin sub) passes the id of the latest
+    already-existing notifiable event so only NEW transitions after that point
+    fire — never a mass backfill of historical events. Existing rows are left
+    untouched (idempotent), so re-registering never rewinds a live cursor.
+    """
     now = int(time.time())
+    seed = int(initial_cursor) if initial_cursor is not None else 0
     with write_txn(conn):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, last_event_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, seed, now),
         )
         if notifier_profile:
             # Self-heal legacy rows that predate notifier ownership by
