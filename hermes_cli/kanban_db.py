@@ -1278,6 +1278,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    last_emit_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2044,6 +2045,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+        if "last_emit_event_id" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "last_emit_event_id",
+                "last_emit_event_id INTEGER NOT NULL DEFAULT 0",
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2169,6 +2177,7 @@ _REBUILD_SPECS = {
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
         " notifier_profile TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " last_emit_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -9006,6 +9015,87 @@ def claim_unseen_events_for_sub(
             (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
         )
         return old_cursor, new_cursor, events
+
+
+def claim_unseen_emit_events_for_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    kinds: Optional[Iterable[str]] = None,
+) -> tuple[int, int, list[Event]]:
+    """Atomically claim unseen *emit* (agent-wake) events for one subscription.
+
+    This is the transition-emit twin of :func:`claim_unseen_events_for_sub`. It
+    runs on a SEPARATE cursor — ``kanban_notify_subs.last_emit_event_id`` — so
+    the agent-wake path claims events INDEPENDENTLY of the chat-ping path.
+
+    Why a second cursor: the chat-ping claim advances ``last_event_id`` past the
+    newest event matching its ``NOTIFY_KINDS`` filter, and that filter
+    deliberately EXCLUDES high-frequency bookkeeping kinds like
+    ``status_changed``. If the wake shared that cursor, a plain lane move
+    (``status_changed``, the ``ready -> review`` handoff) would either never be
+    seen (not in the ping filter) or be silently skipped past (the ping cursor
+    jumping over it). Decoupling lets a ``status_changed`` WAKE the orchestrator
+    without also sending a chat ping.
+
+    Returns ``(old_cursor, new_cursor, events)`` where the cursors are the emit
+    cursor values. When events are returned, ``last_emit_event_id`` has already
+    been advanced inside a ``BEGIN IMMEDIATE`` transaction — same single-owner
+    guarantee across watcher processes as the ping claim.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_emit_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if row is None:
+            return 0, 0, []
+        old_cursor = int(row["last_emit_event_id"])
+        kind_list = list(kinds) if kinds else None
+        q = (
+            "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
+            + (
+                "AND kind IN (" + ",".join("?" * len(kind_list)) + ") "
+                if kind_list
+                else ""
+            )
+            + "ORDER BY id ASC"
+        )
+        params: list[Any] = [task_id, old_cursor]
+        if kind_list:
+            params.extend(kind_list)
+        rows = conn.execute(q, params).fetchall()
+        events: list[Event] = []
+        max_id = old_cursor
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            events.append(
+                Event(
+                    id=int(r["id"]),
+                    task_id=r["task_id"],
+                    kind=r["kind"],
+                    payload=payload,
+                    created_at=r["created_at"],
+                )
+            )
+            if int(r["id"]) > max_id:
+                max_id = int(r["id"])
+        if not events:
+            return old_cursor, old_cursor, []
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_emit_event_id = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_emit_event_id = ?",
+            (int(max_id), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+        )
+        return old_cursor, max_id, events
 
 
 def advance_notify_cursor(
