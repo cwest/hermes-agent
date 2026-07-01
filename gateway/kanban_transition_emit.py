@@ -88,6 +88,15 @@ def build_transition_payload(
         "task_id": task_id,
         "board": board,
         "kind": kind,
+        # The webhook adapter classifies an incoming event from (in order)
+        # the X-GitHub-Event / X-GitLab-Event headers, then body ``event_type``,
+        # then body ``type``. The loopback bridge sends none of those headers
+        # (its X-Kanban-Event header is not consulted for classification), so
+        # ``event_type`` in the BODY is what lets the adapter match this POST
+        # against the route's ``events`` allowlist and spawn the orchestrator
+        # run. Without it the adapter falls through to "unknown", returns
+        # {"status": "ignored"} with a 200, and no run fires. Mirror ``kind``.
+        "event_type": kind,
         "reason": reason or "",
         "title": title or "",
         "event_id": event_id,

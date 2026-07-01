@@ -30,6 +30,18 @@ def test_emit_transition_posts_signed_payload():
         received["sig"] = request.headers.get("X-Hub-Signature-256")
         received["kind"] = request.headers.get("X-Kanban-Event")
         received["idem"] = request.headers.get("X-Idempotency-Key")
+        # Classify the event the way the real webhook adapter does — header
+        # first, then body ``event_type`` / ``type``. The loopback bridge
+        # sends no GitHub/GitLab header, so this exercises the body-field
+        # contract that lets a route actually dispatch (rather than 200-ignore).
+        parsed = json.loads(body)
+        received["adapter_event_type"] = (
+            request.headers.get("X-GitHub-Event", "")
+            or request.headers.get("X-GitLab-Event", "")
+            or parsed.get("event_type", "")
+            or parsed.get("type", "")
+            or "unknown"
+        )
         return web.json_response({"ok": True})
 
     async def scenario():
@@ -77,6 +89,15 @@ def test_emit_transition_posts_signed_payload():
     assert received["sig"] == expected, "HMAC signature must validate"
     assert received["kind"] == "blocked"
     assert received["idem"] == "kanban-transition:default:t_proof:blocked:99"
+    # The real adapter must be able to classify this as a 'blocked' event from
+    # the body alone (no GitHub/GitLab header on a loopback POST). If this is
+    # 'unknown', a route filtering on [blocked, completed] would 200-ignore the
+    # POST and never spawn the orchestrator run — the production regression.
+    assert received["adapter_event_type"] == "blocked", (
+        "adapter classified the loopback POST as %r; the route would ignore it"
+        % received["adapter_event_type"]
+    )
+    assert got["event_type"] == "blocked"
 
 
 if __name__ == "__main__":
