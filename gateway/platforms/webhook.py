@@ -605,6 +605,12 @@ class WebhookAdapter(BasePlatformAdapter):
             prompt_template, payload, event_type, route_name
         )
 
+        # A kanban-transition wake is stamped with origin_* fields by the
+        # emitter; detect it here so the inbound event can be tagged for the
+        # adapter's busy path (defect 1: the busy-session swallow). The tag is
+        # applied to the MessageEvent below.
+        is_transition_wake = self._is_transition_wake_payload(payload)
+
         # Inject skill content if configured.
         # We call build_skill_invocation_message() directly rather than
         # using /skill-name slash commands — the gateway's command parser
@@ -766,6 +772,11 @@ class WebhookAdapter(BasePlatformAdapter):
             raw_message=payload,
             message_id=delivery_id,
         )
+        # Tag a kanban-transition wake so the adapter's busy path keeps it a
+        # DISTINCT turn (defect 1): never text-merge/debounce it into an
+        # unrelated in-progress/queued turn.
+        if is_transition_wake:
+            event.metadata["kanban_transition_wake"] = True
 
         logger.info(
             "[webhook] %s event=%s route=%s prompt_len=%d delivery=%s",
@@ -790,6 +801,20 @@ class WebhookAdapter(BasePlatformAdapter):
             },
             status=202,
         )
+
+    def _is_transition_wake_payload(self, payload: dict) -> bool:
+        """True when a payload is a kanban-transition wake.
+
+        The transition emitter is the only source that stamps ``origin_*`` fields
+        on a webhook payload (see ``build_transition_payload``); ordinary webhook
+        events (GitHub PR, monitoring, cron) never carry them. Keying on the
+        origin coordinates is the same discriminator ``_build_origin_source``
+        uses, so the busy-bypass tag (defect 1) fires exactly on the
+        origin-routed transition wake and nothing else.
+        """
+        if not isinstance(payload, dict):
+            return False
+        return bool(payload.get("origin_platform") and payload.get("origin_chat_id"))
 
     def _build_origin_source(
         self,

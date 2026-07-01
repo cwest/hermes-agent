@@ -2061,6 +2061,19 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+def is_transition_wake_event(event: "MessageEvent") -> bool:
+    """True for a kanban-transition wake event.
+
+    The webhook route tags an origin-routed transition wake with
+    ``metadata["kanban_transition_wake"] = True``. The busy-session path uses
+    this to keep the wake a DISTINCT turn — never text-merging or debouncing it
+    into an unrelated in-progress/queued turn (defect 1: the busy-session
+    swallow).
+    """
+    md = getattr(event, "metadata", None)
+    return bool(md and md.get("kanban_transition_wake"))
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2078,8 +2091,30 @@ def merge_pending_message_event(
     instead of replacing the pending turn. This is used for Telegram bursty
     follow-ups so a multi-part user thought is not silently truncated to only
     the last queued fragment.
+
+    A kanban-transition WAKE event never merges with a non-wake, in either
+    direction (defect 1): the single pending slot can hold one event, and the
+    wake WINS — a dropped autonomy wake (folded into an unrelated turn, or
+    clobbered outright) is worse than a user follow-up the user can resend. So: a
+    pending wake is never overwritten by a later non-wake, and an incoming wake
+    replaces a pending non-wake intact (never appended).
     """
     existing = pending_messages.get(session_key)
+
+    # Wake-precedence guard (defect 1): keep a transition wake a distinct,
+    # intact turn. Handle it before any media/text merge so it is never folded
+    # into — or clobbered by — an unrelated message.
+    incoming_is_wake = is_transition_wake_event(event)
+    existing_is_wake = is_transition_wake_event(existing) if existing else False
+    if existing_is_wake and not incoming_is_wake:
+        # A pending wake is higher-priority; drop the later non-wake rather than
+        # bury the wake. (The user follow-up is recoverable; the wake is not.)
+        return
+    if incoming_is_wake:
+        # The wake takes the slot intact — never appended into existing text.
+        pending_messages[session_key] = event
+        return
+
     if existing:
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
@@ -4744,6 +4779,24 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
                 merge_pending_message_event(self._pending_messages, session_key, event)
                 return  # Don't interrupt now - will run after current task completes
+
+            # Kanban-transition WAKE: never text-merge or debounce it into an
+            # unrelated in-progress/queued turn (defect 1, the busy-session
+            # swallow). Queue it as its OWN un-merged pending event so the
+            # in-band drain runs it as a DISTINCT turn even when the origin
+            # session was busy at emit time. merge_pending_... gives the wake
+            # precedence in the single pending slot.
+            if is_transition_wake_event(event):
+                logger.info(
+                    "[%s] Kanban-transition wake while session %s is active — "
+                    "queuing as a distinct un-merged turn (no debounce, no merge)",
+                    self.name,
+                    session_key,
+                )
+                merge_pending_message_event(
+                    self._pending_messages, session_key, event
+                )
+                return  # Distinct turn — will cascade after the current turn.
 
             if self._is_queue_text_debounce_candidate(event):
                 logger.debug(
