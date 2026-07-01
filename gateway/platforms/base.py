@@ -2074,6 +2074,40 @@ def is_transition_wake_event(event: "MessageEvent") -> bool:
     return bool(md and md.get("kanban_transition_wake"))
 
 
+def should_suppress_stale_response(
+    *,
+    event: "MessageEvent",
+    has_response: bool,
+    interrupted: bool,
+    has_pending: bool,
+) -> bool:
+    """Decide whether a just-produced turn response is a *stale* reply that
+    should be dropped in favour of a queued follow-up.
+
+    The stale-suppression heuristic exists so that when a user sends a new
+    message mid-turn (setting the interrupt Event and queuing the follow-up),
+    the now-obsolete reply to the *previous* prompt is not delivered on top of
+    the answer to the newer one.
+
+    Defect (2026-07-01): this suppression also fired for a kanban-transition
+    WAKE turn. A wake is an autonomous action turn, not a reply to a user
+    prompt — a later inbound message never makes it "stale". When the wake's
+    own turn produced its banner-led output while the interrupt Event happened
+    to be set (a shared/carried-over interrupt) and a follow-up was pending,
+    the wake's output was nulled here and never delivered. That is precisely
+    the "no visible banner, no delivered wake turn" symptom.
+
+    A transition-wake turn is therefore NEVER suppressed: its output must
+    always be delivered so the orchestrator's autonomous turn is visible.
+    """
+    if not (has_response and interrupted and has_pending):
+        return False
+    # An autonomous transition-wake turn is never a "stale reply".
+    if is_transition_wake_event(event):
+        return False
+    return True
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -4929,10 +4963,18 @@ class BasePlatformAdapter(ABC):
             # Suppress stale response when the session was interrupted by a
             # new message that hasn't been consumed yet.  The pending message
             # is processed by the pending-message handler below (#8221/#2483).
-            if (
-                response
-                and interrupt_event.is_set()
-                and session_key in self._pending_messages
+            #
+            # A kanban-transition WAKE turn is an autonomous action, never a
+            # "stale reply" — its banner-led output must always be delivered
+            # even when the interrupt Event is set and a follow-up is pending.
+            # (should_suppress_stale_response encodes that exception; without
+            # it a wake's own turn output was nulled here and lost — the
+            # "no visible wake turn" defect, 2026-07-01.)
+            if should_suppress_stale_response(
+                event=event,
+                has_response=bool(response),
+                interrupted=interrupt_event.is_set(),
+                has_pending=session_key in self._pending_messages,
             ):
                 logger.info(
                     "[%s] Suppressing stale response for interrupted session %s",
