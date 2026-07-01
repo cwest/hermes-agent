@@ -2150,17 +2150,23 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
+        # Per-tick burst bound (distinct from max_spawn live-concurrency cap).
+        max_spawn_per_tick = _coerce_positive_int(
+            _kanban_cfg.get("max_spawn_per_tick")
+        )
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
         auto_route_review_bounce_enabled = True
         max_spawn = getattr(args, "max", None)
+        max_spawn_per_tick = None
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
+            max_spawn_per_tick=max_spawn_per_tick,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,

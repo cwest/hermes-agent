@@ -116,3 +116,72 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_default_spawn_raises_when_toolset_resolution_degenerate(monkeypatch, tmp_path):
+    """A worker must NEVER spawn with a degenerate (None/empty) toolset.
+
+    Core regression guard for the 2026-06-26 burst incident: under a
+    stuck->mass-spawn recovery, ``_resolve_worker_cli_toolsets`` came up empty
+    and the spawn path silently launched workers with only ``kanban_*`` tools,
+    which then self-blocked ("only kanban_* coordination tools"). The spawn
+    must instead FAIL loudly so ``dispatch_once`` reclaims the card for a clean
+    retry rather than burning an LLM cycle on a crippled worker.
+    """
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "salton"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "toolsets:\n  - hermes-cli\n  - terminal\n  - web\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    # Simulate the burst-race failure mode: resolution comes up degenerate.
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda home: None)
+
+    def fail_popen(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("Popen must not run when toolset resolution fails")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="toolset"):
+        kb._default_spawn(_make_task(kb, assignee="salton"), str(workspace))
+
+
+def test_default_spawn_raises_when_toolset_resolution_empty_list(monkeypatch, tmp_path):
+    """An empty resolved toolset is just as degenerate as None — fail the spawn."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "salton"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "toolsets:\n  - hermes-cli\n  - terminal\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda home: [])
+
+    def fail_popen(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("Popen must not run when toolset resolution is empty")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="toolset"):
+        kb._default_spawn(_make_task(kb, assignee="salton"), str(workspace))

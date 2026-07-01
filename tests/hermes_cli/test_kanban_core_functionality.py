@@ -4079,6 +4079,94 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
     assert calls["tick"] == 3
 
 
+def test_gateway_dispatcher_passes_max_spawn_per_tick_from_config(
+    monkeypatch, tmp_path
+):
+    """The gateway dispatcher must forward kanban.max_spawn_per_tick.
+
+    Config-propagation guard: the per-tick burst bound is dead code unless the
+    gateway loop reads ``kanban.max_spawn_per_tick`` and passes it to
+    ``dispatch_once``. Capture the kwargs the watcher hands ``dispatch_once``
+    and assert the configured value arrives.
+    """
+    import asyncio
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+                "max_spawn_per_tick": 3,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb, "list_boards",
+        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(_kb, "read_board_metadata", lambda slug: {"slug": slug})
+    monkeypatch.setattr(_kb, "reap_worker_zombies", lambda: [])
+    monkeypatch.setattr(
+        _kb, "kanban_db_path", lambda board=None: tmp_path / "kanban.db"
+    )
+
+    class _DummyConn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_kb, "connect", lambda *a, **k: _DummyConn())
+    monkeypatch.setattr(_kb, "has_spawnable_ready", lambda conn: True)
+    monkeypatch.setattr(_kb, "has_spawnable_review", lambda conn: False)
+
+    captured = {}
+    tick_ran = threading.Event()
+
+    def _dispatch_once(*args, **kwargs):
+        captured.update(kwargs)
+        tick_ran.set()
+        return SimpleNamespace(
+            spawned=[], reclaimed=0, crashed=[], timed_out=[],
+            promoted=0, auto_blocked=[],
+        )
+
+    monkeypatch.setattr(_kb, "dispatch_once", _dispatch_once)
+
+    async def _scenario():
+        watcher = asyncio.ensure_future(runner._kanban_dispatcher_watcher())
+        try:
+            await asyncio.sleep(5.0)  # startup delay inside the watcher
+            t0 = time.monotonic()
+            while not tick_ran.is_set():
+                if time.monotonic() - t0 > 3.0:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            runner._running = False
+            watcher.cancel()
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    asyncio.run(asyncio.wait_for(_scenario(), timeout=30.0))
+
+    assert tick_ran.is_set(), "dispatcher tick never ran"
+    assert captured.get("max_spawn_per_tick") == 3, (
+        "gateway dispatcher must forward kanban.max_spawn_per_tick to "
+        f"dispatch_once; got {captured.get('max_spawn_per_tick')!r}"
+    )
+
+
 def test_gateway_dispatcher_tick_not_starved_by_busy_default_executor(
     monkeypatch, tmp_path
 ):
