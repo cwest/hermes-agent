@@ -2361,6 +2361,82 @@ def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# An explicit unblock supersedes earlier PR-handoff comments for the active_pr
+# guard. Carried from upstream PR #46204 (dannyfranca). Rationale: a deliberate
+# `unblock` is the operator/orchestrator giving the green light to resume work
+# on the SAME PR (e.g. addressing review feedback), so PR URLs posted BEFORE
+# that unblock must no longer veto the respawn. PR URLs posted AT/AFTER the
+# unblock still guard (a fresh duplicate-PR risk). This is what lets the
+# review -> block -> unblock -> author-rework loop spawn the author without
+# waiting out the 24h PR window.
+# ---------------------------------------------------------------------------
+
+def test_respawn_guard_ignores_pr_comment_before_latest_unblock(kanban_home):
+    """A deliberate unblock supersedes an earlier PR-handoff comment."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="pr-feedback", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR opened: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, now),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_keeps_pr_comment_after_latest_unblock(kanban_home):
+    """A PR URL posted after the latest unblock still guards respawn."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="new-pr-after-unblock", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR opened: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, now),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_keeps_same_second_pr_comment_after_unblock(kanban_home):
+    """Second-resolution timestamps keep a same-tick PR guard conservatively.
+
+    Kanban timestamps are second-granular, so a PR URL and an unblock in the
+    same second cannot be ordered. Guard conservatively (keep active_pr) so a
+    genuine new-PR-at-unblock is never let through.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="same-second-pr-after-unblock", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, now),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR opened: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, now),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+# ---------------------------------------------------------------------------
 # Review tasks bypass the dup-PR guards (recent_success / active_pr) but a
 # build-lane task in the same shape must still be guarded. The invariant being
 # asserted: review spawns are never wedged by the build-only dup-PR guards,
