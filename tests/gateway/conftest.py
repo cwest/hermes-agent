@@ -120,6 +120,21 @@ def _ensure_discord_mock() -> None:
     discord_mod.Interaction = object
     discord_mod.Message = type("Message", (), {})
 
+    # AudioSource: a real (not MagicMock) base class so subclasses such as
+    # plugins/platforms/discord/voice_mixer.VoiceMixer can inherit from it.
+    # A MagicMock attribute used as a base turns the subclass into a mock and
+    # makes instantiation return a MagicMock, breaking the pure-PCM mixer
+    # tests.  This mirrors discord.py's AudioSource contract (read/is_opus/
+    # cleanup), all of which VoiceMixer overrides.
+    class _FakeAudioSource:
+        def read(self):  # pragma: no cover - overridden by subclasses
+            return b""
+        def is_opus(self):  # pragma: no cover - overridden by subclasses
+            return False
+        def cleanup(self):  # pragma: no cover - overridden by subclasses
+            pass
+    discord_mod.AudioSource = _FakeAudioSource
+
     # Embed: accept the kwargs production code / tests use
     # (title, description, color). MagicMock auto-attributes work too,
     # but some tests construct and inspect .title/.description directly.
