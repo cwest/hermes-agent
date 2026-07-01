@@ -469,6 +469,219 @@ class TestEventFilter:
 
 
 # ===================================================================
+# Author filtering (security hard gate)
+# ===================================================================
+
+
+class TestAuthorFilter:
+    """Tests for the author allow-list gate in _handle_webhook.
+
+    The author gate is a SECURITY boundary: a route configured with an
+    `authors` allow-list must never spawn a worker for a PR/push authored by
+    someone outside the list, and — unlike the action filter — it fails CLOSED
+    when the author cannot be resolved (an unattributable event is ignored,
+    not processed).
+    """
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_author_is_processed(self):
+        """PR by an allow-listed author reaches the spawn path (202)."""
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "authors": ["cwest"],
+                "prompt": "PR by {pull_request.user.login}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={
+                    "action": "opened",
+                    "pull_request": {"user": {"login": "cwest"}},
+                },
+                headers={"X-GitHub-Event": "pull_request"},
+            )
+            assert resp.status == 202
+        # Spawn actually happened.
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_allowlisted_author_is_ignored_no_spawn(self):
+        """PR by an outsider is ignored at the HTTP layer — NO worker spawn."""
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "authors": ["cwest"],
+                "prompt": "PR by {pull_request.user.login}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={
+                    "action": "opened",
+                    "pull_request": {"user": {"login": "attacker"}},
+                },
+                headers={"X-GitHub-Event": "pull_request"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ignored"
+            assert data["author"] == "attacker"
+        # The gate ran BEFORE spawn: handle_message must never have been called.
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_author_allowlist_is_unchanged(self):
+        """Route with no `authors` key behaves exactly as today (processed)."""
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "prompt": "PR by {pull_request.user.login}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={
+                    "action": "opened",
+                    "pull_request": {"user": {"login": "anyone-at-all"}},
+                },
+                headers={"X-GitHub-Event": "pull_request"},
+            )
+            assert resp.status == 202
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_author_fails_closed(self):
+        """Allow-list set but author unresolvable -> fail-CLOSED (ignored)."""
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "authors": ["cwest"],
+                "prompt": "PR",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            # No pull_request.user.login anywhere in the payload.
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={"action": "opened"},
+                headers={"X-GitHub-Event": "pull_request"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ignored"
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pull_request_review_author_resolved(self):
+        """pull_request_review resolves author from pull_request.user.login."""
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request_review"],
+                "authors": ["cwest"],
+                "prompt": "review",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={
+                    "action": "submitted",
+                    "pull_request": {"user": {"login": "cwest"}},
+                },
+                headers={"X-GitHub-Event": "pull_request_review"},
+            )
+            assert resp.status == 202
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_push_author_resolved_from_sender_login(self):
+        """push events resolve author from sender.login."""
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["push"],
+                "authors": ["cwest"],
+                "prompt": "push",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={
+                    "ref": "refs/heads/main",
+                    "sender": {"login": "cwest"},
+                    "pusher": {"name": "cwest"},
+                },
+                headers={"X-GitHub-Event": "push"},
+            )
+            assert resp.status == 202
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_push_outsider_via_sender_is_ignored(self):
+        """push by an outsider (sender.login) is ignored — no spawn."""
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["push"],
+                "authors": ["cwest"],
+                "prompt": "push",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={
+                    "ref": "refs/heads/main",
+                    "sender": {"login": "attacker"},
+                },
+                headers={"X-GitHub-Event": "push"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ignored"
+            assert data["author"] == "attacker"
+        adapter.handle_message.assert_not_awaited()
+
+
+# ===================================================================
 # HTTP handling
 # ===================================================================
 

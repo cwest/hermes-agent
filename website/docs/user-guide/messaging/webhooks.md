@@ -79,6 +79,8 @@ Routes define how different webhook sources are handled. Each route is a named e
 | Property | Required | Description |
 |----------|----------|-------------|
 | `events` | No | List of event types to accept (e.g. `["pull_request"]`). If empty, all events are accepted. Event type is read from `X-GitHub-Event`, `X-GitLab-Event`, or `event_type` in the payload. |
+| `actions` | No | List of payload `action` values to accept (e.g. `["opened", "reopened", "synchronize"]`). If empty, all actions are accepted. A delivery whose payload has no `action` field is always accepted (fail-open), even when this list is set. Use this to gate a route subscribed to a whole event — a single human operation on a pull request emits several deliveries (`opened`, `closed`, `reopened`, `synchronize`, …), and without an allow-list every one of them triggers a run. |
+| `authors` | No | List of account logins allowed to trigger this route (e.g. `["cwest"]`). **Security hard gate** — evaluated before the prompt is rendered or a worker is spawned, so a delivery from a non-allow-listed author is ignored at the HTTP layer and never starts a run on untrusted external input. If empty/omitted, all authors are accepted (no change to existing routes). The author is resolved per event type: `pull_request` / `pull_request_review` → `pull_request.user.login`; `push` → `sender.login` (then `pusher.name`); other events → `sender.login`. Unlike `actions`, this gate fails **closed**: if an allow-list is set but no author can be resolved from the payload, the delivery is ignored. |
 | `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation). |
 | `prompt` | No | Template string with dot-notation payload access (e.g. `{pull_request.title}`). If omitted, the full JSON payload is dumped into the prompt. Payload fields are untrusted — see [Authenticated does not mean trusted](#authenticated-does-not-mean-trusted). |
 | `skills` | No | List of skill names to load for the agent run. |
@@ -98,6 +100,8 @@ platforms:
       routes:
         github-pr:
           events: ["pull_request"]
+          actions: ["opened", "reopened", "synchronize"]
+          authors: ["cwest"]  # security gate: only act on PRs from these logins
           secret: "github-webhook-secret"
           prompt: |
             Review this pull request:
