@@ -1820,6 +1820,7 @@ AUTHOR_MAP = {
     "sharma.priyanshu96@gmail.com": "ipriyaaanshu",  # PR #51488 salvage (clear stale base_url on gateway model switches; #25107)
     "290881485+mrparker0980@users.noreply.github.com": "mrparker0980",  # @file context-ref expansion anchored to canonical read deny-list
     "casey@geeknest.com": "cwest",
+    "christophergervais92@users.noreply.github.com": "demi",  # fork patch #17 (review respawn-guard) — demi authored the crashed-reviewer→review-lane restore; preserve authorship
 }
 
 
