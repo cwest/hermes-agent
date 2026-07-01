@@ -2564,6 +2564,13 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Seconds between notifier ticks. The notifier delivers kanban lifecycle
+        # events as chat pings AND drives the transition-emit (agent-wake) POST,
+        # so this gap bounds worst-case emit latency after a lane MOVE. Default 2
+        # keeps a transition's emit comfortably under the near-real-time <10s
+        # target; the first-tick cold-start settle is capped to this value.
+        # Floored at 1.0s — a sub-second value busy-polls the SQLite WAL.
+        "notifier_interval_seconds": 2,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
