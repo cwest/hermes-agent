@@ -7813,11 +7813,18 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         human review rather than immediately re-spawning. Bypassed when an
         explicit re-queue event (status change, promote, unblock, reclaim)
         arrives AFTER that completion — that's a deliberate re-run request.
+        Also **skipped when the task is in status ``review``** — the build
+        run that produced the artifact under review is itself a recent
+        ``completed`` run, so this guard would otherwise wedge the reviewer
+        out for the window.
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        **Skipped when the task is in status ``review``** — a reviewer
+        never opens a PR, and the PR-URL comment is exactly what it needs
+        to act on, not a duplicate-PR risk.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -7825,13 +7832,21 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, status FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return None
 
     now = int(time.time())
+
+    # A reviewer never opens a PR, so the dup-PR (step 4) and recent-success
+    # (step 3) guards are irrelevant to a review pass — yet they'd wedge a
+    # review-status card for up to 24h, because the BUILD run that shipped the
+    # PR counts as a recent ``completed`` run AND left a PR-URL comment. The
+    # rate-limit cooldown (step 1) and auth blocker (step 2) still apply: a
+    # rate-limited or auth-blocked reviewer should defer like any other spawn.
+    is_review = row["status"] == "review"
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
@@ -7880,33 +7895,41 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    reclaim) is a deliberate "run it again" — honor it instead of
     #    deferring. Without this, a manual done→ready just sits there,
     #    silently held by the guard, until the window elapses.
-    cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
-    recent_completed = conn.execute(
-        "SELECT ended_at FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
-        "ORDER BY ended_at DESC LIMIT 1",
-        (task_id, cutoff),
-    ).fetchone()
-    if recent_completed:
-        completed_at = int(recent_completed["ended_at"] or 0)
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
-            "LIMIT 1",
-            (task_id, completed_at),
+    #
+    #    Skipped entirely for review tasks: the build run that produced the
+    #    artifact under review is itself a recent ``completed`` run, which
+    #    would otherwise block the reviewer from ever spawning.
+    if not is_review:
+        cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
+        recent_completed = conn.execute(
+            "SELECT ended_at FROM task_runs "
+            "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
+            "ORDER BY ended_at DESC LIMIT 1",
+            (task_id, cutoff),
         ).fetchone()
-        if not requeued_after:
-            return "recent_success"
+        if recent_completed:
+            completed_at = int(recent_completed["ended_at"] or 0)
+            requeued_after = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND created_at >= ? "
+                "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+                "LIMIT 1",
+                (task_id, completed_at),
+            ).fetchone()
+            if not requeued_after:
+                return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    #    Skipped for review tasks: the PR-URL comment is exactly what the
+    #    reviewer needs to act on, not a signal of a duplicate-PR risk.
+    if not is_review:
+        pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        for c in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            (task_id, pr_cutoff),
+        ).fetchall():
+            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+                return "active_pr"
 
     return None
 
