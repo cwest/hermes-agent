@@ -666,57 +666,33 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
-    """Recursively find all skills in ~/.hermes/skills/ and external dirs.
+def _scan_skill_dirs(
+    local_dir: Optional[Path],
+    external_dirs: List[Path],
+    *,
+    disabled: Set[str],
+) -> List[Dict[str, Any]]:
+    """Scan *local_dir* then *external_dirs* and return skill metadata dicts.
 
-    Args:
-        skip_disabled: If True, return ALL skills regardless of disabled
-            state (used by ``hermes skills`` config UI). Default False
-            filters out disabled skills.
-
-    Returns:
-        List of skill metadata dicts (name, description, category).
-
-    Results are cached per-session; the cache is invalidated when the scan
-    signature changes (dir/category mtimes or the disabled-set) and expires
-    after a short TTL to bound staleness from in-place SKILL.md edits.
+    This is the single source of truth for "what skills does this set of
+    directories provide" — used both for the active environment
+    (:func:`_find_all_skills`) and for enumerating an arbitrary profile
+    (:func:`count_profile_skills`). Local takes precedence over external on a
+    name collision; skills whose frontmatter ``name`` is in *disabled* or that
+    fail the platform/environment gates are skipped. Symlinked skill packages
+    are followed (via :func:`iter_skill_index_files`).
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from agent.skill_utils import iter_skill_index_files
 
-    cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
-
-    # Load disabled set once (not per-skill). Part of the cache signature:
-    # disabling a skill is a config change with no filesystem mtime bump.
-    disabled = set() if skip_disabled else _get_disabled_skill_names()
-
-    # Collect directories to scan — same resolution as the scan loop below
-    # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
-    # SKILLS_DIR can be stale in long-lived runtimes).
-    dirs_to_scan: list = []
-    active_skills_dir = _skills_dir()
-    if active_skills_dir.exists():
-        dirs_to_scan.append(active_skills_dir)
-    dirs_to_scan.extend(get_external_skills_dirs())
-
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
-    now = time.monotonic()
-
-    cached = _SKILLS_CACHE.get(cache_key)
-    if (
-        cached is not None
-        and cached[0] == signature
-        and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS
-    ):
-        # Per-call shallow copies: callers mutate the returned dicts
-        # (e.g. web_server annotates s["enabled"]/s["usage"]) — handing
-        # out the cached objects would poison the cache for everyone else.
-        return [dict(s) for s in cached[2]]
-
-    skills = []
+    skills: List[Dict[str, Any]] = []
     seen_names: set = set()
 
-    # Scan local dir first, then external dirs (local takes precedence) —
-    # dirs_to_scan already resolved above for the signature.
+    # Scan local dir first, then external dirs (local takes precedence).
+    dirs_to_scan: List[Path] = []
+    if local_dir is not None and local_dir.exists():
+        dirs_to_scan.append(local_dir)
+    dirs_to_scan.extend(external_dirs)
+
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
@@ -769,12 +745,86 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 )
                 continue
 
+    return skills
+
+
+def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+    """Recursively find all skills in ~/.hermes/skills/ and external dirs.
+
+    Args:
+        skip_disabled: If True, return ALL skills regardless of disabled
+            state (used by ``hermes skills`` config UI). Default False
+            filters out disabled skills.
+
+    Returns:
+        List of skill metadata dicts (name, description, category).
+
+    Results are cached per-session; the cache is invalidated when the scan
+    signature changes (dir/category mtimes or the disabled-set) and expires
+    after a short TTL to bound staleness from in-place SKILL.md edits.
+    """
+    from agent.skill_utils import get_external_skills_dirs
+
+    cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+
+    # Load disabled set once (not per-skill). Part of the cache signature:
+    # disabling a skill is a config change with no filesystem mtime bump.
+    disabled = set() if skip_disabled else _get_disabled_skill_names()
+
+    # Collect directories to scan — same resolution the scanner performs
+    # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
+    # SKILLS_DIR can be stale in long-lived runtimes).
+    active_skills_dir = _skills_dir()
+    external_dirs = list(get_external_skills_dirs())
+    dirs_to_scan: list = []
+    if active_skills_dir.exists():
+        dirs_to_scan.append(active_skills_dir)
+    dirs_to_scan.extend(external_dirs)
+
+    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    now = time.monotonic()
+
+    cached = _SKILLS_CACHE.get(cache_key)
+    if (
+        cached is not None
+        and cached[0] == signature
+        and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS
+    ):
+        # Per-call shallow copies: callers mutate the returned dicts
+        # (e.g. web_server annotates s["enabled"]/s["usage"]) — handing
+        # out the cached objects would poison the cache for everyone else.
+        return [dict(s) for s in cached[2]]
+
+    skills = _scan_skill_dirs(
+        active_skills_dir,
+        external_dirs,
+        disabled=disabled,
+    )
+
     # Store in cache keyed by the scan signature computed BEFORE the scan
     # (a write racing the scan changes the signature, so the next call
     # re-scans rather than serving the torn result past the TTL). Same
     # shallow-copy contract as the hit path — the caller may mutate.
     _SKILLS_CACHE[cache_key] = (signature, now, skills)
     return [dict(s) for s in skills]
+
+
+def count_profile_skills(profile_dir: Path) -> int:
+    """Count skills available to the profile rooted at *profile_dir*.
+
+    Resolves the profile's own local ``skills/`` directory plus its
+    ``skills.external_dirs`` grant (from that profile's ``config.yaml``) and
+    counts them through the same scanner the active-environment listing uses,
+    so a per-profile count (the dashboard, ``hermes profile list``) matches
+    what ``hermes -p <profile> skills list`` reports — including symlinked
+    grants and frontmatter-name dedup. Disabled skills are included, matching
+    the listing UI's ``skip_disabled=True`` semantics.
+    """
+    from agent.skill_utils import get_external_skills_dirs_for
+
+    local = profile_dir / "skills"
+    external = get_external_skills_dirs_for(profile_dir)
+    return len(_scan_skill_dirs(local, external, disabled=set()))
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
