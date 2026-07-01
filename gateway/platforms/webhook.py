@@ -48,6 +48,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.session import SessionSource
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -716,29 +717,46 @@ class WebhookAdapter(BasePlatformAdapter):
         # same route get independent agent runs (not queued/interrupted).
         session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
-        # Store delivery info for send().  Read by every send() invocation
-        # for this chat_id (interim status messages and the final response),
-        # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
-        deliver_config = {
-            "deliver": route_config.get("deliver", "log"),
-            "deliver_extra": self._render_delivery_extra(
-                route_config.get("deliver_extra", {}), payload
-            ),
-            "payload": payload,
-        }
-        self._delivery_info[session_chat_id] = deliver_config
-        self._delivery_info_created[session_chat_id] = now
-        self._delivery_info_order.append((now, session_chat_id))
-        self._prune_delivery_info(now)
-
-        # Build source and event
-        source = self.build_source(
-            chat_id=session_chat_id,
-            chat_name=f"webhook/{route_name}",
-            chat_type="webhook",
-            user_id=f"webhook:{route_name}",
-            user_name=route_name,
+        # ── Origin routing (event-driven autonomy) ──────────────────
+        # When the payload carries origin_* fields (the kanban-transition
+        # emitter stamps them), route the woken run into the ORIGIN thread
+        # session it was born in — not a contextless webhook: session — so
+        # the orchestrator resumes in that thread and can act + continue
+        # there. Without origin fields, fall back to the webhook: session
+        # (backward-compatible: non-origin webhooks are unaffected).
+        origin_platform = payload.get("origin_platform")
+        origin_chat_id = payload.get("origin_chat_id")
+        origin_thread_id = payload.get("origin_thread_id")
+        origin_source = self._build_origin_source(
+            origin_platform, origin_chat_id, origin_thread_id
         )
+
+        if origin_source is not None:
+            source = origin_source
+        else:
+            # Store delivery info for send().  Read by every send() invocation
+            # for this chat_id (interim status messages and the final response),
+            # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
+            deliver_config = {
+                "deliver": route_config.get("deliver", "log"),
+                "deliver_extra": self._render_delivery_extra(
+                    route_config.get("deliver_extra", {}), payload
+                ),
+                "payload": payload,
+            }
+            self._delivery_info[session_chat_id] = deliver_config
+            self._delivery_info_created[session_chat_id] = now
+            self._delivery_info_order.append((now, session_chat_id))
+            self._prune_delivery_info(now)
+
+            # Build source and event
+            source = self.build_source(
+                chat_id=session_chat_id,
+                chat_name=f"webhook/{route_name}",
+                chat_type="webhook",
+                user_id=f"webhook:{route_name}",
+                user_name=route_name,
+            )
         if profile and isinstance(profile, str):
             source.profile = profile
         event = MessageEvent(
@@ -771,6 +789,48 @@ class WebhookAdapter(BasePlatformAdapter):
                 "delivery_id": delivery_id,
             },
             status=202,
+        )
+
+    def _build_origin_source(
+        self,
+        origin_platform: Optional[str],
+        origin_chat_id: Optional[str],
+        origin_thread_id: Optional[str],
+    ) -> Optional[SessionSource]:
+        """Build a SessionSource targeting the ORIGIN thread/session, or None.
+
+        When a transition-emit payload carries the origin thread it was born in,
+        the woken run must resume THAT session — not a contextless
+        ``webhook:<route>:<delivery>`` one — so the orchestrator reports back
+        and continues in the origin thread (the event-driven autonomy contract).
+
+        Returns ``None`` when origin fields are absent/unusable, so the caller
+        falls back to the default webhook session (backward-compatible).
+
+        The source is shaped to mirror the live inbound key
+        (``build_session_key``): for a thread the platform delivers
+        ``chat_type="thread"`` with ``chat_id``/``thread_id`` both set, and the
+        key omits the user id (threads are shared). Matching that shape here is
+        what makes the wake land in the exact origin session.
+        """
+        if not origin_platform or not origin_chat_id:
+            return None
+        try:
+            platform = Platform(str(origin_platform))
+        except ValueError:
+            logger.warning(
+                "[webhook] origin routing: unknown platform %r; "
+                "falling back to webhook session",
+                origin_platform,
+            )
+            return None
+        chat_type = "thread" if origin_thread_id else "channel"
+        return SessionSource(
+            platform=platform,
+            chat_id=str(origin_chat_id),
+            chat_name="kanban-transition/origin",
+            chat_type=chat_type,
+            thread_id=str(origin_thread_id) if origin_thread_id else None,
         )
 
     # ------------------------------------------------------------------

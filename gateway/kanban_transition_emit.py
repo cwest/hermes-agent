@@ -48,7 +48,20 @@ logger = logging.getLogger("gateway.run")
 # decision), and it used to fire NOTHING at all. `completed`/done is deliberately
 # NOT here — done is a close-loop chat ping, not a reasoning task. Override via
 # config `kanban.transition_emit.emit_kinds`.
-DEFAULT_EMIT_KINDS: tuple[str, ...] = ("blocked", "block_loop_detected")
+DEFAULT_EMIT_KINDS: tuple[str, ...] = (
+    # Terminal / escalation kinds (always woke the orchestrator).
+    "blocked",
+    "block_loop_detected",
+    # Actionable lane-move kinds. A card moving to review fires
+    # ``status_changed`` + ``assigned``; ``unblocked`` returns a card to the
+    # ready lane. These are handoffs the orchestrator must act on — they were
+    # silent pre-fix (live miss: card t_278408f5 review handoff woke nothing).
+    # ``completed``/done stays OUT deliberately: done is a close-loop chat
+    # ping, not a reasoning task.
+    "status_changed",
+    "assigned",
+    "unblocked",
+)
 
 DEFAULT_ROUTE = "kanban-transition"
 # The webhook adapter binds loopback by default; the bridge POSTs to itself.
