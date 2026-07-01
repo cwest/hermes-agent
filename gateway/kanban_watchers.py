@@ -177,6 +177,14 @@ class GatewayKanbanWatchersMixin:
             "block_loop_detected", "unblocked", "assigned",
             "promoted", "reclaimed", "stale", "dependency_wait",
         )
+        # The candidate kinds the agent-WAKE (transition-emit) path may fire on,
+        # BEFORE the emit_kinds config filter is applied. This is a SUPERSET of
+        # NOTIFY_KINDS plus the lane-move kind `status_changed` — the plain
+        # ready→running→review handoff that NOTIFY_KINDS deliberately excludes
+        # from chat pings but which MUST be able to wake the orchestrator. The
+        # actual per-kind decision is `should_emit_transition(cfg, kind)`; this
+        # set only bounds which kinds we bother to claim.
+        _EMIT_CANDIDATE_KINDS = NOTIFY_KINDS + ("status_changed",)
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -254,13 +262,14 @@ class GatewayKanbanWatchersMixin:
             try:
                 def _collect():
                     deliveries: list[dict] = []
+                    emit_wakes: list[dict] = []
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
-                        return deliveries
+                        return deliveries, emit_wakes
 
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
@@ -333,6 +342,53 @@ class GatewayKanbanWatchersMixin:
                                     # silent (no claim/rewind churn, no log
                                     # spam for a dead chat).
                                     continue
+                                # 4c — agent-wake claim (DECOUPLED from the
+                                # chat-ping claim below). The wake path claims
+                                # its OWN events over emit_kinds on a SEPARATE
+                                # cursor (last_emit_event_id), so a plain lane
+                                # move (status_changed, the ready→review handoff)
+                                # wakes the orchestrator even though it is NOT in
+                                # NOTIFY_KINDS and thus never chat-pings. Runs
+                                # BEFORE the ping claim's `if not events:
+                                # continue` so a sub with only emit-relevant
+                                # events is not skipped.
+                                if transition_emit_secret:
+                                    try:
+                                        from gateway.kanban_transition_emit import (
+                                            should_emit_transition as _should_emit,
+                                        )
+                                        emit_kind_set = [
+                                            ek
+                                            for ek in _EMIT_CANDIDATE_KINDS
+                                            if _should_emit(transition_emit_cfg, ek)
+                                        ]
+                                        if emit_kind_set:
+                                            (
+                                                _e_old, _e_new, _emit_events
+                                            ) = _kb.claim_unseen_emit_events_for_sub(
+                                                conn,
+                                                task_id=sub["task_id"],
+                                                platform=sub["platform"],
+                                                chat_id=sub["chat_id"],
+                                                thread_id=sub.get("thread_id") or "",
+                                                kinds=emit_kind_set,
+                                            )
+                                            if _emit_events:
+                                                _e_task = _kb.get_task(
+                                                    conn, sub["task_id"]
+                                                )
+                                                emit_wakes.append({
+                                                    "sub": sub,
+                                                    "events": _emit_events,
+                                                    "task": _e_task,
+                                                    "board": slug,
+                                                })
+                                    except Exception as _emit_claim_exc:
+                                        logger.debug(
+                                            "kanban notifier: emit claim for %s "
+                                            "failed: %s",
+                                            sub["task_id"], _emit_claim_exc,
+                                        )
                                 old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                     conn,
                                     task_id=sub["task_id"],
@@ -483,9 +539,9 @@ class GatewayKanbanWatchersMixin:
                                         })
                         finally:
                             conn.close()
-                    return deliveries
+                    return deliveries, emit_wakes
 
-                deliveries = await asyncio.to_thread(_collect)
+                deliveries, emit_wakes = await asyncio.to_thread(_collect)
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -651,48 +707,13 @@ class GatewayKanbanWatchersMixin:
                             # Reset the failure state on success.
                             sub_fail_states.pop(sub_key, None)
 
-                            # 4c — agent-run bridge: after the chat ping is
-                            # delivered, ALSO wake the orchestrator as an agent
-                            # run for configured transition kinds (default OFF).
-                            if transition_emit_secret:
-                                try:
-                                    from gateway.kanban_transition_emit import (
-                                        should_emit_transition,
-                                        build_transition_payload,
-                                        emit_transition,
-                                    )
-                                    if should_emit_transition(transition_emit_cfg, kind):
-                                        reason_val = None
-                                        if ev.payload and ev.payload.get("reason"):
-                                            reason_val = str(ev.payload["reason"])
-                                        # Carry the ORIGIN (session + thread) so the
-                                        # woken orchestrator reports back to the
-                                        # thread this work was born in, not a
-                                        # contextless webhook session. session_id
-                                        # comes from the card; the thread source
-                                        # from the subscription being delivered.
-                                        origin_sid = getattr(task, "session_id", None) if task else None
-                                        payload = build_transition_payload(
-                                            task_id=sub["task_id"],
-                                            board=board_slug or "default",
-                                            kind=kind,
-                                            reason=reason_val,
-                                            event_id=int(getattr(ev, "id", 0) or 0),
-                                            title=title,
-                                            origin_session_id=origin_sid,
-                                            origin_platform=sub.get("platform"),
-                                            origin_chat_id=sub.get("chat_id"),
-                                            origin_thread_id=sub.get("thread_id"),
-                                        )
-                                        await emit_transition(
-                                            transition_emit_cfg, payload,
-                                            transition_emit_secret,
-                                        )
-                                except Exception as emit_exc:
-                                    logger.debug(
-                                        "kanban transition emit for %s failed: %s",
-                                        sub["task_id"], emit_exc,
-                                    )
+                            # NOTE: the agent-wake (transition-emit) is no longer
+                            # fired here. It is DECOUPLED from the chat-ping path
+                            # and driven by its own emit-claim (collected in
+                            # _collect via claim_unseen_emit_events_for_sub over
+                            # emit_kinds) and fired below in the emit_wakes loop.
+                            # This lets a status_changed lane move wake the
+                            # orchestrator WITHOUT sending a chat ping.
                         except Exception as exc:
                             state = sub_fail_states.setdefault(sub_key, {})
                             fails = state.get("fails", 0) + 1
@@ -757,6 +778,62 @@ class GatewayKanbanWatchersMixin:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
+
+                # 4c — agent-wake fire loop (DECOUPLED). For every emit event
+                # claimed above (on the separate last_emit_event_id cursor over
+                # emit_kinds), POST to the transition route so the orchestrator
+                # wakes as an agent RUN in the ORIGIN thread session. This runs
+                # independently of the chat-ping deliveries above: a lane move
+                # (status_changed) that never chat-pinged still wakes here.
+                if transition_emit_secret and emit_wakes:
+                    try:
+                        from gateway.kanban_transition_emit import (
+                            build_transition_payload,
+                            emit_transition,
+                        )
+                    except Exception as _imp_exc:
+                        logger.debug(
+                            "kanban transition emit import failed: %s", _imp_exc
+                        )
+                    else:
+                        for w in emit_wakes:
+                            e_sub = w["sub"]
+                            e_task = w["task"]
+                            e_board = w["board"]
+                            e_title = (
+                                (e_task.title if e_task else e_sub["task_id"])[:120]
+                            )
+                            origin_sid = (
+                                getattr(e_task, "session_id", None)
+                                if e_task else None
+                            )
+                            for ev in w["events"]:
+                                try:
+                                    reason_val = None
+                                    if ev.payload and ev.payload.get("reason"):
+                                        reason_val = str(ev.payload["reason"])
+                                    payload = build_transition_payload(
+                                        task_id=e_sub["task_id"],
+                                        board=e_board or "default",
+                                        kind=ev.kind,
+                                        reason=reason_val,
+                                        event_id=int(getattr(ev, "id", 0) or 0),
+                                        title=e_title,
+                                        origin_session_id=origin_sid,
+                                        origin_platform=e_sub.get("platform"),
+                                        origin_chat_id=e_sub.get("chat_id"),
+                                        origin_thread_id=e_sub.get("thread_id"),
+                                    )
+                                    await emit_transition(
+                                        transition_emit_cfg, payload,
+                                        transition_emit_secret,
+                                    )
+                                except Exception as emit_exc:
+                                    logger.debug(
+                                        "kanban transition emit for %s "
+                                        "(kind=%s) failed: %s",
+                                        e_sub["task_id"], ev.kind, emit_exc,
+                                    )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
