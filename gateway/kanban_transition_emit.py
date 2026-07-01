@@ -77,6 +77,50 @@ DEFAULT_ROUTE = "kanban-transition"
 DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 DEFAULT_WEBHOOK_PORT = 8644
 
+# Fixed, greppable sentinel that leads every transition-wake banner. It is
+# deliberately upper-case, hyphenated, and unlikely to occur in ordinary prose,
+# so a woken turn that leads with it is UNMISTAKABLE — both the orchestrator and
+# Casey can identify (and grep for) the wake, and it can never be conflated with
+# a late-delivered prior reply (the ambiguity that cost a live session on
+# 2026-07-01). Keep this stable: the E2E probe and any log/dashboard grep key on
+# this exact string.
+WAKE_BANNER_PREFIX = "AUTONOMOUS-WAKE"
+# Stable placeholder for a lane end when the transition carries no from/to pair
+# (most kinds don't — crashed/timed_out/gave_up/blocked). Never emit a Python
+# ``None`` into the wire text.
+_UNKNOWN_LANE = "?"
+
+
+def build_wake_banner(
+    *,
+    task_id: str,
+    kind: str,
+    from_lane: Optional[str] = None,
+    to_lane: Optional[str] = None,
+    event_id: int = 0,
+) -> str:
+    """Build the unique, greppable self-announce banner for a woken turn.
+
+    Shape (single source of truth — the route renders it via ``{wake_banner}``
+    and the woken orchestrator leads its in-thread reply with it verbatim):
+
+        ``AUTONOMOUS-WAKE <task_id> <kind> <from>-><to> evt=<event_id>``
+
+    e.g. ``AUTONOMOUS-WAKE t_abc blocked ready->blocked evt=4242``.
+
+    The banner is deterministic for a given (task_id, kind, from, to, event_id):
+    identical inputs yield a byte-identical string (stable to grep), and a
+    different ``event_id`` yields a different banner (so each wake is unique and
+    a delivery can never be mistaken for a prior one). When a lane end is unknown
+    it degrades to ``?`` rather than leaking ``None`` — most transition kinds do
+    not carry a from->to lane pair.
+    """
+    src = from_lane if from_lane else _UNKNOWN_LANE
+    dst = to_lane if to_lane else _UNKNOWN_LANE
+    return (
+        f"{WAKE_BANNER_PREFIX} {task_id} {kind} {src}->{dst} evt={int(event_id)}"
+    )
+
 
 def should_emit_transition(cfg: Optional[dict], kind: str) -> bool:
     """True when a transition of ``kind`` should POST to the orchestrator route.
@@ -103,6 +147,8 @@ def build_transition_payload(
     reason: Optional[str],
     event_id: int,
     title: str = "",
+    from_lane: Optional[str] = None,
+    to_lane: Optional[str] = None,
     origin_session_id: Optional[str] = None,
     origin_platform: Optional[str] = None,
     origin_chat_id: Optional[str] = None,
@@ -112,6 +158,11 @@ def build_transition_payload(
 
     The idempotency key is stable per ``(board, task_id, kind, event_id)`` so a
     webhook retry or a duplicate notifier tick converges on one agent run.
+
+    ``from_lane``/``to_lane`` are the lane hop this transition represents (when
+    the source event carries a ``{"from", "to"}`` pair — ``status_changed`` and
+    ``assigned`` do); they feed the self-announce ``wake_banner`` and are
+    surfaced to the woken run so it can lead with the banner verbatim.
 
     The ``origin_*`` fields carry the thread/session this work was born in, so
     the woken orchestrator reports back to that origin thread (the autonomy
@@ -135,6 +186,21 @@ def build_transition_payload(
         "reason": reason or "",
         "title": title or "",
         "event_id": event_id,
+        # Lane hop (empty string when unknown — keeps the body JSON-stable and
+        # never renders a Python ``None`` into the route's prompt template).
+        "from_lane": from_lane or "",
+        "to_lane": to_lane or "",
+        # The unique, greppable self-announce banner. Computed here so the
+        # emitter is the single source of truth for its exact shape; the route
+        # renders it via ``{wake_banner}`` and the woken orchestrator leads its
+        # in-thread reply with it verbatim.
+        "wake_banner": build_wake_banner(
+            task_id=task_id,
+            kind=kind,
+            from_lane=from_lane,
+            to_lane=to_lane,
+            event_id=event_id,
+        ),
         "idempotency_key": (
             f"kanban-transition:{board}:{task_id}:{kind}:{event_id}"
         ),

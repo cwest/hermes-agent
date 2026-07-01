@@ -810,8 +810,18 @@ class GatewayKanbanWatchersMixin:
                             for ev in w["events"]:
                                 try:
                                     reason_val = None
-                                    if ev.payload and ev.payload.get("reason"):
-                                        reason_val = str(ev.payload["reason"])
+                                    from_lane_val = None
+                                    to_lane_val = None
+                                    if ev.payload:
+                                        if ev.payload.get("reason"):
+                                            reason_val = str(ev.payload["reason"])
+                                        # status_changed / assigned carry the
+                                        # lane (or author) hop as {"from","to"};
+                                        # feed it to the self-announce banner.
+                                        if ev.payload.get("from") is not None:
+                                            from_lane_val = str(ev.payload["from"])
+                                        if ev.payload.get("to") is not None:
+                                            to_lane_val = str(ev.payload["to"])
                                     payload = build_transition_payload(
                                         task_id=e_sub["task_id"],
                                         board=e_board or "default",
@@ -819,6 +829,8 @@ class GatewayKanbanWatchersMixin:
                                         reason=reason_val,
                                         event_id=int(getattr(ev, "id", 0) or 0),
                                         title=e_title,
+                                        from_lane=from_lane_val,
+                                        to_lane=to_lane_val,
                                         origin_session_id=origin_sid,
                                         origin_platform=e_sub.get("platform"),
                                         origin_chat_id=e_sub.get("chat_id"),

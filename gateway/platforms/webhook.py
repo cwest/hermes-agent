@@ -611,6 +611,27 @@ class WebhookAdapter(BasePlatformAdapter):
         # applied to the MessageEvent below.
         is_transition_wake = self._is_transition_wake_payload(payload)
 
+        # ── Self-announcing wake banner (event-driven autonomy) ──────
+        # A kanban-transition emit stamps a unique, greppable ``wake_banner``
+        # into the payload (gateway/kanban_transition_emit.py). Guarantee the
+        # woken run LEADS with it verbatim as the first line — regardless of the
+        # route's prompt template — so the orchestrator's in-thread reply opens
+        # with an UNMISTAKABLE marker (task_id + kind + from->to + event_id) that
+        # both it and Casey can identify and grep, and that can never be
+        # conflated with a late-delivered prior reply. Scoped to payloads that
+        # carry ``wake_banner``, so ordinary webhooks are untouched.
+        wake_banner = payload.get("wake_banner")
+        if isinstance(wake_banner, str) and wake_banner.strip():
+            banner = wake_banner.strip()
+            instruction = (
+                f"{banner}\n\n"
+                "You were woken by the kanban transition above. Your reply MUST "
+                f"lead with that exact banner line ({banner!r}) as its first "
+                "line, verbatim, before anything else, so it is unambiguous and "
+                "greppable — then act per the kanban-transition-orchestrate "
+                "skill."
+            )
+            prompt = f"{instruction}\n\n{prompt}" if prompt else instruction
         # Inject skill content if configured.
         # We call build_skill_invocation_message() directly rather than
         # using /skill-name slash commands — the gateway's command parser
