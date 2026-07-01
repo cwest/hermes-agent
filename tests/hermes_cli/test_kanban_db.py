@@ -1124,6 +1124,185 @@ def test_reaper_ignores_other_host_claim_in_nonrunning_lane(
 
 
 # ---------------------------------------------------------------------------
+# Running-reviewer crash: a card claimed via ``claim_review_task`` is
+# ``running`` while the reviewer works (indistinguishable at the row level
+# from a build run). If that reviewer worker CRASHES, ``detect_crashed_workers``
+# must restore the card to ``review`` (NOT ``ready``) so the reviewer respawns
+# via the review-column dispatch and ``check_respawn_guard`` keeps the review
+# carve-outs. A build crash must still fall back to ``ready`` (no regression),
+# and a reviewer that keeps crashing must still trip the breaker to ``blocked``
+# rather than loop forever in ``review``. The durable "this was a review run"
+# signal is the ``source_status: review`` payload on the run's ``claimed``
+# event (written by ``claim_review_task``).
+# ---------------------------------------------------------------------------
+
+
+def _crash_running_worker(conn, monkeypatch, task_id, pid):
+    """Stamp a dead host-local worker_pid on a ``running`` card and reap it.
+
+    The card must already be ``running`` with a host-local ``claim_lock``
+    (i.e. claimed via ``claim_task`` or ``claim_review_task``). We only need
+    to attach the dead ``worker_pid`` and run the reaper; ``_pid_alive`` is
+    patched False by the caller and grace is disabled via env.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    conn.execute(
+        "UPDATE tasks SET worker_pid = ? WHERE id = ?", (pid, task_id),
+    )
+    conn.commit()
+    # No reap-registry entry → ``_classify_worker_exit`` returns ``unknown``,
+    # the generic crash path (a genuine signal/OOM crash). Asserted indirectly
+    # by the ``crashed`` event + failure-counter increment.
+    return _kb.detect_crashed_workers(conn)
+
+
+def test_crashed_reviewer_run_restored_to_review_lane(kanban_home, monkeypatch):
+    """A reviewer run (claimed via ``claim_review_task``, status ``running``,
+    ``source_status: review``) whose worker PID is dead returns to ``review``
+    after ``detect_crashed_workers`` — NOT ``ready`` — with the claim cleared.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review crash", assignee="reviewer")
+        _set_task_status(conn, tid, "review")
+        claimed = kb.claim_review_task(conn, tid)
+        assert claimed is not None and claimed.status == "running"
+
+        _crash_running_worker(conn, monkeypatch, tid, 65001)
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        # CRITICAL: a crashed reviewer must land back in ``review``, not
+        # ``ready`` (which would re-run the implementer in the build lane).
+        assert task.status == "review", (
+            f"crashed reviewer must restore to review, got {task.status}"
+        )
+        assert task.claim_lock is None, "claim_lock must be cleared"
+        assert task.worker_pid is None, "worker_pid must be cleared"
+        assert task.claim_expires is None, "claim_expires must be cleared"
+
+
+def test_crashed_build_run_restored_to_ready_lane(kanban_home, monkeypatch):
+    """A normal BUILD run (claimed via ``claim_task``, no review source) whose
+    worker PID is dead returns to ``ready`` after reap — unchanged behavior,
+    no regression from the review-lane restoration.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="build crash", assignee="builder")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.status == "running"
+
+        _crash_running_worker(conn, monkeypatch, tid, 65002)
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready", (
+            f"crashed build run must restore to ready, got {task.status}"
+        )
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+
+
+def test_crashed_reviewer_still_trips_breaker_to_blocked(kanban_home, monkeypatch):
+    """A reviewer that keeps crashing up to the breaker limit ends ``blocked``
+    — the breaker still works; review-lane restoration does not create an
+    infinite respawn loop in the ``review`` lane.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="flaky reviewer", assignee="reviewer")
+        _set_task_status(conn, tid, "review")
+
+        # DEFAULT_FAILURE_LIMIT == 2: crash the reviewer that many times.
+        for i in range(_kb.DEFAULT_FAILURE_LIMIT):
+            claimed = kb.claim_review_task(conn, tid)
+            assert claimed is not None and claimed.status == "running", (
+                f"iteration {i}: reviewer must re-claim from review lane"
+            )
+            _crash_running_worker(conn, monkeypatch, tid, 65100 + i)
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        # The breaker must win over lane restoration — no forever-loop in review.
+        assert task.status == "blocked", (
+            f"a repeatedly-crashing reviewer must trip the breaker to blocked, "
+            f"got {task.status}"
+        )
+
+
+def test_respawn_guard_frees_restored_review_card(kanban_home, monkeypatch):
+    """End-to-end: after a reviewer crash restores the card to ``review``,
+    ``check_respawn_guard`` returns None for the ``recent_success`` /
+    ``active_pr`` cases (both skipped for review status), proving the reviewer
+    is actually free to respawn — the whole point of restoring the lane.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review free", assignee="reviewer")
+
+        # Simulate the build run that produced the PR under review: a recent
+        # ``completed`` run + a PR-URL comment. On a ``ready`` card these would
+        # trip ``recent_success`` and ``active_pr`` respectively.
+        kb.claim_task(conn, tid)
+        build_run = kb.get_task(conn, tid).current_run_id
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET outcome='completed', status='completed', "
+            "ended_at=? WHERE id=?",
+            (now, build_run),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='review', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        kb.add_comment(
+            conn, tid, "builder",
+            "PR opened: https://github.com/cwest/hermes-agent/pull/999",
+        )
+        conn.commit()
+
+        # Sanity: while the card is in ``review``, the guard is already clear.
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        # Now the reviewer claims it, crashes, and the reaper must restore it
+        # to ``review`` — keeping the guard clear (NOT trapping on the build
+        # run's recent_success / the PR-URL comment, which is what a ``ready``
+        # fallback would do).
+        claimed = kb.claim_review_task(conn, tid)
+        assert claimed is not None and claimed.status == "running"
+        _crash_running_worker(conn, monkeypatch, tid, 65200)
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "review", (
+            f"crashed reviewer must restore to review, got {task.status}"
+        )
+        assert kb.check_respawn_guard(conn, tid) is None, (
+            "restored review card must be free to respawn (no recent_success / "
+            "active_pr guard), but the guard deferred it"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Rate-limit requeue: a worker that bails on a provider quota wall must be
 # released back to ``ready`` WITHOUT counting a failure, so a long (e.g.
 # 5-hour) quota window can't trip the circuit breaker and permanently block
