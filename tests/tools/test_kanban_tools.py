@@ -1238,6 +1238,127 @@ def test_create_rejects_non_list_skills(worker_env):
     assert json.loads(out).get("error")
 
 
+# ---------------------------------------------------------------------------
+# report_back_target fallback (webhook/CLI/cron cards with no session context)
+# ---------------------------------------------------------------------------
+
+def _clear_session_env(monkeypatch):
+    """Simulate a webhook-spawned card: no session context whatsoever.
+
+    Webhook stage-pr-review cards run with neither HERMES_SESSION_PLATFORM/
+    CHAT_ID (gateway path) nor HERMES_SESSION_KEY (TUI path) set, so
+    _maybe_auto_subscribe falls through to the CLI/cron/test branch.
+    """
+    for var in (
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_THREAD_ID",
+        "HERMES_SESSION_USER_ID",
+        "HERMES_SESSION_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _write_report_back_target(monkeypatch, **fields):
+    """Write a kanban.report_back_target block into the isolated config.yaml."""
+    import os
+    from pathlib import Path
+    lines = ["kanban:", "  report_back_target:"]
+    for k, v in fields.items():
+        lines.append(f"    {k}: \"{v}\"")
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_create_subscribes_report_back_target_without_session(
+    monkeypatch, worker_env,
+):
+    """A webhook-spawned card (no session env) subscribes the configured
+    kanban.report_back_target so the existing notifier can deliver the
+    review-card completion to Casey's thread."""
+    _clear_session_env(monkeypatch)
+    _write_report_back_target(
+        monkeypatch, platform="telegram", chat_id="-1009999", thread_id="42",
+    )
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({"title": "review card", "assignee": "lamport"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True, "expected report_back_target fallback to subscribe"
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, d["task_id"])
+    finally:
+        conn.close()
+    assert len(subs) == 1, subs
+    sub = subs[0]
+    assert sub["platform"] == "telegram"
+    assert sub["chat_id"] == "-1009999"
+    assert sub["thread_id"] == "42"
+
+
+def test_create_report_back_target_thread_optional(monkeypatch, worker_env):
+    """thread_id is optional in the configured target."""
+    _clear_session_env(monkeypatch)
+    _write_report_back_target(monkeypatch, platform="discord", chat_id="chan-1")
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    d = json.loads(kt._handle_create({"title": "rc", "assignee": "lamport"}))
+    assert d["subscribed"] is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, d["task_id"])
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "discord"
+    assert subs[0]["chat_id"] == "chan-1"
+    assert subs[0]["thread_id"] in ("", None)
+
+
+def test_create_no_report_back_target_preserves_current_behavior(
+    monkeypatch, worker_env,
+):
+    """With no config key and no session env, behavior is unchanged: no
+    subscription is written and subscribed is False."""
+    _clear_session_env(monkeypatch)
+    # No config.yaml report_back_target written.
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    d = json.loads(kt._handle_create({"title": "rc", "assignee": "lamport"}))
+    assert d["subscribed"] is False
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, d["task_id"])
+    finally:
+        conn.close()
+    assert subs == []
+
+
+def test_create_incomplete_report_back_target_no_subscription(
+    monkeypatch, worker_env,
+):
+    """An incomplete target (platform but no chat_id) does not subscribe."""
+    _clear_session_env(monkeypatch)
+    _write_report_back_target(monkeypatch, platform="telegram")  # no chat_id
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    d = json.loads(kt._handle_create({"title": "rc", "assignee": "lamport"}))
+    assert d["subscribed"] is False
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, d["task_id"])
+    finally:
+        conn.close()
+    assert subs == []
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
