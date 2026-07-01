@@ -866,6 +866,16 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # Read kanban.auto_route_review_bounce — when a reviewer terminates a
+        # review with a clean review-changes-requested block, the housekeeping
+        # tick routes that card back to the original author (closes the
+        # reviewer→author hop the GitHub webhook can't when reviewer and author
+        # share one identity). Defaults ON; set false to keep bounce blocks
+        # parked for a human to route.
+        auto_route_review_bounce_enabled = bool(
+            kanban_cfg.get("auto_route_review_bounce", True)
+        )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -959,6 +969,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    auto_route_review_bounce_enabled=auto_route_review_bounce_enabled,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
