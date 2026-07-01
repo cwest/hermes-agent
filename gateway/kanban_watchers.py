@@ -56,6 +56,40 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+# Near-real-time default for the notifier tick. The transition-emit (agent-wake)
+# and chat-ping delivery both fire from this loop, so the tick gap bounds
+# worst-case emit latency. 2s keeps a lane MOVE's emit comfortably under the
+# <10s near-real-time target while staying cheap on the WAL. Floored at 1.0s —
+# tighter is a busy-poll footgun.
+_NOTIFIER_INTERVAL_DEFAULT = 2.0
+_NOTIFIER_INTERVAL_FLOOR = 1.0
+
+
+def _resolve_notifier_interval(load_config: Callable[[], Any]) -> float:
+    """Resolve the live notifier tick interval in seconds.
+
+    Read fresh from config (``kanban.notifier_interval_seconds``) so the emit /
+    chat-ping poll cadence is tunable without editing source. Defaults to
+    :data:`_NOTIFIER_INTERVAL_DEFAULT` (near-real-time) and is clamped to
+    :data:`_NOTIFIER_INTERVAL_FLOOR` so a sub-second value can't busy-poll the
+    WAL. Fails **safe**: any read/parse error returns the default rather than
+    crashing the notifier loop.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return _NOTIFIER_INTERVAL_DEFAULT
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    raw = kcfg.get("notifier_interval_seconds", _NOTIFIER_INTERVAL_DEFAULT)
+    try:
+        interval = float(raw)
+    except (TypeError, ValueError):
+        return _NOTIFIER_INTERVAL_DEFAULT
+    if interval < _NOTIFIER_INTERVAL_FLOOR:
+        return _NOTIFIER_INTERVAL_FLOOR
+    return interval
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -111,7 +145,7 @@ def _release_singleton_lock(handle) -> None:
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
-    async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+    async def _kanban_notifier_watcher(self, interval: Optional[float] = None) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
@@ -154,6 +188,13 @@ class GatewayKanbanWatchersMixin:
                 "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        # Resolve the tick cadence. An explicit `interval` (tests, callers)
+        # wins; otherwise read kanban.notifier_interval_seconds so the emit /
+        # chat-ping poll gap is tunable and near-real-time by default. The tick
+        # gap bounds worst-case transition-emit latency.
+        if interval is None:
+            interval = _resolve_notifier_interval(_load_config)
+        interval = max(float(interval), _NOTIFIER_INTERVAL_FLOOR)
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -255,8 +296,12 @@ class GatewayKanbanWatchersMixin:
         fallback_chat_id = notify_fallback_cfg.get("chat_id", "1515879019269197885")
         fallback_platform = (notify_fallback_cfg.get("platform") or "discord").lower()
 
-        # Initial delay so the gateway can finish wiring adapters.
-        await asyncio.sleep(5)
+        # Initial delay so the gateway can finish wiring adapters. Capped to the
+        # tick interval so a tightened (near-real-time) interval isn't undercut
+        # by a fixed cold-start delay — an early tick before adapters connect is
+        # a harmless no-op (the tick skips when no adapters are active) and
+        # retries on the next interval.
+        await asyncio.sleep(min(5.0, interval))
 
         while self._running:
             try:

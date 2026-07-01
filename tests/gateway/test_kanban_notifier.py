@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 from gateway.config import Platform
+from gateway.kanban_watchers import _resolve_notifier_interval
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -25,9 +26,14 @@ class DisconnectedAdapters(dict):
 
 async def _run_one_notifier_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
+    # The first sleep is the cold-start settle (now capped to the interval, so
+    # it is no longer a fixed 5s); let it pass through. Any sleep after that is
+    # the post-tick cadence sleep — stop the loop so exactly one tick runs.
+    state = {"settled": False}
 
     async def fake_sleep(delay):
-        if delay == 5:
+        if not state["settled"]:
+            state["settled"] = True
             return None
         runner._running = False
         await real_sleep(0)
@@ -136,6 +142,80 @@ def test_kanban_db_path_is_test_isolated_from_real_home():
 
     assert kb.kanban_db_path().resolve().is_relative_to(hermes_home.resolve())
     assert kb.kanban_db_path().resolve() != production_db.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Notifier tick cadence — near-real-time transition-emit latency.
+#
+# The transition-emit / chat-ping delivery both fire from the notifier tick, so
+# the notifier's poll gap bounds worst-case emit latency. Historically the tick
+# interval was a hardcoded 5.0s with a hardcoded 5s first-tick settle, so a cold
+# start could push a transition emit toward ~10s and the value was not tunable
+# without editing source. `_resolve_notifier_interval` makes it config-driven
+# (kanban.notifier_interval_seconds) with a snappy near-real-time default and a
+# hard >=1.0s floor, and the watcher caps the first-tick settle to the interval.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_notifier_interval_defaults_near_real_time():
+    # No config key => a snappy default that keeps worst-case emit latency well
+    # under the <10s near-real-time target.
+    assert _resolve_notifier_interval(lambda: {}) <= 3.0
+    assert _resolve_notifier_interval(lambda: {"kanban": {}}) <= 3.0
+
+
+def test_resolve_notifier_interval_reads_config():
+    cfg = {"kanban": {"notifier_interval_seconds": 7}}
+    assert _resolve_notifier_interval(lambda: cfg) == 7.0
+
+
+def test_resolve_notifier_interval_floors_at_one_second():
+    # A sub-second value is a footgun (busy-poll on the WAL); clamp to >=1.0.
+    cfg = {"kanban": {"notifier_interval_seconds": 0.1}}
+    assert _resolve_notifier_interval(lambda: cfg) == 1.0
+    cfg0 = {"kanban": {"notifier_interval_seconds": 0}}
+    assert _resolve_notifier_interval(lambda: cfg0) >= 1.0
+
+
+def test_resolve_notifier_interval_fails_safe_on_bad_values():
+    # Garbage value => fall back to the default, never crash the loop.
+    cfg = {"kanban": {"notifier_interval_seconds": "nonsense"}}
+    assert _resolve_notifier_interval(lambda: cfg) <= 3.0
+
+    def _boom():
+        raise RuntimeError("config read failed")
+
+    assert _resolve_notifier_interval(_boom) <= 3.0
+
+
+def test_notifier_first_tick_settle_is_bounded_by_interval(tmp_path, monkeypatch):
+    """Cold-start settle must not exceed the tick interval.
+
+    The first-tick settle used to be a hardcoded 5s regardless of interval, so a
+    tightened interval still ate a 5s cold-start delay before the first emit.
+    Capping settle to the interval keeps cold-start latency near-real-time too.
+    """
+    db_path = tmp_path / "settle.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(delay):
+        sleeps.append(delay)
+        # Stop the loop after the settle + first tick so the test terminates.
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+    runner = _make_runner(RecordingAdapter())
+
+    asyncio.run(runner._kanban_notifier_watcher(interval=2))
+
+    # The first sleep is the settle; it must be <= the interval, not a fixed 5s.
+    assert sleeps, "expected the notifier to sleep at least once"
+    assert sleeps[0] <= 2.0
 
 
 class FailingAdapter:

@@ -3615,6 +3615,16 @@ def test_config_default_dispatch_in_gateway_is_true():
     assert isinstance(interval, (int, float)) and interval >= 1, (
         f"dispatch_interval_seconds must be a positive number, got {interval!r}"
     )
+    notify_interval = kanban.get("notifier_interval_seconds")
+    assert isinstance(notify_interval, (int, float)) and notify_interval >= 1, (
+        f"notifier_interval_seconds must be a positive number, got {notify_interval!r}"
+    )
+    # Near-real-time transition-emit target: the notifier tick gap bounds
+    # worst-case emit latency, so the default must stay well under 10s.
+    assert notify_interval < 10, (
+        "notifier_interval_seconds default must keep emit latency <10s; got "
+        f"{notify_interval!r}"
+    )
 
 
 def test_check_dispatcher_presence_silent_when_gateway_running(monkeypatch):
