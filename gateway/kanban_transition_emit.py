@@ -52,6 +52,15 @@ DEFAULT_EMIT_KINDS: tuple[str, ...] = (
     # Terminal / escalation kinds (always woke the orchestrator).
     "blocked",
     "block_loop_detected",
+    # Terminal-FAILURE escalation kinds. A worker that gives up, crashes, or
+    # times out is the failure-path twin of ``blocked``: the notifier's
+    # NOTIFY_KINDS pings chat for these (via TERMINAL_KINDS), so the wake must
+    # cover them too or the orchestrator is woken on a clean handoff but stays
+    # asleep when a worker actually fails — the same silent-escalation gap this
+    # fix closes, on the failure side.
+    "gave_up",
+    "crashed",
+    "timed_out",
     # Actionable lane-move kinds. A card moving to review fires
     # ``status_changed`` + ``assigned``; ``unblocked`` returns a card to the
     # ready lane. These are handoffs the orchestrator must act on — they were

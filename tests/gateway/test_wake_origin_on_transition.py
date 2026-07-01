@@ -50,6 +50,17 @@ def test_should_emit_still_covers_blocked_and_loop_detected():
     ) is True
 
 
+def test_should_emit_covers_terminal_failure_kinds_by_default():
+    # A worker that gives up / crashes / times out is a terminal-failure
+    # escalation: the notifier's NOTIFY_KINDS pings chat for these (via
+    # TERMINAL_KINDS), but the wake must ALSO fire so the orchestrator can act
+    # on the failure path. These were silent pre-fix — a crashed worker pinged
+    # chat but woke no orchestrator, the same silent-escalation gap this fix
+    # closes, on the failure side.
+    for kind in ("gave_up", "crashed", "timed_out"):
+        assert kte.should_emit_transition(_enabled_cfg(), kind) is True, kind
+
+
 def test_should_emit_respects_explicit_config_override():
     # An explicit emit_kinds list still wins over the default set.
     cfg = _enabled_cfg(emit_kinds=["blocked"])
