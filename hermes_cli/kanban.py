@@ -333,6 +333,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "and re-queues the task.")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
+    p_create.add_argument("--session-id", default=None, dest="session_id",
+                          help="Origin session id (the thread/session this work "
+                               "was born in). Persisted so a later terminal "
+                               "transition can wake that session and report back "
+                               "to its origin thread.")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
                                "(repeatable). The kanban lifecycle is already "
@@ -1344,6 +1349,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
+            session_id=getattr(args, "session_id", None) or None,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
@@ -2452,7 +2458,12 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
             thread_id=args.thread_id, user_id=args.user_id,
-            notifier_profile=args.notifier_profile or _profile_author(),
+            # Default to the profile of the gateway that will DELIVER the ping,
+            # NOT the creator's profile. A sub stamped with a worker profile
+            # (salton/avram/…) is silently dropped by the gateway notifier's
+            # owner-profile gate. An explicit --notifier-profile still wins for
+            # the rare multi-gateway case.
+            notifier_profile=args.notifier_profile or kb.notifier_delivery_profile(),
         )
     print(f"Subscribed {args.platform}:{args.chat_id}"
           + (f":{args.thread_id}" if args.thread_id else "")
