@@ -13,6 +13,10 @@ below.
 ## Base
 
 - **Base:** `main@9be292f1e` (rebased onto upstream `main`, 1941 commits past `v2026.6.19`)
+<!-- Base commit: 9be292f1e678437644396b47b3410b433ba3433f -->
+<!-- machine-readable base for fork CI (secret-scan). The fork tracks upstream `main` HEAD,
+     so the base is a commit SHA, not a release tag. Update this SHA on every rebase. -->
+- **Base tag:** `v2026.6.19` (historical fork point; the fork now tracks `main` HEAD — see Base commit above)
 - **Upstream:** `NousResearch/hermes-agent`
 - **Integration branch:** `cwest/integration`
 

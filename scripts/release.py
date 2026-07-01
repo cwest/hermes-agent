@@ -2056,6 +2056,7 @@ LEGACY_AUTHOR_MAP = {
     "zhchl@hermes-agent.local": "8294",  # PR #50572 salvage (honor config context_length on banner)
     "yansh2017@gmail.com": "ya-nsh",  # PR #26790 salvage (normalize local terminal relative cwd; #26783)
     "casey@geeknest.com": "cwest",
+    "christophergervais92@users.noreply.github.com": "demi",  # fork patch #17 (review respawn-guard) — demi authored the crashed-reviewer→review-lane restore; preserve authorship
 }
 
 
