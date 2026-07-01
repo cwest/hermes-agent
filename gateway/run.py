@@ -1686,6 +1686,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
+    is_transition_wake_event,
     merge_pending_message_event,
 )
 from gateway.restart import (
@@ -5008,6 +5009,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # which queues internal events silently (no interrupt, no ack) so they
         # cascade after the current turn finishes.
         if getattr(event, "internal", False):
+            return False
+
+        # --- Kanban-transition wakes must never interrupt/steer/fold ---
+        # An origin-routed transition wake (tagged kanban_transition_wake) is an
+        # autonomy signal that MUST become its own distinct conversation turn.
+        # If it arrives while the origin session is mid-turn, treating it like a
+        # user TEXT message under busy_input_mode='interrupt' calls
+        # running_agent.interrupt(wake_text) — folding the banner into the
+        # finishing prior turn's response context (where it is discarded) — and
+        # returning True short-circuits handle_message BEFORE the base adapter's
+        # wake-precedence enqueue runs. The wake is then silently swallowed: no
+        # turn_context line, banner never surfaces (root-caused live 2026-07-01).
+        # Fall through so the base adapter queues the wake un-merged (its
+        # wake-precedence slot guard) and the post-turn drain dispatches it as a
+        # DISTINCT turn once the in-flight turn ends. This is the same shape as
+        # the internal-event exemption above.
+        if is_transition_wake_event(event):
             return False
 
         running_agent = self._running_agents.get(session_key)
