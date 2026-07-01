@@ -791,6 +791,8 @@ class WebhookAdapter(BasePlatformAdapter):
             status=202,
         )
 
+    # Key-mirror invariant: an origin discord thread source must yield the key
+    # ``agent:main:discord:thread:<chat>:<thread>`` so the wake lands in the exact origin session.
     def _build_origin_source(
         self,
         origin_platform: Optional[str],
