@@ -5910,6 +5910,46 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
+def _crashed_run_was_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    current_run_id: Optional[int],
+) -> bool:
+    """Return True if the task's current (crashed) run was a REVIEW run.
+
+    The durable signal is the ``source_status: "review"`` payload that
+    ``claim_review_task`` writes onto the run's ``claimed`` event. A build run
+    claimed via ``claim_task`` writes a ``claimed`` event WITHOUT that key.
+    Reading the existing event payload avoids inventing a new schema column.
+
+    Scoped to the crashed run's ``current_run_id`` so a card that was built
+    once (build ``claimed`` event) and later moved to review (review ``claimed``
+    event) is classified by its CURRENT run, not its history. Falls back to the
+    latest ``claimed`` event for the task when the run id is unknown.
+    """
+    if current_run_id is not None:
+        ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'claimed' AND run_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, current_run_id),
+        ).fetchone()
+    else:
+        ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    if ev is None or not ev["payload"]:
+        return False
+    try:
+        payload = json.loads(ev["payload"])
+    except (ValueError, TypeError):
+        return False
+    return isinstance(payload, dict) and payload.get("source_status") == "review"
+
+
 def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
@@ -6477,6 +6517,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
         # look. See the per-status branch below.
         rows = conn.execute(
             "SELECT t.id, t.status, t.worker_pid, t.claim_lock, "
+            "       t.current_run_id, "
             "       COALESCE(r.started_at, t.started_at) AS active_started_at "
             "FROM tasks t "
             "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -6594,12 +6635,35 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            # A crashed REVIEW run must return to ``review`` (not ``ready``):
+            # the card was claimed via ``claim_review_task`` (review -> running)
+            # so at the row level it's indistinguishable from a build run, but
+            # dropping it to ``ready`` loses the review lane — the normal ready
+            # dispatch would re-run the IMPLEMENTER instead of respawning the
+            # reviewer, and ``check_respawn_guard`` would re-trip its
+            # recent_success / active_pr guards (both carved out for review
+            # status). The durable signal is the ``source_status: review``
+            # payload on this run's ``claimed`` event. Rate-limited and
+            # protocol-violation sub-cases are unaffected here: only the LANE a
+            # genuine crash returns to changes; the breaker still trips a
+            # repeatedly-crashing reviewer via the normal failure-count path
+            # (see ``_record_task_failure``, whose blocked transition matches
+            # ``review`` too).
+            current_run_id = (
+                row["current_run_id"]
+                if "current_run_id" in row.keys()
+                else None
+            )
+            was_review_run = _crashed_run_was_review(
+                conn, row["id"], current_run_id
+            )
+            restore_status = "review" if was_review_run else "ready"
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (restore_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -6761,13 +6825,16 @@ def _record_task_failure(
                     (failures, error[:500], task_id),
                 )
             else:
-                # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
-                # counter fields.
+                # Timeout/crash path: task is already at ``ready`` (build
+                # crash) or ``review`` (a crashed REVIEW run restored to its
+                # lane by ``detect_crashed_workers``) with claim cleared; just
+                # flip to blocked + update counter fields. ``review`` is
+                # included so a repeatedly-crashing reviewer still trips the
+                # breaker instead of looping forever in the review lane.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN ('ready', 'running', 'review')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
