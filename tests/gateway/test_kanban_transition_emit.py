@@ -166,9 +166,14 @@ class _RecordingAdapter:
 
 async def _run_one_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
+    # The first sleep is the cold-start settle (now capped to the interval, not a
+    # fixed 5s); pass it through. The next sleep is the post-tick cadence sleep —
+    # stop the loop so exactly one tick runs.
+    state = {"settled": False}
 
     async def fake_sleep(delay):
-        if delay == 5:
+        if not state["settled"]:
+            state["settled"] = True
             return None
         runner._running = False
         await real_sleep(0)
