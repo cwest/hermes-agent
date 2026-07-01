@@ -820,6 +820,74 @@ def test_detect_crashed_workers_skips_freshly_claimed_tasks(
         assert tid in crashed, "should reclaim task past grace period"
 
 
+def test_detect_crashed_workers_grace_uses_current_run_start_after_reclaim(
+    kanban_home, monkeypatch,
+):
+    """A re-claimed worker gets the launch-window grace measured per spawn.
+
+    ``tasks.started_at`` intentionally records the first time the task ever
+    started (pinned via ``COALESCE`` on every claim). The launch-window grace
+    in ``detect_crashed_workers`` exists to protect a *freshly-spawned* worker
+    through the fork -> /proc-visibility window, so it must be measured from the
+    active ``task_runs.started_at`` row — not the task's first-ever start.
+    Otherwise a card re-claimed for its next lane (implement -> review) inherits
+    a stale ``tasks.started_at``, the grace has long since expired, and the new
+    worker is reaped as ``crashed`` before it finishes initializing. This is the
+    same bug class ``enforce_max_runtime`` already fixed
+    (see ``test_max_runtime_uses_current_run_start_after_retry``).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.delenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", raising=False)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="reclaim grace test", assignee="a")
+
+        # First claim: sets tasks.started_at and opens run 1.
+        kb.claim_task(conn, tid, claimer=f"{host}:first")
+
+        # Simulate the first run having started long ago (well past the 30s
+        # grace) and the task bouncing back to ready (worker exited without a
+        # terminal verb), then being re-claimed for its next lane. The
+        # COALESCE pin keeps tasks.started_at at the OLD timestamp; the new
+        # run gets a FRESH task_runs.started_at.
+        old_started = int(time.time()) - 3600
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (old_started, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE task_id = ?",
+            (old_started, tid),
+        )
+        conn.commit()
+
+        # Re-claim: opens a fresh run with a current task_runs.started_at = now.
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        kb.claim_task(conn, tid, claimer=f"{host}:second")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?",
+            (99999, tid),
+        )
+        conn.commit()
+
+        # The freshly-spawned second worker is within the grace window when
+        # measured from the CURRENT run's start — even though tasks.started_at
+        # is an hour stale. It must NOT be reaped.
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed, (
+            "freshly re-claimed worker must get launch-window grace from its "
+            "current run start, not the task's pinned first-ever started_at"
+        )
+
+
 def test_detect_crashed_workers_grace_period_env_override(
     kanban_home, monkeypatch,
 ):

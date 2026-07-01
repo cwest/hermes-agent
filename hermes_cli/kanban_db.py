@@ -6467,8 +6467,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.worker_pid, t.claim_lock, "
+            "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+            "FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -6478,11 +6481,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID
-            # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
-            if started_at is not None:
+            # is visible on /proc. The grace is a PER-SPAWN concept, so it
+            # must be measured from the active task_runs row — not from
+            # ``tasks.started_at``, which is pinned to the task's first-ever
+            # start (COALESCE on claim) and stays stale across re-claims. A
+            # card re-claimed for its next lane (implement -> review) would
+            # otherwise inherit an expired grace and get reaped mid-init.
+            # Same reasoning as ``enforce_max_runtime`` (retries measured
+            # from the current run, not the task's lifetime start).
+            active_started_at = (
+                row["active_started_at"]
+                if "active_started_at" in row.keys()
+                else None
+            )
+            if active_started_at is not None:
                 grace = _resolve_crash_grace_seconds()
-                if time.time() - started_at < grace:
+                if time.time() - active_started_at < grace:
                     continue
             if _pid_alive(row["worker_pid"]):
                 continue
