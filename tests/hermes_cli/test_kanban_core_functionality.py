@@ -90,6 +90,189 @@ def test_no_idempotency_key_never_collides(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# Review-card PR dedup (webhook auto-card vs. manually-filed card)
+# ---------------------------------------------------------------------------
+
+PR_URL = "https://github.com/cwest/hermes-agent/pull/43"
+
+
+def test_review_card_dedups_on_pr_url_without_idempotency_key(kanban_home):
+    """A second review card for the same PR no-ops even without a shared key.
+
+    The webhook idempotency-keys its review card on the PR URL, but a
+    *manually* filed card for the same PR carries a different (or no) key,
+    so the key-based dedup misses it. The PR-URL guard catches it anyway.
+    """
+    conn = kb.connect()
+    try:
+        a = kb.create_task(
+            conn,
+            title=f"Review PR #43: {PR_URL}",
+            skills=["github-code-review"],
+            idempotency_key="webhook:" + PR_URL,
+        )
+        # Manual card: same PR, different key, different title wording.
+        b = kb.create_task(
+            conn,
+            title="please review pr 43",
+            body=f"Take a look at {PR_URL}",
+            skills=["github-code-review"],
+        )
+        assert a == b, "second review card for the same PR must dedup to the first"
+    finally:
+        conn.close()
+
+
+def test_review_card_dedup_pr_url_in_body_only(kanban_home):
+    conn = kb.connect()
+    try:
+        a = kb.create_task(
+            conn,
+            title="review",
+            body=f"PR: {PR_URL}",
+            skills=["github-code-review"],
+        )
+        b = kb.create_task(
+            conn,
+            title="review again",
+            body=f"the pr is {PR_URL} thanks",
+            skills=["github-code-review"],
+        )
+        assert a == b
+    finally:
+        conn.close()
+
+
+def test_review_card_dedup_ignored_for_archived(kanban_home):
+    """An archived prior review card does not block a fresh re-review."""
+    conn = kb.connect()
+    try:
+        a = kb.create_task(
+            conn,
+            title="review",
+            body=PR_URL,
+            skills=["github-code-review"],
+        )
+        kb.archive_task(conn, a)
+        b = kb.create_task(
+            conn,
+            title="re-review after changes",
+            body=PR_URL,
+            skills=["github-code-review"],
+        )
+        assert a != b
+    finally:
+        conn.close()
+
+
+def test_review_card_dedup_only_for_review_skill(kanban_home):
+    """A non-review card mentioning the same PR is never deduped."""
+    conn = kb.connect()
+    try:
+        review = kb.create_task(
+            conn,
+            title="review",
+            body=PR_URL,
+            skills=["github-code-review"],
+        )
+        # An implement/merge card can legitimately reference the PR URL.
+        merge = kb.create_task(
+            conn,
+            title="merge",
+            body=f"merge once green: {PR_URL}",
+        )
+        another_review = kb.create_task(
+            conn,
+            title="review 2",
+            body=PR_URL,
+            skills=["github-code-review"],
+        )
+        assert merge != review, "non-review card must not collide with a review card"
+        assert another_review == review, "second review card still dedups"
+    finally:
+        conn.close()
+
+
+def test_review_card_dedup_distinct_prs_do_not_collide(kanban_home):
+    conn = kb.connect()
+    try:
+        a = kb.create_task(
+            conn,
+            title="review 43",
+            body="https://github.com/cwest/hermes-agent/pull/43",
+            skills=["github-code-review"],
+        )
+        b = kb.create_task(
+            conn,
+            title="review 44",
+            body="https://github.com/cwest/hermes-agent/pull/44",
+            skills=["github-code-review"],
+        )
+        assert a != b, "review cards for different PRs must be independent"
+    finally:
+        conn.close()
+
+
+def test_review_card_without_pr_url_not_deduped(kanban_home):
+    """No PR URL → fall back to normal (no PR-based dedup)."""
+    conn = kb.connect()
+    try:
+        a = kb.create_task(
+            conn, title="review something", skills=["github-code-review"]
+        )
+        b = kb.create_task(
+            conn, title="review something else", skills=["github-code-review"]
+        )
+        assert a != b
+    finally:
+        conn.close()
+
+
+def test_review_card_dedup_canonicalises_url_variants(kanban_home):
+    """`.../pull/43`, `.../pull/43/files`, and `www.` host all collapse."""
+    conn = kb.connect()
+    try:
+        a = kb.create_task(
+            conn,
+            title="review",
+            body="https://github.com/cwest/hermes-agent/pull/43",
+            skills=["github-code-review"],
+        )
+        b = kb.create_task(
+            conn,
+            title="review files view",
+            body="https://www.github.com/cwest/hermes-agent/pull/43/files?w=1",
+            skills=["github-code-review"],
+        )
+        assert a == b
+    finally:
+        conn.close()
+
+
+def test_review_card_dedup_substring_skill_not_matched(kanban_home):
+    """A skill that merely contains the review-skill name doesn't trigger dedup."""
+    conn = kb.connect()
+    try:
+        a = kb.create_task(
+            conn,
+            title="not a real review",
+            body=PR_URL,
+            skills=["github-code-review-extra"],
+        )
+        b = kb.create_task(
+            conn,
+            title="real review",
+            body=PR_URL,
+            skills=["github-code-review"],
+        )
+        # The first card isn't a review card (different skill), so the real
+        # review card is created fresh rather than deduping to it.
+        assert a != b
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Spawn-failure circuit breaker
 # ---------------------------------------------------------------------------
 
