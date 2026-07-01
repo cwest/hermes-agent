@@ -1,0 +1,470 @@
+name: Fork Daily Sync
+
+# Keeps this fork current with upstream on a daily cadence, without ever
+# merging on its own.
+#
+# What it does, once a day:
+#   1. Fetches upstream (NousResearch/hermes-agent) tags and history.
+#   2. Picks the newest *release* tag — the highest vYYYY.M.D[.N] by version
+#      sort, not lexical sort, so v2026.4.23 beats v2026.4.3.
+#   3. Rebases cwest/integration onto that tag on a throwaway sync branch.
+#   4. Reconciles PATCHES.md: any upstream-pending patch whose pull request has
+#      merged and shipped in the new base is dropped (scripts/fork_retire_patches.py).
+#   5. Runs the full suite the same way upstream CI does — per-file isolation
+#      via scripts/run_tests.sh, integration tests excluded.
+#   6. Secret-scans the carried patch stack (gitleaks). No secrets reach the
+#      fork — ever — so a finding fails the run before anything is pushed.
+#   7. On a clean run, opens a pull request for human review. It never merges.
+#      This is the whole point: a person decides when the fork moves.
+#   8. On a rebase conflict or a test failure, opens (or updates) a tracking
+#      issue instead, so the breakage is visible and nothing silently stalls.
+#
+# What it deliberately does NOT do:
+#   * It does not auto-merge. Review is mandatory.
+#   * It does not touch osv-scanner.yml or supply-chain-audit.yml. Those two
+#     upstream workflows are load-bearing security checks and are preserved
+#     as-is; a guard step below fails the run if either ever goes missing.
+#
+# Commits are signed when a bot signing key is configured (see the "Configure
+# git identity and signing" step) and carry no AI-authorship attribution.
+
+on:
+  schedule:
+    # 07:00 UTC daily — after upstream's usual release window, before most
+    # contributors start their day, so a fresh PR is waiting for review.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run the full sync but skip pushing the branch and opening the PR.'
+        type: boolean
+        default: false
+      base_tag_override:
+        description: 'Rebase onto this exact tag instead of auto-detecting the newest.'
+        type: string
+        default: ''
+
+permissions:
+  contents: write        # push the sync branch
+  pull-requests: write   # open the review PR
+  issues: write          # open the breakage tracking issue
+
+# One sync at a time. A second tick should wait, not race the first.
+concurrency:
+  group: fork-daily-sync
+  cancel-in-progress: false
+
+env:
+  INTEGRATION_BRANCH: cwest/integration
+  UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+  ISSUE_LABEL: fork-sync
+  ISSUE_TITLE_PREFIX: '[fork-sync]'
+  # Secret scanner used by the gate below. Pinned to a release version and
+  # verified against the published SHA-256, like the ripgrep install further
+  # down. Keep this in step with .github/workflows/fork-secret-scan.yml.
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ env.INTEGRATION_BRANCH }}
+          fetch-depth: 0
+          fetch-tags: true
+          # Use a token that can push the sync branch and open the PR.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Guard — upstream security workflows must be present
+        # These two are preserved from upstream and must never be dropped by a
+        # sync. If a rebase or a careless edit removes them, stop here loudly.
+        run: |
+          set -euo pipefail
+          missing=0
+          for wf in osv-scanner.yml supply-chain-audit.yml; do
+            if [ ! -f ".github/workflows/$wf" ]; then
+              echo "::error::Required upstream workflow .github/workflows/$wf is missing"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Refusing to sync without the upstream supply-chain checks in place."
+            exit 1
+          fi
+          echo "osv-scanner.yml and supply-chain-audit.yml present — OK"
+
+      - name: Add upstream remote and fetch
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || \
+            git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --tags --prune upstream
+          echo "Upstream tags fetched."
+
+      - name: Detect newest upstream release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          override="${{ github.event.inputs.base_tag_override }}"
+          if [ -n "$override" ]; then
+            if ! git rev-parse -q --verify "refs/tags/$override" >/dev/null; then
+              echo "::error::Override tag $override does not exist"
+              exit 1
+            fi
+            tag="$override"
+            echo "Using overridden base tag: $tag"
+          else
+            # Release tags look like vYYYY.M.D with an optional .N suffix.
+            # Version-sort (sort -V) so dotted numeric segments compare as
+            # numbers, then take the highest.
+            tag="$(git tag -l 'v20*' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+              | sort -V \
+              | tail -1)"
+            if [ -z "$tag" ]; then
+              echo "::error::No release tag matched vYYYY.M.D pattern"
+              exit 1
+            fi
+            echo "Newest release tag: $tag"
+          fi
+          commit="$(git rev-parse --short "refs/tags/$tag")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+          # The fork point for the rebase is our *current* base tag, recorded in
+          # PATCHES.md, not the merge-base with the new tag. Replaying from the
+          # current base replays exactly our carried patches and nothing else —
+          # if we used the merge-base we would re-apply upstream history too.
+          # The line looks like:  - **Base tag:** `vYYYY.M.D` (commit `sha`)
+          current_base="$(grep -m1 'Base tag:' PATCHES.md \
+            | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' \
+            | head -1)"
+          if [ -z "$current_base" ]; then
+            echo "::error::Could not read current base tag from PATCHES.md"
+            exit 1
+          fi
+          echo "Current base tag (from PATCHES.md): $current_base"
+          echo "current_base=$current_base" >> "$GITHUB_OUTPUT"
+
+      - name: Short-circuit if already on the newest tag
+        id: already
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          # If the integration branch already contains the tag's commit, there
+          # is nothing to rebase onto — skip the rest cleanly.
+          if git merge-base --is-ancestor "refs/tags/$tag" "origin/$INTEGRATION_BRANCH" 2>/dev/null; then
+            echo "fork already contains $tag — nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure git identity and signing
+        if: steps.already.outputs.skip != 'true'
+        env:
+          BOT_SSH_SIGNING_KEY: ${{ secrets.FORK_BOT_SSH_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          # Identity for the sync commits. No AI attribution anywhere — this is
+          # a maintenance bot acting on the maintainer's behalf, recorded as
+          # such, with no "generated by" / "co-authored-by an assistant" lines.
+          git config user.name  "cwest-fork-sync[bot]"
+          git config user.email "fork-sync@users.noreply.github.com"
+
+          if [ -n "${BOT_SSH_SIGNING_KEY:-}" ]; then
+            # Sign with an SSH key provided as a repo secret. The matching
+            # public key must be registered as a signing key on the bot account
+            # for GitHub to show commits as Verified.
+            mkdir -p ~/.ssh
+            printf '%s\n' "$BOT_SSH_SIGNING_KEY" > ~/.ssh/fork_sync_signing
+            chmod 600 ~/.ssh/fork_sync_signing
+            ssh-keygen -y -f ~/.ssh/fork_sync_signing > ~/.ssh/fork_sync_signing.pub
+            git config gpg.format ssh
+            git config user.signingkey ~/.ssh/fork_sync_signing.pub
+            git config commit.gpgsign true
+            echo "Commit signing enabled (SSH key from secret)."
+          else
+            # No signing key configured. Proceed unsigned rather than block the
+            # whole sync; surface a warning so it is visible in the run log.
+            git config commit.gpgsign false
+            echo "::warning::FORK_BOT_SSH_SIGNING_KEY not set — sync commits will be unsigned."
+          fi
+
+      - name: Create sync branch and rebase onto newest tag
+        id: rebase
+        if: steps.already.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          sync_branch="cwest/sync/${tag}-${{ github.run_id }}"
+          echo "sync_branch=$sync_branch" >> "$GITHUB_OUTPUT"
+
+          git checkout -B "$sync_branch" "origin/$INTEGRATION_BRANCH"
+
+          # Rebase our carried patches onto the new base tag. The fork point is
+          # our current base tag (from PATCHES.md), so only our own commits
+          # replay. Commits the new base already contains apply empty and git
+          # drops them automatically — that is how a landed upstream PR retires
+          # its local copy.
+          current_base="${{ steps.tag.outputs.current_base }}"
+          if git rebase --onto "refs/tags/$tag" "refs/tags/$current_base" "$sync_branch"; then
+            echo "rebase_ok=true" >> "$GITHUB_OUTPUT"
+            echo "Rebase onto $tag succeeded."
+          else
+            echo "rebase_ok=false" >> "$GITHUB_OUTPUT"
+            # Capture the conflicting files for the issue body, then abort so we
+            # leave the checkout in a clean state.
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
+            git rebase --abort || true
+            echo "::warning::Rebase onto $tag hit conflicts."
+          fi
+
+      - name: Reconcile PATCHES.md (drop shipped patches)
+        id: patches
+        if: steps.already.outputs.skip != 'true' && steps.rebase.outputs.rebase_ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          commit="${{ steps.tag.outputs.commit }}"
+          # Report first (for the log), then write.
+          python3 scripts/fork_retire_patches.py --base-tag "$tag"
+          python3 scripts/fork_retire_patches.py --base-tag "$tag" --base-commit "$commit" --write
+          if ! git diff --quiet -- PATCHES.md; then
+            git add PATCHES.md
+            git commit -m "chore(fork): reconcile PATCHES.md against ${tag}" \
+                       -m "Drop patches whose upstream PR shipped in ${tag}; refresh base tag."
+            echo "Committed PATCHES.md reconciliation."
+          else
+            echo "PATCHES.md unchanged — no patches retired this cycle."
+          fi
+
+      - name: Secret-scan the carried patch stack (gate)
+        id: secrets
+        if: steps.already.outputs.skip != 'true' && steps.rebase.outputs.rebase_ok == 'true'
+        # No secrets in the fork — ever. Before this sync can become a pushable
+        # branch and a review PR, the rebased patch stack is scanned for anything
+        # secret-shaped. A finding fails the run here, which means no push and no
+        # PR: the secret never reaches a branch others can see. The scan is
+        # scoped to base-tag..HEAD, i.e. our carried commits including the
+        # PATCHES.md reconciliation just made, and not upstream history.
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          curl -sSfL -o "$tarball" "$url"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" gitleaks
+          chmod +x gitleaks
+          rm -f "$tarball"
+          ./gitleaks version
+
+          # After the rebase, our carried commits sit directly on top of the new
+          # base tag, so that tag is the fork point. Scanning tag..HEAD covers
+          # exactly our replayed patch stack plus the PATCHES.md reconciliation
+          # commit, and nothing from upstream history.
+          new_base="${{ steps.tag.outputs.tag }}"
+          echo "Scanning carried patch stack ${new_base}..HEAD for secrets."
+          git log --oneline "refs/tags/${new_base}..HEAD" || true
+          if ! ./gitleaks git . \
+              --redact \
+              --report-format sarif \
+              --report-path /tmp/gitleaks-sync.sarif \
+              --verbose \
+              --exit-code 1 \
+              --log-opts="refs/tags/${new_base}..HEAD"; then
+            echo "::error::Secret scan found secret-shaped content in the carried patch stack. Refusing to push or open a PR."
+            exit 1
+          fi
+          echo "Secret scan clean — safe to proceed."
+
+      - name: Install ripgrep (prebuilt binary)
+        if: steps.already.outputs.skip != 'true' && steps.rebase.outputs.rebase_ok == 'true'
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Install uv
+        if: steps.already.outputs.skip != 'true' && steps.rebase.outputs.rebase_ok == 'true'
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Set up Python 3.11
+        if: steps.already.outputs.skip != 'true' && steps.rebase.outputs.rebase_ok == 'true'
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        if: steps.already.outputs.skip != 'true' && steps.rebase.outputs.rebase_ok == 'true'
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
+      - name: Run full suite (mirror upstream CI)
+        id: tests
+        if: steps.already.outputs.skip != 'true' && steps.rebase.outputs.rebase_ok == 'true'
+        continue-on-error: true
+        # scripts/run_tests.sh gives every test file a fresh interpreter — the
+        # same per-file isolation upstream CI uses. We exclude integration tests
+        # (they need live services) to match the upstream test matrix, which
+        # runs `-m 'not integration'` equivalently by skipping tests/integration.
+        run: |
+          set -euo pipefail
+          scripts/run_tests.sh -- -m 'not integration'
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+      - name: Push sync branch
+        id: push
+        if: >-
+          steps.already.outputs.skip != 'true' &&
+          steps.rebase.outputs.rebase_ok == 'true' &&
+          steps.secrets.outcome == 'success' &&
+          steps.tests.outcome == 'success' &&
+          github.event.inputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          git push origin "${{ steps.rebase.outputs.sync_branch }}"
+          echo "Pushed ${{ steps.rebase.outputs.sync_branch }}."
+
+      - name: Open review pull request (mode B — never auto-merge)
+        if: >-
+          steps.already.outputs.skip != 'true' &&
+          steps.rebase.outputs.rebase_ok == 'true' &&
+          steps.secrets.outcome == 'success' &&
+          steps.tests.outcome == 'success' &&
+          github.event.inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          COMMIT: ${{ steps.tag.outputs.commit }}
+          SYNC_BRANCH: ${{ steps.rebase.outputs.sync_branch }}
+        run: |
+          set -euo pipefail
+          body="$(cat <<EOF
+          This pull request rebases the fork onto upstream release \`${TAG}\` (\`${COMMIT}\`).
+
+          ## What changed
+
+          - Rebased \`${INTEGRATION_BRANCH}\` onto \`${TAG}\`.
+          - Reconciled \`PATCHES.md\`: any carried patch whose upstream pull request has
+          already shipped in \`${TAG}\` was dropped, and the base tag was refreshed.
+          - Ran the full suite with per-file isolation via \`scripts/run_tests.sh\`,
+          integration tests excluded, matching upstream CI. It passed.
+
+          ## How to review
+
+          Read the diff against \`${INTEGRATION_BRANCH}\`. The interesting parts are any
+          patches that survived the rebase and the \`PATCHES.md\` changes. The test run
+          for this branch is linked from the Checks tab.
+
+          ## Merging
+
+          Merge this when you are satisfied. Nothing merges it for you — this fork
+          moves only when a person decides it should.
+
+          Opened by \`.github/workflows/fork-daily-sync.yml\`.
+          EOF
+          )"
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --base "$INTEGRATION_BRANCH" \
+            --head "$SYNC_BRANCH" \
+            --title "Sync onto upstream ${TAG}" \
+            --body "$body" \
+            --label "$ISSUE_LABEL"
+
+      - name: Open or update tracking issue on conflict or failure
+        if: >-
+          always() &&
+          steps.already.outputs.skip != 'true' &&
+          (steps.rebase.outputs.rebase_ok == 'false' || steps.tests.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          REBASE_OK: ${{ steps.rebase.outputs.rebase_ok }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ "$REBASE_OK" = "false" ]; then
+            kind="rebase conflict"
+            detail="The rebase onto \`${TAG}\` hit conflicts and was aborted. Conflicting files:"
+            files="$(sed 's/^/- /' /tmp/conflicts.txt 2>/dev/null || echo '- (file list unavailable)')"
+            next="Rebase \`${INTEGRATION_BRANCH}\` onto \`${TAG}\` by hand, resolve the conflicts, and update \`PATCHES.md\` for any patch that no longer applies."
+          else
+            kind="test failure"
+            detail="The rebase onto \`${TAG}\` succeeded, but the test suite failed."
+            files=""
+            next="Open the run, find the failing test files, and decide whether the break is in upstream or in a carried patch. The branch was not pushed and no PR was opened."
+          fi
+
+          title="${ISSUE_TITLE_PREFIX} ${kind} syncing onto ${TAG}"
+          body="$(cat <<EOF
+          The daily sync could not produce a clean pull request.
+
+          **What happened:** ${detail}
+          ${files}
+
+          **Run:** ${RUN_URL}
+
+          **What to do next:** ${next}
+
+          This issue was opened by \`.github/workflows/fork-daily-sync.yml\`. Close it once
+          the sync is unblocked; the next run will reopen if the same step fails again.
+          EOF
+          )"
+
+          # De-dupe: if an open issue with this exact title already exists, add a
+          # comment instead of stacking duplicates.
+          existing="$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --search "in:title \"$title\"" \
+            --json number,title \
+            --jq '.[] | select(.title == "'"$title"'") | .number' \
+            | head -1)"
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "${{ github.repository }}" \
+              --body "Still failing on $(date -u +%FT%TZ). Run: ${RUN_URL}"
+            echo "Updated existing issue #$existing."
+          else
+            # Ensure the label exists, then open the issue.
+            gh label create "$ISSUE_LABEL" --repo "${{ github.repository }}" \
+              --color BFD4F2 --description "Fork upstream-sync automation" 2>/dev/null || true
+            gh issue create --repo "${{ github.repository }}" \
+              --title "$title" --body "$body" --label "$ISSUE_LABEL"
+            echo "Opened new tracking issue."
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Fork daily sync"
+            echo ""
+            echo "- Newest tag: \`${{ steps.tag.outputs.tag }}\`"
+            echo "- Already current: \`${{ steps.already.outputs.skip }}\`"
+            echo "- Rebase clean: \`${{ steps.rebase.outputs.rebase_ok }}\`"
+            echo "- Secret scan: \`${{ steps.secrets.outcome }}\`"
+            echo "- Tests: \`${{ steps.tests.outcome }}\`"
+            echo "- Dry run: \`${{ github.event.inputs.dry_run }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
