@@ -809,7 +809,45 @@ class WebhookAdapter(BasePlatformAdapter):
         )
 
         # Non-blocking — return 202 Accepted immediately
-        task = asyncio.create_task(self.handle_message(event))
+        #
+        # Origin-routed wakes (kanban-transition) carry a SessionSource whose
+        # platform is the ORIGIN platform (e.g. discord), and target a session
+        # that is owned by that platform's adapter — NOT this webhook adapter.
+        # Each adapter keeps its OWN _active_sessions / _pending_messages, so if
+        # the wake is processed on the webhook adapter it never sees the origin
+        # session's busy state: it takes the cold path, spawns a turn via the
+        # shared runner, collides with the already-running origin turn at the
+        # runner's _running_agents guard, and is silently dropped (no
+        # turn_context, banner never surfaces — root-caused live 2026-07-01).
+        #
+        # Dispatch through the OWNING platform's adapter so busy-detection, the
+        # wake-precedence pending slot, and the post-turn drain all operate on
+        # the SAME session state as the running origin turn. Fall back to self
+        # when the owning adapter can't be resolved (backward-compatible).
+        dispatch_adapter = self
+        if origin_source is not None:
+            gw = getattr(self, "gateway_runner", None)
+            adapters = getattr(gw, "adapters", None) if gw is not None else None
+            if adapters:
+                owner = adapters.get(source.platform)
+                if owner is not None and owner is not self:
+                    dispatch_adapter = owner
+                    logger.info(
+                        "[webhook] origin wake: dispatching on owning adapter %s "
+                        "(not webhook adapter) for session platform=%s chat=%s thread=%s",
+                        source.platform,
+                        source.platform,
+                        source.chat_id,
+                        source.thread_id,
+                    )
+                else:
+                    logger.warning(
+                        "[webhook] origin wake: owning adapter for %s not found; "
+                        "falling back to webhook adapter (wake may not resume the "
+                        "origin session correctly)",
+                        source.platform,
+                    )
+        task = asyncio.create_task(dispatch_adapter.handle_message(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
