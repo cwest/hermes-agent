@@ -218,3 +218,84 @@ class TestBusySessionAuthBypass:
         running_agent.steer.assert_not_called()
         # Nothing queued
         assert sk not in adapter._pending_messages
+
+
+# ---------------------------------------------------------------------------
+# System-internal events (kanban-transition wake) bypass the auth gate.
+#
+# Root cause (2026-07-01, live): an origin-routed transition wake has
+# user_id=None (the webhook builds a user-less SessionSource for a shared
+# thread) and is HMAC-authenticated upstream. When the origin session was busy,
+# the busy handler's user-authorization gate saw user=None, deemed it
+# "unauthorized", and silently dropped it (return True) BEFORE the wake
+# exemption further down — so the wake never became a turn. System events must
+# skip the user-authorization gate.
+# ---------------------------------------------------------------------------
+
+def _make_wake_event(chat_id="c1", thread_id="c1"):
+    from gateway.platforms.base import Platform
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=chat_id,
+        chat_type="thread",
+        user_id="",          # webhook builds a user-less source for shared threads
+        user_name="",
+        thread_id=thread_id,
+    )
+    evt = MessageEvent(
+        text="AUTONOMOUS WAKE banner", message_type=MessageType.TEXT,
+        source=source, message_id="wake1",
+    )
+    evt.metadata["kanban_transition_wake"] = True
+    return evt
+
+
+class TestSystemEventAuthBypass:
+    @pytest.mark.asyncio
+    async def test_transition_wake_not_dropped_by_auth_gate(self):
+        """A kanban-transition wake (user_id='') must NOT be dropped as
+        unauthorized in the busy path — it must fall through to be queued as a
+        distinct turn."""
+        from gateway.run import GatewayRunner
+        from gateway.platforms.base import Platform
+
+        runner, _ = _make_runner(authorized_users={"user1"})  # wake user is NOT here
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="discord")
+        adapter.platform = Platform.DISCORD
+
+        wake = _make_wake_event()
+        sk = build_session_key(wake.source)
+        runner._running_agents[sk] = MagicMock()  # session is busy
+        runner.adapters[Platform.DISCORD] = adapter
+        # _adapter_for_source resolves by platform
+        runner._adapter_for_source = lambda src: adapter
+
+        result = await GatewayRunner._handle_active_session_busy_message(runner, wake, sk)
+
+        # The wake reaches the wake-exemption (return False = fall through to the
+        # base adapter's wake-precedence enqueue), NOT the auth-drop (return True).
+        assert result is False, "transition wake must fall through, not be auth-dropped"
+        # And the running agent must NOT be interrupted by the wake.
+        runner._running_agents[sk].interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ordinary_userless_message_still_dropped(self):
+        """Control: a NON-wake message with no authorized user is still dropped
+        — the exemption is specific to system events, not a blanket bypass."""
+        from gateway.run import GatewayRunner
+        from gateway.platforms.base import Platform
+
+        runner, _ = _make_runner(authorized_users={"user1"})
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="discord")
+        adapter.platform = Platform.DISCORD
+
+        evt = _make_event(text="sneak in", user_id="attacker", platform_val="discord")
+        sk = build_session_key(evt.source)
+        runner._running_agents[sk] = MagicMock()
+        runner.adapters[Platform.DISCORD] = adapter
+        runner._adapter_for_source = lambda src: adapter
+
+        result = await GatewayRunner._handle_active_session_busy_message(runner, evt, sk)
+        assert result is True, "unauthorized non-system message must still be dropped"
