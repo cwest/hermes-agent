@@ -266,35 +266,68 @@ class GatewayKanbanWatchersMixin:
             self._kanban_notifier_profile = notifier_profile
 
         # 4c — transition emit bridge (event-driven orchestration). When enabled
-        # (config kanban.transition_emit.enabled, default OFF / restart-gated), a
-        # delivered transition of a configured kind ALSO POSTs to a loopback
-        # webhook route so the orchestrator wakes as an agent RUN (not just a chat
-        # ping). Default-off means this block is a no-op until Casey enables it;
-        # the chat-ping delivery above is unchanged either way.
-        transition_emit_cfg = (
-            kanban_cfg.get("transition_emit", {}) if isinstance(kanban_cfg, dict) else {}
-        )
-        transition_emit_secret = None
-        if transition_emit_cfg.get("enabled") is True:
-            # Secret bridges to an internal var; never a user-facing HERMES_* knob.
-            transition_emit_secret = os.environ.get("HERMES_KANBAN_TRANSITION_SECRET")
+        # (config kanban.transition_emit.enabled, default OFF), a delivered
+        # transition of a configured kind ALSO POSTs to a loopback webhook route
+        # so the orchestrator wakes as an agent RUN (not just a chat ping).
+        # Default-off means this is a no-op until Casey enables it; the chat-ping
+        # delivery is unchanged either way.
+        #
+        # This config (transition_emit + notify_fallback) is RE-DERIVED from a
+        # FRESH load_config() at the TOP OF EACH TICK below — not cached once
+        # here — so editing kanban.transition_emit.emit_kinds / .enabled (or the
+        # notify_fallback target) hot-loads on the next tick with NO gateway
+        # restart, mirroring how the tick interval is re-resolved per call. It
+        # was previously read once before the loop, which silently restart-gated
+        # every emit_kinds change. `load_config()` is a cheap in-memory read.
+        def _resolve_transition_cfg() -> tuple[dict, str | None, str, str]:
+            """Re-read the transition-emit + fallback config for this tick.
 
-        # Fallback delivery target — so a transition on a card that carries NO
-        # origin subscription is NEVER silent. When a task has an unseen
-        # notifiable event but no subscription at all, the notifier lazily
-        # registers a fallback subscription to the default channel (Casey's #5),
-        # then the normal claim/cursor/dedup machinery delivers it. Both the
-        # channel and its platform are config-overridable
-        # (kanban.notify_fallback.{chat_id,platform}); the default is the
-        # thread-origin-autonomy default channel. Empty chat_id disables the
-        # fallback entirely (opt-out).
-        notify_fallback_cfg = (
-            kanban_cfg.get("notify_fallback", {}) if isinstance(kanban_cfg, dict) else {}
-        )
-        if not isinstance(notify_fallback_cfg, dict):
-            notify_fallback_cfg = {}
-        fallback_chat_id = notify_fallback_cfg.get("chat_id", "1515879019269197885")
-        fallback_platform = (notify_fallback_cfg.get("platform") or "discord").lower()
+            Returns (transition_emit_cfg, transition_emit_secret,
+            fallback_chat_id, fallback_platform). Falls back to safe defaults if
+            the fresh load fails, so a transient config-read error never crashes
+            the notifier tick (it just reuses the defaults for that tick).
+            """
+            try:
+                _cfg = _load_config()
+            except Exception:
+                _cfg = {}
+            _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+            _te_cfg = (
+                _kanban_cfg.get("transition_emit", {})
+                if isinstance(_kanban_cfg, dict) else {}
+            )
+            if not isinstance(_te_cfg, dict):
+                _te_cfg = {}
+            _te_secret = None
+            if _te_cfg.get("enabled") is True:
+                # Secret bridges to an internal var; never a user-facing HERMES_* knob.
+                _te_secret = os.environ.get("HERMES_KANBAN_TRANSITION_SECRET")
+            # Fallback delivery target — so a transition on a card that carries
+            # NO origin subscription is NEVER silent. When a task has an unseen
+            # notifiable event but no subscription at all, the notifier lazily
+            # registers a fallback subscription to the default channel (Casey's
+            # #5), then the normal claim/cursor/dedup machinery delivers it. Both
+            # the channel and its platform are config-overridable
+            # (kanban.notify_fallback.{chat_id,platform}); the default is the
+            # thread-origin-autonomy default channel. Empty chat_id disables the
+            # fallback entirely (opt-out).
+            _nf_cfg = (
+                _kanban_cfg.get("notify_fallback", {})
+                if isinstance(_kanban_cfg, dict) else {}
+            )
+            if not isinstance(_nf_cfg, dict):
+                _nf_cfg = {}
+            _fb_chat_id = _nf_cfg.get("chat_id", "1515879019269197885")
+            _fb_platform = (_nf_cfg.get("platform") or "discord").lower()
+            return _te_cfg, _te_secret, _fb_chat_id, _fb_platform
+
+        # Prime once for the cold-start window; re-derived per tick inside the loop.
+        (
+            transition_emit_cfg,
+            transition_emit_secret,
+            fallback_chat_id,
+            fallback_platform,
+        ) = _resolve_transition_cfg()
 
         # Initial delay so the gateway can finish wiring adapters. Capped to the
         # tick interval so a tightened (near-real-time) interval isn't undercut
@@ -305,6 +338,19 @@ class GatewayKanbanWatchersMixin:
 
         while self._running:
             try:
+                # Hot-reload the emit/fallback config each tick so live edits to
+                # kanban.transition_emit.emit_kinds / .enabled (and the
+                # notify_fallback target) take effect on the NEXT tick with no
+                # gateway restart. The `_collect` closure below captures these
+                # names by reference, so rebinding them here is what makes the
+                # change visible to this tick's claim/emit gates.
+                (
+                    transition_emit_cfg,
+                    transition_emit_secret,
+                    fallback_chat_id,
+                    fallback_platform,
+                ) = _resolve_transition_cfg()
+
                 def _collect():
                     deliveries: list[dict] = []
                     emit_wakes: list[dict] = []
