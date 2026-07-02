@@ -3560,7 +3560,7 @@ _ACCEPTANCE_SIGNOFF_REASON_PREFIX = "awaiting-casey-signoff"
 
 
 def _resolve_stray_acceptance_owner(
-    conn: sqlite3.Connection, task_id: str,
+    conn: sqlite3.Connection, task_id: str, *, reviewer: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve the acceptance owner a stray ``review`` card was reassigned to.
 
@@ -3573,9 +3573,20 @@ def _resolve_stray_acceptance_owner(
 
     The review-move stamped ``assigned {from: author, to: reviewer}``; the stray
     PASS stamped a LATER ``assigned {from: reviewer, to: <owner>}``. The owner is
-    the ``to`` of the most recent ``assigned`` event whose ``to`` differs from the
-    card's current review reviewer — i.e. the reassignment that moved it off the
-    reviewer. Returns None when unresolvable (leave it for a human).
+    the ``to`` of the most recent ``assigned`` event that moved the card OFF the
+    reviewer — i.e. whose ``from`` is the current review reviewer and whose ``to``
+    differs from that reviewer.
+
+    Keying on ``from == reviewer`` (not merely ``from != to``) is load-bearing: a
+    card still owned by its reviewer has NO off-reviewer move — its newest
+    ``assigned`` is the build→review hop ``{author → reviewer}``, whose ``from`` is
+    the author, not the reviewer. Without this key that hop would resolve the owner
+    back to the reviewer, and an in-flight ``review``/reviewer card carrying a PASS
+    comment would be wrongly reconciled to ``blocked``/reviewer (a block with no
+    acceptance owner — the exact wrong-lane state this reconciler prevents).
+
+    Returns None when unresolvable (no off-reviewer move, or the reviewer cannot
+    be determined) so the caller leaves the card for a human.
     """
     rows = conn.execute(
         "SELECT payload FROM task_events "
@@ -3583,25 +3594,87 @@ def _resolve_stray_acceptance_owner(
         "ORDER BY id DESC",
         (task_id,),
     ).fetchall()
-    for row in rows:
-        payload_str = row["payload"]
+
+    def _move(payload_str):
         if not payload_str:
-            continue
+            return None, None
         try:
             payload = json.loads(payload_str)
         except (ValueError, TypeError):
-            continue
+            return None, None
         if not isinstance(payload, dict):
-            continue
+            return None, None
         frm = payload.get("from")
         to = payload.get("to")
         frm = frm.strip() if isinstance(frm, str) and frm.strip() else None
         to = to.strip() if isinstance(to, str) and to.strip() else None
-        # The stray reassignment moved the card OFF the reviewer (from == reviewer)
-        # onto the acceptance owner (to). The most recent such move wins.
-        if frm and to and frm != to:
+        return frm, to
+
+    moves = [_move(row["payload"]) for row in rows]
+    # The reviewer is the identity that HELD the card in the ``review`` lane before
+    # the stray PASS moved it off — resolved from the ``status_changed → review``
+    # hop (see :func:`_resolve_review_reviewer`). Anchoring on the transition (not
+    # the oldest reassignment) keeps this correct when the card was reassigned
+    # earlier in its life (a ready-lane hop before ever reaching review).
+    if reviewer is None:
+        reviewer = _resolve_review_reviewer(conn, task_id)
+    if not reviewer:
+        return None
+    # The stray acceptance move is the most recent ``assigned`` that moved the card
+    # OFF the reviewer: ``from == reviewer`` and ``to != reviewer``. With no such
+    # move (the reviewer still holds the card) there is no acceptance owner.
+    for frm, to in moves:
+        if to and frm == reviewer and to != reviewer:
             return to
     return None
+
+
+def _resolve_review_reviewer(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Resolve who held a card in the ``review`` lane (its reviewer).
+
+    Anchors on the ``status_changed → review`` transition and returns the ``to`` of
+    the ``assigned`` event closest to it — the identity the build→review hop moved
+    the card into. The paired ``assigned`` may be stamped just before or just after
+    the ``status_changed`` in the same move, so proximity (nearest event id), not
+    strict before/after, is what identifies it. A later stray PASS reassignment
+    (``{reviewer → owner}``) sits farther from the transition and is not mistaken
+    for the review hop. Returns None when there is no review transition or no
+    accompanying assignment (unresolvable).
+    """
+    rows = conn.execute(
+        "SELECT id, kind, payload FROM task_events WHERE task_id = ? ORDER BY id ASC",
+        (task_id,),
+    ).fetchall()
+
+    def _payload(row):
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (ValueError, TypeError):
+            payload = {}
+        return payload if isinstance(payload, dict) else {}
+
+    review_event_id = None
+    for row in rows:
+        if row["kind"] == "status_changed" and _payload(row).get("to") == "review":
+            review_event_id = row["id"]  # keep the LAST →review transition
+    if review_event_id is None:
+        return None
+    reviewer = None
+    best_distance = None
+    for row in rows:
+        if row["kind"] != "assigned":
+            continue
+        to = _payload(row).get("to")
+        to = to.strip() if isinstance(to, str) and to.strip() else None
+        if not to:
+            continue
+        distance = abs(row["id"] - review_event_id)
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            reviewer = to
+    return reviewer
 
 
 def _has_pass_signal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
@@ -3633,9 +3706,10 @@ def reconcile_pass_acceptance(
     ``status='blocked'`` AND ``assignee=<principal>`` together, with a ``blocked``
     event emitted (that event fires the acceptance notification). The bug this
     reconciles: a PASS that did ``assign <principal>`` WITHOUT the ``block`` half,
-    leaving the card in ``status='review'`` under the principal's name —
-    Lamport's lane with Casey's name on it. That state is contradictory AND
-    silent: no ``blocked`` event fired, so the acceptance ping never triggered.
+    leaving the card in ``status='review'`` under the acceptance principal's name —
+    the reviewer's lane with the acceptance owner's name on it. That state is
+    contradictory AND silent: no ``blocked`` event fired, so the acceptance ping
+    never triggered.
 
     The primary fix is the ``sdlc-review`` skill making the reviewer do BOTH
     halves itself (unifying the PR and no-PR paths). THIS is the board-internal
@@ -6146,11 +6220,12 @@ class DispatchResult:
     """Count of review-changes-requested blocks auto-routed back to their author
     this tick (the reviewer→author hop). See :func:`auto_route_review_bounce`."""
     reconciled_pass_acceptance: int = 0
-    """Count of stray ``review``/casey cards repaired to the atomic acceptance
-    lane (``blocked``/casey with a ``blocked`` event) this tick. A PASS that did
-    ``assign casey`` WITHOUT the ``block`` half strands the card in the reviewer's
-    lane under Casey's name — contradictory AND silent (no ``blocked`` event → the
-    acceptance ping never fires). See :func:`reconcile_pass_acceptance`."""
+    """Count of stray ``review``/owner cards repaired to the atomic acceptance
+    lane (``blocked``/owner with a ``blocked`` event) this tick. A PASS that did
+    ``assign <owner>`` WITHOUT the ``block`` half strands the card in the reviewer's
+    lane under the acceptance owner's name — contradictory AND silent (no
+    ``blocked`` event → the acceptance ping never fires). See
+    :func:`reconcile_pass_acceptance`."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)

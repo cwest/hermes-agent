@@ -216,6 +216,44 @@ def test_review_card_with_reviewer_is_untouched(kanban_home: Path) -> None:
         assert task.status == "review" and task.assignee == "lamport"
 
 
+def test_review_card_with_reviewer_and_pass_comment_is_untouched(
+    kanban_home: Path,
+) -> None:
+    """A card still owned by its reviewer (``review``/lamport) that ALSO carries an
+    ``awaiting-casey-signoff`` PASS comment must NOT be reconciled to
+    ``blocked``/lamport.
+
+    This is the case the guard has to exclude: the reviewer posted the PASS gist
+    but has not yet done the ``assign`` half, so the card is still legitimately in
+    the reviewer's hands. Reconciling here would produce ``blocked``/lamport — a
+    block with no acceptance owner, the exact wrong-lane state this reconciler
+    exists to prevent. The owner resolution must key on a reassignment that moved
+    the card OFF the reviewer (``from == reviewer``, ``to != reviewer``); with no
+    such move, there is no acceptance owner and the card is left alone.
+    """
+    with kb.connect() as conn:
+        tid = _stage_review_with_reviewer(conn)  # review + lamport
+        # The PASS gist is recorded, but the card is STILL owned by the reviewer —
+        # no assign-off-reviewer move has happened.
+        kb.add_comment(
+            conn, tid, author="lamport", body=f"[audit] status=PASS {_SIGNOFF_GIST}"
+        )
+        assert kb.get_task(conn, tid).assignee == "lamport"
+
+        reconciled = kb.reconcile_pass_acceptance(conn)
+
+        assert reconciled == 0, (
+            "a review card still owned by its reviewer must not be reconciled, "
+            "even with a PASS comment present"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "review" and task.assignee == "lamport", (
+            "the card must stay review/lamport, never become blocked/lamport"
+        )
+        blocked = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+        assert not blocked, "no blocked event may fire for an in-flight review card"
+
+
 # ---------------------------------------------------------------------------
 # RED 4 — fires inside the real housekeeping tick
 # ---------------------------------------------------------------------------
