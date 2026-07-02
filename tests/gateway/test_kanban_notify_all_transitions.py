@@ -129,6 +129,62 @@ def test_assigned_transition_delivers_chat_ping(tmp_path, monkeypatch):
     assert tid in adapter.sent[0]["text"]
 
 
+# --- (a2) a card landing in CASEY'S lane delivers a DISTINCT notification -----
+
+
+def test_assigned_to_casey_lane_delivers_distinct_ready_for_you_notification(
+    tmp_path, monkeypatch
+):
+    """When a card is reassigned to ``casey`` (the human acceptance/merge lane),
+    the chat ping must be a DISTINCT, unmistakable "it's in your lane / ready for
+    you" notification — not the generic "reassigned -> @casey" line every
+    worker-to-worker handoff produces. It must also surface the PR URL inline so
+    Casey can act without digging. This is the clear lane signal that was missing
+    (a card sat PASS'd in acceptance with only a generic reassign ping).
+    """
+    db_path = tmp_path / "casey_lane.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _install_config(monkeypatch, _base_config())
+
+    pr_url = "https://github.com/cwest/office/pull/14"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="feat: something",
+            assignee="lamport",
+            body=f"Work item.\nPR: {pr_url}\n",
+        )
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            notifier_profile="default",
+        )
+        # PASS handoff: reviewer hands the card to casey's acceptance lane.
+        assert kb.assign_task(conn, tid, "casey")
+    finally:
+        conn.close()
+
+    adapter = _RecordingAdapter()
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    assert len(adapter.sent) == 1, "a casey-lane assignment must deliver a ping"
+    text = adapter.sent[0]["text"]
+    # DISTINCT from the generic worker reassign ping ("reassigned -> @…").
+    assert "reassigned" not in text, (
+        "the casey-lane notification must NOT be the generic reassign ping"
+    )
+    # A clear, unmistakable human-lane signal.
+    assert ("READY FOR YOU" in text) or ("🔔" in text), (
+        "the casey-lane notification must carry a clear 'ready for you' signal"
+    )
+    # Actionable: the PR URL inline so Casey can act without digging.
+    assert pr_url in text, (
+        "the casey-lane notification must include the PR URL inline"
+    )
+    assert tid in text
+
+
 # --- (b) triage escalation delivers AND wakes --------------------------------
 
 

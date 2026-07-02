@@ -734,13 +734,34 @@ class GatewayKanbanWatchersMixin:
                                 f"— {title}"
                             )
                         elif kind == "assigned":
-                            who_now = ""
+                            assignee_now = ""
                             if ev.payload and ev.payload.get("assignee"):
-                                who_now = f" → @{ev.payload['assignee']}"
-                            msg = (
-                                f"➡ {tag}Kanban {sub['task_id']} reassigned"
-                                f"{who_now} — {title}"
-                            )
+                                assignee_now = str(ev.payload["assignee"])
+                            if assignee_now == "casey":
+                                # The human acceptance/merge lane. This is the
+                                # one hand-off Casey must act on, so it gets a
+                                # DISTINCT, unmistakable notification (not the
+                                # generic "reassigned -> @worker" line) with the
+                                # PR URL inline so he can act without digging.
+                                from hermes_cli.kanban_db import (
+                                    _canonical_pr_url as _pr_url_of,
+                                )
+                                pr = None
+                                if task is not None:
+                                    pr = _pr_url_of(getattr(task, "title", None)) or \
+                                        _pr_url_of(getattr(task, "body", None))
+                                pr_line = f"\n{pr}" if pr else ""
+                                msg = (
+                                    f"🔔 {tag}READY FOR YOU — Kanban "
+                                    f"{sub['task_id']} is in your lane"
+                                    f" — {title}{pr_line}"
+                                )
+                            else:
+                                who_now = f" → @{assignee_now}" if assignee_now else ""
+                                msg = (
+                                    f"➡ {tag}Kanban {sub['task_id']} reassigned"
+                                    f"{who_now} — {title}"
+                                )
                         else:
                             # Any other lane-change kind in NOTIFY_KINDS
                             # (promoted / reclaimed / stale / dependency_wait):
