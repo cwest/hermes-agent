@@ -1344,6 +1344,14 @@ class GatewayKanbanWatchersMixin:
             kanban_cfg.get("auto_route_review_bounce", True)
         )
 
+        # Read kanban.reconcile_pass_acceptance — repair a stray review/owner card
+        # (a PASS that assigned the owner but dropped the block half) into the
+        # atomic blocked/owner acceptance state so the acceptance ping fires.
+        # Defaults ON; set false to leave stray review/owner cards for a human.
+        reconcile_pass_acceptance_enabled = bool(
+            kanban_cfg.get("reconcile_pass_acceptance", True)
+        )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1439,6 +1447,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     auto_route_review_bounce_enabled=auto_route_review_bounce_enabled,
+                    reconcile_pass_acceptance_enabled=reconcile_pass_acceptance_enabled,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
