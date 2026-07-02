@@ -734,13 +734,35 @@ class GatewayKanbanWatchersMixin:
                                 f"— {title}"
                             )
                         elif kind == "assigned":
-                            who_now = ""
+                            assignee_now = None
                             if ev.payload and ev.payload.get("assignee"):
-                                who_now = f" → @{ev.payload['assignee']}"
-                            msg = (
-                                f"➡ {tag}Kanban {sub['task_id']} reassigned"
-                                f"{who_now} — {title}"
-                            )
+                                assignee_now = str(ev.payload["assignee"])
+                            if assignee_now == "casey":
+                                # A card entering Casey's merge lane is an
+                                # "act on this" signal, not another worker
+                                # handoff — render a DISTINCT ready-for-you ping
+                                # and inline the PR URL (from title/body) so the
+                                # merge is one click away. Falls back cleanly to
+                                # the plain ping when no PR URL is present.
+                                pr_url = _kb._canonical_pr_url(
+                                    getattr(task, "title", None)
+                                ) or _kb._canonical_pr_url(
+                                    getattr(task, "body", None)
+                                )
+                                pr_line = f"\n{pr_url}" if pr_url else ""
+                                msg = (
+                                    f"🔔 {tag}READY FOR YOU — Kanban "
+                                    f"{sub['task_id']} is in your lane"
+                                    f" — {title}{pr_line}"
+                                )
+                            else:
+                                who_now = (
+                                    f" → @{assignee_now}" if assignee_now else ""
+                                )
+                                msg = (
+                                    f"➡ {tag}Kanban {sub['task_id']} reassigned"
+                                    f"{who_now} — {title}"
+                                )
                         else:
                             # Any other lane-change kind in NOTIFY_KINDS
                             # (promoted / reclaimed / stale / dependency_wait):

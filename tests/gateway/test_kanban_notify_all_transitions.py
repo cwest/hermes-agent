@@ -129,6 +129,97 @@ def test_assigned_transition_delivers_chat_ping(tmp_path, monkeypatch):
     assert tid in adapter.sent[0]["text"]
 
 
+# --- (a.2) assignee == casey renders a distinct "ready for you" ping ----------
+
+
+def test_assigned_to_casey_renders_ready_for_you_with_pr_url(tmp_path, monkeypatch):
+    """An ``assigned`` event whose target is ``casey`` (the merge lane) must
+
+    render a DISTINCT 'ready for you' message — not the generic
+    ``➡ reassigned → @casey`` any worker handoff produces — and inline the
+    card's PR URL so Casey has a one-click 'act on this' signal.
+    """
+    db_path = tmp_path / "casey.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _install_config(monkeypatch, _base_config())
+
+    pr_url = "https://github.com/cwest/hermes-agent/pull/43"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="feat: a thing",
+            body=f"Ready for merge.\n{pr_url}\n<!-- card:x -->",
+            assignee="worker",
+        )
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            notifier_profile="default",
+        )
+        # PASS -> promote into Casey's lane emits an `assigned` -> casey event.
+        assert kb.assign_task(conn, tid, "casey")
+    finally:
+        conn.close()
+
+    adapter = _RecordingAdapter()
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    # Distinct signal, NOT the generic reassignment ping.
+    assert "READY FOR YOU" in text, (
+        "an assigned->casey transition must render the distinct "
+        "'READY FOR YOU' merge-lane ping, not the generic reassignment message"
+    )
+    assert "reassigned" not in text, (
+        "the casey merge-lane ping must not reuse the generic 'reassigned' text"
+    )
+    # The PR URL is inline so Casey can act with one click.
+    assert pr_url in text, "the ready-for-you ping must inline the card's PR URL"
+    assert tid in text
+
+
+def test_assigned_to_non_casey_stays_generic_reassignment(tmp_path, monkeypatch):
+    """The distinct ping is scoped to ``casey`` — a worker handoff to any other
+
+    assignee must still render the generic ``➡ … reassigned → @X`` message.
+    """
+    db_path = tmp_path / "worker.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _install_config(monkeypatch, _base_config())
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="feat: another thing",
+            body="https://github.com/cwest/hermes-agent/pull/99",
+            assignee="worker",
+        )
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            notifier_profile="default",
+        )
+        assert kb.assign_task(conn, tid, "lamport")
+    finally:
+        conn.close()
+
+    adapter = _RecordingAdapter()
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert "reassigned" in text, (
+        "a non-casey handoff must keep the generic reassignment ping"
+    )
+    assert "READY FOR YOU" not in text, (
+        "the distinct merge-lane ping must NOT fire for non-casey assignees"
+    )
+    assert "@lamport" in text
+
+
 # --- (b) triage escalation delivers AND wakes --------------------------------
 
 
