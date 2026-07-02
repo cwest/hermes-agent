@@ -5,10 +5,10 @@ upstream base tag. It exists so that anyone — human or agent — can answer tw
 questions at a glance: *what are we carrying, and why*, and *when is it safe to
 drop*.
 
-The fork tracks tagged upstream releases, not `main`. The integration branch
-(`cwest/integration`) is built off a known-good release tag and every local
-change is layered on top. Each such change gets exactly one row in the table
-below.
+The fork tracks upstream `main` HEAD, not tagged releases (see **Base** below).
+The integration branch (`cwest/integration`) is rebased onto a known-good `main`
+commit and every local change is layered on top. Each such change gets exactly
+one row in the table below.
 
 ## Base
 
