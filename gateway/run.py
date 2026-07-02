@@ -4873,12 +4873,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._enqueue_fifo(session_key, event, adapter)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # --- System-internal events bypass the user-authorization gate ---
+        # A kanban-transition WAKE (and other internal/system events) is NOT a
+        # user message: the webhook receiver builds its SessionSource with no
+        # user_id (threads are shared) and it is already authenticated upstream
+        # (HMAC on the webhook route). Running the user-authorization check on it
+        # sees user=None, deems it "unauthorized", and silently drops it
+        # (return True) BEFORE the wake exemption below — the final swallow that
+        # kept an origin-routed wake from ever becoming a turn while the session
+        # was busy (root-caused live 2026-07-01). Skip the auth gate for these
+        # system events; they are exempted from interrupt/steer/fold further down
+        # regardless, so this only lets them reach that queue-as-distinct-turn path.
+        _is_system_event = bool(getattr(event, "internal", False)) or is_transition_wake_event(event)
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
         # can inject messages into an active session they don't own.
-        if not self._is_user_authorized(event.source):
+        if not _is_system_event and not self._is_user_authorized(event.source):
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s",
