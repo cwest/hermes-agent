@@ -557,3 +557,109 @@ class TestCLI:
         res = _cli(["boards", "list", "--json"], env_extra=env)
         slugs = [b["slug"] for b in json.loads(res.stdout)]
         assert "rmme" not in slugs
+
+
+# ---------------------------------------------------------------------------
+# allowed_boards guard (opt-in single-board enforcement)
+# ---------------------------------------------------------------------------
+
+class TestAllowedBoardsGuard:
+    """``kanban.allowed_boards`` gates ``create_board`` at the choke point.
+
+    Default (absent/None) is permissive so the upstream multi-board feature
+    is preserved. When set to a non-empty list, only listed slugs (plus the
+    always-implicit ``default``) may be created; existing boards outside the
+    list still read/return metadata (mkdir -p semantics).
+    """
+
+    def test_restricted_slug_is_refused(self, fresh_home):
+        with pytest.raises(ValueError, match="restricted"):
+            kb.create_board("knowledge", kanban_cfg={"allowed_boards": ["default"]})
+        # And no board dir was created as a side effect.
+        assert not kb.board_exists("knowledge")
+
+    def test_none_is_permissive_upstream_preserved(self, fresh_home):
+        # allowed_boards absent → any slug still works (no regression).
+        meta = kb.create_board("anything", kanban_cfg={})
+        assert meta["slug"] == "anything"
+        assert kb.board_exists("anything")
+
+    def test_none_via_absent_key_is_permissive(self, fresh_home):
+        # kanban_cfg with no allowed_boards key at all behaves as unrestricted.
+        meta = kb.create_board("freeboard", kanban_cfg={"dispatch_interval_seconds": 60})
+        assert meta["slug"] == "freeboard"
+
+    def test_empty_list_is_permissive(self, fresh_home):
+        # An empty list is treated as "no restriction", not "allow nothing".
+        meta = kb.create_board("openboard", kanban_cfg={"allowed_boards": []})
+        assert meta["slug"] == "openboard"
+
+    def test_default_always_allowed(self, fresh_home):
+        # The base board is creatable even if the list omits it.
+        meta = kb.create_board("default", kanban_cfg={"allowed_boards": ["knowledge"]})
+        assert meta["slug"] == "default"
+
+    def test_listed_slug_allowed(self, fresh_home):
+        meta = kb.create_board("knowledge", kanban_cfg={"allowed_boards": ["knowledge"]})
+        assert meta["slug"] == "knowledge"
+        assert kb.board_exists("knowledge")
+
+    def test_existing_board_outside_list_is_idempotent(self, fresh_home):
+        # Create while permissive, then a later restricted create must NOT raise
+        # (mkdir -p semantics: never break reads/existing boards).
+        kb.create_board("legacy", kanban_cfg={})
+        meta = kb.create_board("legacy", kanban_cfg={"allowed_boards": ["default"]})
+        assert meta["slug"] == "legacy"
+
+    def test_slug_normalized_before_guard(self, fresh_home):
+        # Guard compares the normalized slug, so an allow-list of the
+        # normalized form matches an un-normalized input.
+        meta = kb.create_board("Knowledge", kanban_cfg={"allowed_boards": ["knowledge"]})
+        assert meta["slug"] == "knowledge"
+
+    def test_cli_refuses_restricted_slug(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        (tmp_path / "config.yaml").write_text(
+            "kanban:\n  allowed_boards:\n    - default\n",
+            encoding="utf-8",
+        )
+        r = _cli(["boards", "create", "knowledge"], env_extra=env)
+        # main.py's dispatcher doesn't propagate subcommand return codes today
+        # (see test_board_flag_rejects_unknown), so we assert the user-visible
+        # signal: the policy error on stderr, plus that no board was created.
+        combined = (r.stdout + r.stderr).lower()
+        assert "not permitted" in combined or "single-board" in combined
+        assert "restricted" in combined
+        # default board still reachable and no new board landed.
+        res = _cli(["boards", "list", "--json"], env_extra=env)
+        slugs = [b["slug"] for b in json.loads(res.stdout)]
+        assert slugs == ["default"]
+
+    def test_cli_returns_nonzero_on_restricted(self):
+        # Unit-level assertion that the CLI handler itself returns a non-zero
+        # exit code when the guard fires — independent of main.py's dispatcher
+        # (which currently discards subcommand return codes).
+        import argparse
+        from hermes_cli import kanban as kbcli
+
+        ns = argparse.Namespace(
+            slug="knowledge",
+            name=None,
+            description=None,
+            icon=None,
+            color=None,
+            default_workdir=None,
+            switch=False,
+        )
+        # Force the guard on regardless of ambient config.
+        orig = kb.create_board
+
+        def _fake_create_board(slug, **kw):
+            return orig(slug, kanban_cfg={"allowed_boards": ["default"]}, **kw)
+
+        kbcli.kb.create_board = _fake_create_board
+        try:
+            rc = kbcli._cmd_boards_create(ns)
+        finally:
+            kbcli.kb.create_board = orig
+        assert rc != 0
