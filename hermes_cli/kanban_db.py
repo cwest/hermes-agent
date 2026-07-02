@@ -4610,12 +4610,30 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    allow_acceptance_complete: bool = False,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
     a claim/start/complete sequence.
+
+    ``done`` means exactly one thing on this board: Casey merged/accepted
+    the work. A card parked in the *acceptance lane* — status ``blocked``
+    whose latest sticky block reason is the ``awaiting-casey-signoff``
+    PASS park — is therefore NOT completable by a generic caller: a worker
+    that blocks-then-completes in one run, or a stray ``hermes kanban
+    complete <id>``, would otherwise flip an unmerged card straight to
+    ``done`` (the exact false state the invariant exists to prevent). Such
+    an attempt is a clean no-op refusal — ``complete_task`` returns
+    ``False`` (same contract as completing an archived/already-done card)
+    and a ``completion_refused_acceptance`` audit event records it. The
+    ONE legitimate completer, Casey's merge (the ``github-pr-closed``
+    webhook path), passes ``allow_acceptance_complete=True`` to bypass the
+    guard. The guard keys on the ``awaiting-casey-signoff`` REASON, not on
+    ``blocked`` status generally: a ``blocked`` card with a generic
+    ``needs_input`` / ``review-changes-requested`` reason stays completable
+    exactly as before (the manual-complete-a-stuck-card flow is unchanged).
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -4667,6 +4685,40 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Acceptance-lane guard: refuse to complete a card parked for Casey's
+    # sign-off unless the merge path explicitly overrides. ``done`` must
+    # mean "Casey merged" — a generic completer (worker kanban_complete,
+    # CLI complete, swarm root helper) turning an ``awaiting-casey-signoff``
+    # card into ``done`` is the false state this guards against. Keyed on
+    # the sticky REASON, not ``blocked`` status generally, so a generic
+    # needs_input / review-changes-requested block stays completable. Runs
+    # before the write txn: a rejected completion never mutates task state,
+    # exactly like the hallucinated-cards gate above. The refusal is a clean
+    # no-op (returns False, same contract as an archived/already-done card)
+    # with an auditable ``completion_refused_acceptance`` event.
+    if not allow_acceptance_complete:
+        _task_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if _task_row is not None and _task_row["status"] == "blocked":
+            _reason = _latest_sticky_block_reason(conn, task_id)
+            if _reason and _reason.lstrip().startswith(
+                _ACCEPTANCE_SIGNOFF_REASON_PREFIX
+            ):
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_refused_acceptance",
+                        {
+                            "reason": _reason,
+                            "summary_preview": (
+                                (summary or result or "").strip().splitlines()[0][:200]
+                                if (summary or result)
+                                else None
+                            ),
+                        },
+                    )
+                return False
 
     with write_txn(conn):
         if expected_run_id is None:
