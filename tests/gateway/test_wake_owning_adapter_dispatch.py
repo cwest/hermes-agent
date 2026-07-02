@@ -295,3 +295,85 @@ async def test_real_handle_webhook_falls_back_when_owner_missing():
         assert resp.status == 202
         await asyncio.sleep(0.1)
     assert len(webhook_calls) == 1, "fallback: wake runs on the webhook adapter when no owner"
+
+
+@pytest.mark.asyncio
+async def test_wake_dispatch_task_exception_is_logged_not_swallowed(caplog):
+    """A wake whose dispatch coroutine raises must LOG the failure, not swallow it.
+
+    The wake is fired as a fire-and-forget ``asyncio.create_task``. If its
+    done-callback only discards the task reference, an exception raised inside
+    ``handle_message`` (the idle cold-path failure that ate the ``gave_up`` wake
+    live) vanishes with no log line anywhere — the card silently never notifies.
+    The done-callback must retrieve the task's exception and log it so the
+    swallow can never be silent again.
+    """
+    secret = "wake-exc-logging-secret"
+    routes = {
+        "kanban-transition": {
+            "secret": secret,
+            "events": ["blocked"],
+            "prompt": "WAKE {task_id}",
+            "deliver": "log",
+        }
+    }
+    webhook = _WebhookAdapter(
+        _PlatformConfig(enabled=True, extra={"host": "0.0.0.0", "port": 0, "routes": routes})
+    )
+
+    # Owning (discord) adapter whose handle_message RAISES — mimics the
+    # idle cold-path exception that surfaced no turn_context and no error.
+    class _RaisingOwner:
+        async def handle_message(self, ev):
+            raise RuntimeError("boom: idle cold-path wake failure")
+
+    webhook.gateway_runner = types.SimpleNamespace(
+        adapters={Platform.DISCORD: _RaisingOwner()}
+    )
+
+    app = _web.Application()
+    app.router.add_post("/webhooks/{route_name}", webhook._handle_webhook)
+    payload = {
+        "task_id": "t_probe",
+        "status": "blocked",
+        "event_type": "blocked",
+        "origin_platform": "discord",
+        "origin_chat_id": "c1",
+        "origin_thread_id": "c1",
+    }
+    body = _json.dumps(payload).encode()
+
+    import logging as _logging
+    with caplog.at_level(_logging.ERROR):
+        async with _TestClient(_TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/kanban-transition",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Hub-Signature-256": _sig(body, secret),
+                    "X-GitHub-Delivery": "wake-int-003",
+                },
+            )
+            assert resp.status == 202
+            # Let the fire-and-forget dispatch task run and its done-callback fire.
+            await asyncio.sleep(0.1)
+
+    # The raised exception must be logged BY THE WEBHOOK MODULE'S OWN LOGGER
+    # with context — not merely surface via asyncio's unreliable, context-free
+    # "Task exception was never retrieved" GC warning (which fires only on GC,
+    # never while _background_tasks holds the ref, and names no route/session).
+    # So we explicitly EXCLUDE the asyncio logger and require a gateway.* record.
+    matched = [
+        r for r in caplog.records
+        if r.levelno >= _logging.ERROR
+        and not r.name.startswith("asyncio")
+        and (
+            "boom: idle cold-path wake failure" in r.getMessage()
+            or (r.exc_info and "boom: idle cold-path wake failure" in str(r.exc_info[1]))
+        )
+    ]
+    assert matched, (
+        "wake dispatch task exception must be logged by the webhook module's own "
+        "logger (with context), not swallowed / left to asyncio's GC warning"
+    )

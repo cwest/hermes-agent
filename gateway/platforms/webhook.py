@@ -849,7 +849,27 @@ class WebhookAdapter(BasePlatformAdapter):
                     )
         task = asyncio.create_task(dispatch_adapter.handle_message(event))
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+
+        def _on_wake_task_done(t: "asyncio.Task", _route=route_name, _event=event_type, _delivery=delivery_id) -> None:
+            # Always drop the strong ref so the task set doesn't leak.
+            self._background_tasks.discard(t)
+            if t.cancelled():
+                return
+            # Retrieve the exception so a failed wake surfaces LOUDLY with
+            # context (route/event/delivery) on the module logger — instead of
+            # vanishing behind asyncio's context-free GC-time "Task exception
+            # was never retrieved" warning (which never fires while this set
+            # held the ref). This is the silent-swallow that let an idle-path
+            # wake failure produce no log and no notification (2026-07-02).
+            exc = t.exception()
+            if exc is not None:
+                logger.error(
+                    "[webhook] wake dispatch task failed (route=%s event=%s delivery=%s): %s",
+                    _route, _event, _delivery, exc,
+                    exc_info=exc,
+                )
+
+        task.add_done_callback(_on_wake_task_done)
 
         return web.json_response(
             {
