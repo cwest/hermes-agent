@@ -896,6 +896,12 @@ class WebhookAdapter(BasePlatformAdapter):
         ``chat_type="thread"`` with ``chat_id``/``thread_id`` both set, and the
         key omits the user id (threads are shared). Matching that shape here is
         what makes the wake land in the exact origin session.
+
+        Key-mirror invariant (concrete form): an origin discord thread source
+        must yield the key ``agent:main:discord:thread:<chat_id>:<thread_id>``
+        with ``chat_id == thread_id``. If the two diverge (or the user id is
+        appended), the wake targets a different session key and is silently
+        dropped — the failure mode that cost real debugging time.
         """
         if not origin_platform or not origin_chat_id:
             return None
