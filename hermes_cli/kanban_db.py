@@ -3396,10 +3396,11 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    """Return True when ``task_id`` is sticky-blocked by a deliberate
+    human-gated transition (#28712).
 
-    A ``blocked`` status can come from two very different sources:
+    A ``blocked`` status can come from three sources with different
+    recovery semantics:
 
     * **Worker- or operator-initiated** — a worker called
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
@@ -3407,30 +3408,70 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       should stay blocked until an operator unblocks it.  The block tool
       emits a ``"blocked"`` event row in ``task_events``.
 
+    * **One-card MOVE to acceptance** — the reviewer's atomic
+      PASS→acceptance transition moves the card to ``status='blocked'``
+      via ``onecard.move_card`` (``status="blocked"``, ``assignee=<owner>``).
+      Unlike ``kanban_block`` it emits a ``"status_changed"`` event
+      (``{"to": "blocked", "by": "onecard:move_card"}``) rather than a
+      ``"blocked"`` event, but semantically it is the SAME "waiting on a
+      human, do NOT auto-recover" state.  Without recognizing it,
+      ``recompute_ready`` would flip an acceptance card ``blocked → ready``
+      moments after the PASS, stranding it in the reviewer's lane under the
+      acceptance owner's name.  The ``by=onecard:move_card`` marker is the
+      explicit signal — no guessing.
+
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      ``"gave_up"``, *not* ``"blocked"`` (and not a ``move_card``
+      ``status_changed``), and is meant to recover automatically once the
+      underlying conditions change (e.g. parents finish, transient infra
+      error clears).
 
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    The signal that distinguishes them is the most recent DECISIVE event —
+    a ``"blocked"``/``"unblocked"`` event, or a ``move_card``-driven
+    ``"status_changed"`` transition.  Walking the task's events newest-first:
 
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    * a ``"blocked"`` event         → sticky (worker/operator block)
+    * an ``"unblocked"`` event      → NOT sticky (explicit clear wins)
+    * a ``move_card`` ``status_changed`` → sticky iff its ``to == "blocked"``
+      (a move back to ``ready``/other clears stickiness, mirroring
+      ``unblocked``)
+
+    Non-decisive events (``gave_up``, ``promoted``, ``assigned``, a
+    non-``move_card`` ``status_changed``) are skipped so they can never
+    silently override a deliberate acceptance block nor resurrect a cleared
+    one.
+
+    Returns ``False`` when there is no decisive event at all (e.g. the task
+    was set to ``status='blocked'`` by the circuit breaker or by direct DB
+    manipulation) — preserves the pre-#28712 auto-recover semantics for
+    that path.
     """
-    row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
-        "ORDER BY id DESC LIMIT 1",
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'status_changed') "
+        "ORDER BY id DESC",
         (task_id,),
-    ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    ).fetchall()
+    for row in rows:
+        kind = row["kind"]
+        if kind == "blocked":
+            return True
+        if kind == "unblocked":
+            return False
+        # kind == "status_changed": only a move_card-driven transition is
+        # decisive. Any other status_changed is skipped.
+        payload = row["payload"]
+        if not payload:
+            continue
+        try:
+            data = json.loads(payload)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict) or data.get("by") != "onecard:move_card":
+            continue
+        return data.get("to") == "blocked"
+    return False
 
 
 # The reviewer's clean-block contract for a review-bounce (the sdlc-review skill
