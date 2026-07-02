@@ -8435,7 +8435,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
-        is_internal = bool(getattr(event, "internal", False))
+        #
+        # A kanban-transition WAKE is also a system event: the webhook builds a
+        # user-less SessionSource for a shared thread (user_id=None) and it is
+        # HMAC-authenticated upstream on the webhook route. It is NOT tagged
+        # event.internal, only event.metadata["kanban_transition_wake"]=True.
+        # The busy path already exempts it (see
+        # _handle_active_session_busy_message: _is_system_event = ... or
+        # is_transition_wake_event(event)). The cold/IDLE path had no such
+        # exemption, so a wake to an idle, unsubscribed/fallback channel fell
+        # into the `source.user_id is None` auth gate below, failed
+        # _is_user_authorized, and was silently dropped (logger.debug, no
+        # exception, no turn — the "202 but no turn on an idle origin session"
+        # regression, root-caused live 2026-07-02). Treat the wake as internal
+        # here so it bypasses the auth gate symmetrically with the busy path.
+        is_internal = bool(getattr(event, "internal", False)) or is_transition_wake_event(event)
 
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
