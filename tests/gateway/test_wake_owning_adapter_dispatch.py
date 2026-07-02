@@ -149,3 +149,149 @@ def test_wake_on_wrong_adapter_never_reaches_owner_pending():
         # discord's pending slot is untouched — the wake was lost to the busy turn.
         assert sk not in discord._pending_messages
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Integration: drive the REAL _handle_webhook selection block end to end.
+#
+# Lamport's blocking remark: routing tests 1-3 assert against a hand-copied
+# _select_dispatch_adapter that can drift from production. This test POSTs an
+# origin-wake payload through the live aiohttp route (adapter._handle_webhook)
+# with a mocked gateway_runner.adapters, and asserts the SHIPPED selection block
+# dispatches to the OWNING adapter's handle_message — not the webhook adapter's.
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib  # noqa: E402
+import hmac as _hmac  # noqa: E402
+import json as _json  # noqa: E402
+from aiohttp import web as _web  # noqa: E402
+from aiohttp.test_utils import TestClient as _TestClient, TestServer as _TestServer  # noqa: E402
+from gateway.config import PlatformConfig as _PlatformConfig  # noqa: E402
+from gateway.platforms.webhook import WebhookAdapter as _WebhookAdapter  # noqa: E402
+
+
+def _sig(body: bytes, secret: str) -> str:
+    return "sha256=" + _hmac.new(secret.encode(), body, _hashlib.sha256).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_real_handle_webhook_routes_origin_wake_to_owning_adapter():
+    secret = "wake-owning-adapter-test-secret"
+    routes = {
+        "kanban-transition": {
+            "secret": secret,
+            "events": ["blocked"],
+            "prompt": "WAKE for {task_id}: {status}",
+            "deliver": "log",
+        }
+    }
+    webhook = _WebhookAdapter(
+        _PlatformConfig(enabled=True, extra={"host": "0.0.0.0", "port": 0, "routes": routes})
+    )
+
+    # Owning (discord) adapter — a stub whose handle_message records the call.
+    owner_calls: list = []
+
+    class _Owner:
+        async def handle_message(self, ev):
+            owner_calls.append(ev)
+
+    owner = _Owner()
+
+    # The webhook adapter's OWN handle_message must NOT be called for an origin wake.
+    webhook_calls: list = []
+
+    async def _webhook_hm(ev):
+        webhook_calls.append(ev)
+
+    webhook.handle_message = _webhook_hm  # type: ignore[method-assign]
+
+    # Wire the gateway_runner.adapters registry (as run.py does at build time).
+    webhook.gateway_runner = types.SimpleNamespace(adapters={Platform.DISCORD: owner})
+
+    app = _web.Application()
+    app.router.add_post("/webhooks/{route_name}", webhook._handle_webhook)
+
+    # Origin-wake payload: origin_* fields are what mark it a transition wake and
+    # drive _build_origin_source (origin platform = discord).
+    payload = {
+        "task_id": "t_probe",
+        "status": "blocked",
+        "event_type": "blocked",
+        "origin_platform": "discord",
+        "origin_chat_id": "1520255822704152666",
+        "origin_thread_id": "1520255822704152666",
+    }
+    body = _json.dumps(payload).encode()
+
+    async with _TestClient(_TestServer(app)) as cli:
+        resp = await cli.post(
+            "/webhooks/kanban-transition",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": _sig(body, secret),
+                "X-GitHub-Delivery": "wake-int-001",
+            },
+        )
+        assert resp.status == 202
+        # Let the fire-and-forget dispatch task run.
+        await asyncio.sleep(0.1)
+
+    # The SHIPPED selection block must have routed to the owning discord adapter.
+    assert len(owner_calls) == 1, "origin wake must reach the owning adapter's handle_message"
+    assert owner_calls[0].metadata.get("kanban_transition_wake") is True
+    assert owner_calls[0].source.platform == Platform.DISCORD
+    # And must NOT have run on the webhook adapter.
+    assert webhook_calls == [], "origin wake must NOT run on the webhook adapter"
+
+
+@pytest.mark.asyncio
+async def test_real_handle_webhook_falls_back_when_owner_missing():
+    """With no owning adapter in the registry, the real route falls back to the
+    webhook adapter's own handle_message (backward-compatible)."""
+    secret = "wake-fallback-secret"
+    routes = {
+        "kanban-transition": {
+            "secret": secret,
+            "events": ["blocked"],
+            "prompt": "WAKE {task_id}",
+            "deliver": "log",
+        }
+    }
+    webhook = _WebhookAdapter(
+        _PlatformConfig(enabled=True, extra={"host": "0.0.0.0", "port": 0, "routes": routes})
+    )
+    webhook_calls: list = []
+
+    async def _webhook_hm(ev):
+        webhook_calls.append(ev)
+
+    webhook.handle_message = _webhook_hm  # type: ignore[method-assign]
+    # Registry has NO discord adapter.
+    webhook.gateway_runner = types.SimpleNamespace(adapters={})
+
+    app = _web.Application()
+    app.router.add_post("/webhooks/{route_name}", webhook._handle_webhook)
+    payload = {
+        "task_id": "t_probe",
+        "status": "blocked",
+        "event_type": "blocked",
+        "origin_platform": "discord",
+        "origin_chat_id": "c1",
+        "origin_thread_id": "c1",
+    }
+    body = _json.dumps(payload).encode()
+    async with _TestClient(_TestServer(app)) as cli:
+        resp = await cli.post(
+            "/webhooks/kanban-transition",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": _sig(body, secret),
+                "X-GitHub-Delivery": "wake-int-002",
+            },
+        )
+        assert resp.status == 202
+        await asyncio.sleep(0.1)
+    assert len(webhook_calls) == 1, "fallback: wake runs on the webhook adapter when no owner"
