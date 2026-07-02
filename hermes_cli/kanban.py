@@ -2150,6 +2150,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         auto_route_review_bounce_enabled = bool(
             _kanban_cfg.get("auto_route_review_bounce", True)
         )
+        reconcile_pass_acceptance_enabled = bool(
+            _kanban_cfg.get("reconcile_pass_acceptance", True)
+        )
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2178,6 +2181,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             auto_route_review_bounce_enabled=auto_route_review_bounce_enabled,
+            reconcile_pass_acceptance_enabled=reconcile_pass_acceptance_enabled,
         )
     if getattr(args, "json", False):
         print(json.dumps({
