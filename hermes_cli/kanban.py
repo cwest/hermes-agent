@@ -1100,14 +1100,24 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         print("kanban boards create: slug is required", file=sys.stderr)
         return 2
     already = kb.board_exists(normed) and normed != kb.DEFAULT_BOARD
-    meta = kb.create_board(
-        normed,
-        name=args.name,
-        description=args.description,
-        icon=args.icon,
-        color=args.color,
-        default_workdir=args.default_workdir,
-    )
+    try:
+        meta = kb.create_board(
+            normed,
+            name=args.name,
+            description=args.description,
+            icon=args.icon,
+            color=args.color,
+            default_workdir=args.default_workdir,
+        )
+    except ValueError as exc:
+        # Single-board policy (kanban.allowed_boards) or a malformed slug.
+        print(f"kanban boards create: {exc}", file=sys.stderr)
+        print(
+            "This install enforces a single-board policy "
+            "(kanban.allowed_boards in config.yaml).",
+            file=sys.stderr,
+        )
+        return 1
     verb = "already exists" if already else "created"
     print(f"Board {meta['slug']!r} {verb}.")
     print(f"  Display name: {meta.get('name', '')}")

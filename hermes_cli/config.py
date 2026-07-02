@@ -2580,6 +2580,15 @@ DEFAULT_CONFIG = {
         # raise these to keep more early failure evidence.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
+        # Opt-in single-board guard. When set to a non-empty list of board
+        # slugs, ``create_board`` (the one choke point for the CLI and the
+        # API) refuses to create any board whose slug isn't listed — a
+        # config-level invariant that a drifting skill/persona can't create
+        # a second board. ``default`` is always implicitly allowed, and an
+        # already-existing board outside the list still reads/returns its
+        # metadata (never breaks existing boards). Default None / absent /
+        # empty list = NO restriction, preserving the multi-board feature.
+        "allowed_boards": None,
         # Profile assigned to the root/orchestration task after Triage
         # decomposition. When unset, falls back to the default profile (the
         # one `hermes` launches with no -p flag). This does not control the

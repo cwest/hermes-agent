@@ -735,16 +735,45 @@ def create_board(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
+    kanban_cfg: Optional[dict] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
     Returns the resulting metadata. Raises :class:`ValueError` for a
     malformed slug; returns the existing metadata (not an error) if the
     board already exists — matching ``mkdir -p`` semantics.
+
+    **Opt-in single-board guard.** When ``kanban.allowed_boards`` is set
+    to a non-empty list in ``config.yaml``, board creation is restricted
+    to those slugs. This is the one choke point for both the CLI
+    (``_cmd_boards_create``) and the API, so a drifting skill/persona
+    cannot create a second board behind the operator's back. The default
+    (key absent / ``None`` / empty list) imposes NO restriction, so the
+    upstream multi-board feature is preserved for other users. ``default``
+    is always implicitly allowed so the system can never lock itself out
+    of its own base board, and an already-existing board is returned
+    untouched even if it sits outside the allowlist (never break reads /
+    existing boards). ``kanban_cfg`` is injectable for testability,
+    mirroring :func:`worker_log_rotation_config`.
     """
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
+
+    allowed = _allowed_boards_config(kanban_cfg)
+    if allowed is not None:
+        # ``default`` is always implicitly permitted; existing boards are
+        # honoured (mkdir -p) so a restricted config never breaks reads.
+        if (
+            normed != DEFAULT_BOARD
+            and normed not in allowed
+            and not board_exists(normed)
+        ):
+            raise ValueError(
+                f"board creation is restricted to {sorted(allowed)}; "
+                f"'{normed}' is not permitted"
+            )
+
     meta = write_board_metadata(
         normed,
         name=name,
@@ -756,6 +785,38 @@ def create_board(
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
     return meta
+
+
+def _allowed_boards_config(kanban_cfg: Optional[dict] = None) -> Optional[set[str]]:
+    """Return the normalized ``kanban.allowed_boards`` allowlist, or ``None``.
+
+    ``None`` means "no restriction" — the key is absent, not a list, or an
+    empty list (an empty list is treated as unrestricted, NOT "allow
+    nothing", so a misconfigured empty value can never brick board
+    creation). A non-empty list returns a set of normalized slugs.
+
+    Reads ``config.yaml`` lazily via the established module pattern when
+    ``kanban_cfg`` is not injected.
+    """
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            kanban_cfg = (load_config().get("kanban") or {})
+        except Exception:
+            kanban_cfg = {}
+    raw = (kanban_cfg or {}).get("allowed_boards")
+    if not isinstance(raw, (list, tuple, set)) or not raw:
+        return None
+    normed: set[str] = set()
+    for item in raw:
+        try:
+            slug = _normalize_board_slug(item)
+        except ValueError:
+            continue
+        if slug:
+            normed.add(slug)
+    return normed or None
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
