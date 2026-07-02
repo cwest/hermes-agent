@@ -215,3 +215,92 @@ def test_transition_without_subscription_delivers_to_fallback(tmp_path, monkeypa
         "no-subscription transition must fall back to the default Casey channel"
     )
     assert any(tid in d["text"] for d in adapter.sent)
+
+
+# --- (d) transition_emit config hot-reloads mid-run (no restart) --------------
+
+
+async def _run_two_ticks(monkeypatch, runner, between):
+    """Run exactly two notifier ticks, invoking ``between()`` after tick 1.
+
+    Mirrors ``_run_one_tick`` but lets a test mutate live config / board state
+    in the gap between the first and second tick, proving per-tick re-reads.
+    """
+    real_sleep = asyncio.sleep
+    # sleep #1 = cold-start settle (pass through); sleep #2 = post-tick-1 cadence
+    # (run `between`, keep looping); sleep #3 = post-tick-2 cadence (stop).
+    state = {"count": 0}
+
+    async def fake_sleep(delay):
+        state["count"] += 1
+        if state["count"] == 1:
+            return None  # settle
+        if state["count"] == 2:
+            between()  # mutate config/board between tick 1 and tick 2
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await runner._kanban_notifier_watcher(interval=1)
+
+
+def test_emit_kinds_config_hot_reloads_mid_run(tmp_path, monkeypatch):
+    """Flipping kanban.transition_emit.emit_kinds takes effect on the NEXT tick.
+
+    The notifier used to cache transition_emit_cfg ONCE before its poll loop, so
+    an emit_kinds change was silently restart-gated. This pins the fix: with a
+    ``blocked`` event whose kind is initially OUTSIDE emit_kinds (so the wake
+    bridge stays quiet), widening emit_kinds mid-run must let the SAME unseen
+    event wake the orchestrator on the next tick — no gateway restart.
+    """
+    db_path = tmp_path / "hotreload.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    # A fresh load_config() must return a FRESH dict each call (as reading
+    # config.yaml from disk does) — otherwise a shared-reference mutation would
+    # mask the very restart-gating bug under test. `holder` is what the current
+    # config resolves to; the flip REBINDS it to a brand-new object.
+    holder = {"cfg": _base_config(emit_enabled=True, emit_kinds=["unblocked"])}
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda *a, **k: holder["cfg"]
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TRANSITION_SECRET", "test-secret")
+
+    conn = kb.connect()
+    try:
+        tid = _running_task(conn, title="hot reload me")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            notifier_profile="default",
+        )
+        kb.block_task(conn, tid, reason="gate on emit_kinds", kind="capability")
+    finally:
+        conn.close()
+
+    calls = []
+
+    async def fake_emit(cfg_arg, payload, secret):
+        calls.append(payload)
+        return True
+
+    monkeypatch.setattr(
+        "gateway.kanban_transition_emit.emit_transition", fake_emit
+    )
+
+    def widen_emit_kinds():
+        # Hot-reload the gate to include `blocked` between the two ticks — a
+        # fresh config object, as an on-disk config.yaml edit would produce.
+        holder["cfg"] = _base_config(
+            emit_enabled=True, emit_kinds=["unblocked", "blocked"]
+        )
+
+    adapter = _RecordingAdapter()
+    asyncio.run(_run_two_ticks(monkeypatch, _runner(adapter), widen_emit_kinds))
+
+    assert any(p["kind"] == "blocked" for p in calls), (
+        "widening transition_emit.emit_kinds mid-run must wake the orchestrator "
+        "for `blocked` on the next tick with NO restart (config was cached once "
+        "before the loop -> restart-gated)"
+    )
