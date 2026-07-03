@@ -2438,8 +2438,9 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
     assert reason is None
 
 
-def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+def test_respawn_guard_active_pr_in_comment(kanban_home, monkeypatch):
+    """A GitHub PR URL for a LIVE (open) PR in a recent comment triggers active_pr."""
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
@@ -2496,8 +2497,9 @@ def test_respawn_guard_ignores_pr_comment_before_latest_unblock(kanban_home):
     assert reason is None
 
 
-def test_respawn_guard_keeps_pr_comment_after_latest_unblock(kanban_home):
+def test_respawn_guard_keeps_pr_comment_after_latest_unblock(kanban_home, monkeypatch):
     """A PR URL posted after the latest unblock still guards respawn."""
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
     with kb.connect() as conn:
         t = kb.create_task(conn, title="new-pr-after-unblock", assignee="alice")
         now = int(time.time())
@@ -2516,13 +2518,14 @@ def test_respawn_guard_keeps_pr_comment_after_latest_unblock(kanban_home):
     assert reason == "active_pr"
 
 
-def test_respawn_guard_keeps_same_second_pr_comment_after_unblock(kanban_home):
+def test_respawn_guard_keeps_same_second_pr_comment_after_unblock(kanban_home, monkeypatch):
     """Second-resolution timestamps keep a same-tick PR guard conservatively.
 
     Kanban timestamps are second-granular, so a PR URL and an unblock in the
     same second cannot be ordered. Guard conservatively (keep active_pr) so a
     genuine new-PR-at-unblock is never let through.
     """
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
     with kb.connect() as conn:
         t = kb.create_task(conn, title="same-second-pr-after-unblock", assignee="alice")
         now = int(time.time())
@@ -2542,6 +2545,155 @@ def test_respawn_guard_keeps_same_second_pr_comment_after_unblock(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Layer 2: the active_pr guard must reflect LIVE PR state, not a stale comment.
+# A closed / merged PR is not "work in flight" — it can never justify blocking a
+# respawn. Historically the guard matched ANY PR URL in a recent comment
+# regardless of whether that PR was still open, which stranded a card whose PR
+# had already been closed on GitHub (the stored comment link went stale and was
+# never cleared). check_respawn_guard now resolves the PR's real state via the
+# injectable ``_resolve_pr_state`` hook: only ``open`` (or an ``unknown`` /
+# unresolvable state, fail-open) counts as active_pr; ``closed`` / ``merged``
+# are ignored so the card dispatches.
+# ---------------------------------------------------------------------------
+
+def test_respawn_guard_closed_pr_not_guarded(kanban_home, monkeypatch):
+    """A recent PR-URL comment whose PR is CLOSED no longer blocks respawn."""
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "closed")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="closed-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR opened: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_merged_pr_not_guarded(kanban_home, monkeypatch):
+    """A recent PR-URL comment whose PR is MERGED no longer blocks respawn."""
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "merged")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="merged-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR opened: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_open_pr_still_guarded(kanban_home, monkeypatch):
+    """A genuinely OPEN PR still guards against a duplicate respawn."""
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="open-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR opened: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_unknown_pr_state_fails_open_and_guards(kanban_home, monkeypatch):
+    """If live PR state cannot be resolved (gh missing / errored), keep guarding.
+
+    Fail-open (conservative): an unresolvable state must never be LESS safe than
+    the old always-guard behavior, so an unknown PR still blocks the respawn.
+    """
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "unknown")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="unknown-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR opened: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_first_open_pr_wins_over_later_closed(kanban_home, monkeypatch):
+    """With multiple PR URLs, one still-open PR is enough to guard."""
+    states = {
+        "https://github.com/totemx-AI/subsidysmart/pull/1": "closed",
+        "https://github.com/totemx-AI/subsidysmart/pull/2": "open",
+    }
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: states.get(url, "unknown"))
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="multi-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "old PR: https://github.com/totemx-AI/subsidysmart/pull/1",
+        )
+        kb.add_comment(
+            conn, t, "worker",
+            "new PR: https://github.com/totemx-AI/subsidysmart/pull/2",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_resolves_pr_state_only_once_per_url(kanban_home, monkeypatch):
+    """The live-state lookup is cached per call — same URL is resolved once."""
+    calls: list[str] = []
+
+    def _fake(url: str) -> str:
+        calls.append(url)
+        return "closed"
+
+    monkeypatch.setattr(kb, "_resolve_pr_state", _fake)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="dup-url", assignee="alice")
+        url = "https://github.com/totemx-AI/subsidysmart/pull/42"
+        kb.add_comment(conn, t, "worker", f"PR opened: {url}")
+        kb.add_comment(conn, t, "worker", f"still working {url}")
+        kb.check_respawn_guard(conn, t)
+    assert calls.count(url) == 1
+
+
+# ---------------------------------------------------------------------------
+# _resolve_pr_state: the gh-backed live PR-state resolver. Fail-open on any
+# subprocess / parse failure so the guard never becomes LESS safe than the old
+# always-guard behavior.
+# ---------------------------------------------------------------------------
+
+def test_resolve_pr_state_maps_gh_states(monkeypatch):
+    """gh's uppercase OPEN/CLOSED/MERGED map to lowercase open/closed/merged."""
+    url = "https://github.com/o/r/pull/7"
+    for gh_state, expected in (("OPEN", "open"), ("CLOSED", "closed"), ("MERGED", "merged")):
+        def _fake_run(*a, _s=gh_state, **k):
+            return types.SimpleNamespace(
+                returncode=0, stdout=f'{{"state":"{_s}"}}', stderr="",
+            )
+        monkeypatch.setattr(kb.subprocess, "run", _fake_run)
+        assert kb._resolve_pr_state(url) == expected
+
+
+def test_resolve_pr_state_unknown_on_nonzero_exit(monkeypatch):
+    """A gh error (nonzero exit) resolves to 'unknown' (fail-open)."""
+    def _fake_run(*a, **k):
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
+    monkeypatch.setattr(kb.subprocess, "run", _fake_run)
+    assert kb._resolve_pr_state("https://github.com/o/r/pull/7") == "unknown"
+
+
+def test_resolve_pr_state_unknown_on_exception(monkeypatch):
+    """A subprocess exception (gh not installed, timeout) resolves to 'unknown'."""
+    def _fake_run(*a, **k):
+        raise FileNotFoundError("gh not found")
+    monkeypatch.setattr(kb.subprocess, "run", _fake_run)
+    assert kb._resolve_pr_state("https://github.com/o/r/pull/7") == "unknown"
+
+
+def test_resolve_pr_state_unknown_on_unparseable_output(monkeypatch):
+    """Non-JSON / unexpected gh output resolves to 'unknown'."""
+    def _fake_run(*a, **k):
+        return types.SimpleNamespace(returncode=0, stdout="not json", stderr="")
+    monkeypatch.setattr(kb.subprocess, "run", _fake_run)
+    assert kb._resolve_pr_state("https://github.com/o/r/pull/7") == "unknown"
+
+
 # Review tasks bypass the dup-PR guards (recent_success / active_pr) but a
 # build-lane task in the same shape must still be guarded. The invariant being
 # asserted: review spawns are never wedged by the build-only dup-PR guards,
@@ -2549,13 +2701,14 @@ def test_respawn_guard_keeps_same_second_pr_comment_after_unblock(kanban_home):
 # are orthogonal and still apply to both — covered by the tests above.)
 # ---------------------------------------------------------------------------
 
-def test_respawn_guard_review_bypasses_active_pr_build_does_not(kanban_home):
+def test_respawn_guard_review_bypasses_active_pr_build_does_not(kanban_home, monkeypatch):
     """A PR-URL comment guards a build (ready) task but not a review task.
 
     Same task, same comment — only the status differs. The reviewer never
     opens a PR, so the active_pr guard must not apply to it; the builder
     might re-open a duplicate PR, so the guard must still apply.
     """
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
     with kb.connect() as conn:
         t = kb.create_task(conn, title="pr-shipped", assignee="alice")
         kb.add_comment(
@@ -2707,9 +2860,10 @@ def test_dispatch_respawn_guard_skips_recent_success(
 
 
 def test_dispatch_respawn_guard_skips_active_pr(
-    kanban_home, all_assignees_spawnable
+    kanban_home, all_assignees_spawnable, monkeypatch
 ):
     """dispatch_once skips (but does not block) a task with an active PR comment."""
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
     spawned_ids = []
 
     def fake_spawn(task, workspace):

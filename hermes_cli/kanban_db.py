@@ -6364,6 +6364,44 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 )
 
 
+def _resolve_pr_state(pr_url: str) -> str:
+    """Return the live GitHub state of ``pr_url`` for the active_pr respawn guard.
+
+    One of ``"open"``, ``"closed"``, ``"merged"``, or ``"unknown"``. Backed by
+    ``gh pr view <url> --json state`` (``gh``'s uppercase ``OPEN``/``CLOSED``/
+    ``MERGED`` are lowercased). Fail-open: any subprocess failure -- ``gh`` not
+    installed, not authenticated, network error, timeout, unparseable output --
+    resolves to ``"unknown"`` so the caller keeps guarding conservatively rather
+    than dropping the guard on a transient hiccup.
+
+    Isolated as a module-level function (not inlined) so ``check_respawn_guard``
+    can be tested without a live network call by monkeypatching this hook, and
+    so the sole ``gh`` dependency lives in one auditable place.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_url, "--json", "state"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception:
+        return "unknown"
+    if result.returncode != 0:
+        return "unknown"
+    try:
+        state = json.loads(result.stdout or "{}").get("state")
+    except (ValueError, AttributeError):
+        return "unknown"
+    if not isinstance(state, str):
+        return "unknown"
+    normalized = state.strip().lower()
+    if normalized in ("open", "closed", "merged"):
+        return normalized
+    return "unknown"
+
+
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
@@ -7604,13 +7642,18 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         this guard would otherwise wedge the reviewer out for the window.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds) at or after the latest explicit
-        unblock.  A prior worker already opened a PR; re-spawning risks a
-        duplicate PR on the same task — unless an operator/orchestrator
-        unblocked it to resume work on that same PR (e.g. to address review
-        feedback), in which case only PR URLs added at/after the unblock guard.
-        **Skipped when the task is in status ``review``** — a reviewer
+        A GitHub PR URL that is still LIVE (open, or unresolvable) appears in a
+        recent task comment (within ``_RESPAWN_GUARD_PR_WINDOW`` seconds) at or
+        after the latest explicit unblock.  A prior worker already opened a PR;
+        re-spawning risks a duplicate PR on the same task — unless an operator/
+        orchestrator unblocked it to resume work on that same PR (e.g. to
+        address review feedback), in which case only PR URLs added at/after the
+        unblock guard.  The PR's LIVE state is resolved via ``_resolve_pr_state``
+        (``gh``): a closed/merged PR is never active work and does NOT guard, so
+        a card whose PR was closed on GitHub dispatches even though the stale
+        comment link was never cleared.  An unresolvable state (``gh`` missing /
+        errored) fails open — it still guards, matching the prior always-guard
+        behavior.  **Skipped when the task is in status ``review``** — a reviewer
         never opens a PR, and the PR-URL comment is exactly what it needs
         to act on, not a duplicate-PR risk.
 
@@ -7730,13 +7773,30 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         ).fetchone()
         if latest_unblock and latest_unblock["ts"] is not None:
             pr_cutoff = max(pr_cutoff, int(latest_unblock["ts"]))
+        # Live-state cache: resolve each distinct PR URL at most once per call.
+        # A closed/merged PR is never active work — only an ``open`` (or an
+        # unresolvable ``unknown``, fail-open) PR justifies the guard. This is
+        # the Layer-2 fix: the stored comment link can go stale (the PR was
+        # closed on GitHub but the comment was never cleared), which used to
+        # strand the card forever.
+        pr_state_cache: dict[str, str] = {}
         for c in conn.execute(
             "SELECT body FROM task_comments "
             "WHERE task_id = ? AND created_at >= ? AND author != 'dispatcher'",
             (task_id, pr_cutoff),
         ).fetchall():
-            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-                return "active_pr"
+            if not c["body"]:
+                continue
+            for m in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"]):
+                pr_url = m.group(0)
+                state = pr_state_cache.get(pr_url)
+                if state is None:
+                    state = _resolve_pr_state(pr_url)
+                    pr_state_cache[pr_url] = state
+                # open or unknown (unresolvable -> fail-open) still guards;
+                # a confirmed closed/merged PR does not.
+                if state not in ("closed", "merged"):
+                    return "active_pr"
 
     return None
 
