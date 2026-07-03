@@ -1421,6 +1421,153 @@ def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
         )
 
 
+# ---------------------------------------------------------------------------
+# Clean-exit-after-done: a worker that FINISHES its lane correctly but exits
+# rc=0 WITHOUT calling kanban_complete/kanban_block must NOT be counted as a
+# protocol_violation when the lane work is provably done (a prior completed
+# run within the guard window, or a PR URL in a recent comment). Otherwise a
+# completed-but-un-signposted rc=0 exit trips a FALSE gave_up and strands a
+# fully-completed card in blocked. The proof signals mirror the ones
+# ``check_respawn_guard`` already trusts (recent_success / active_pr).
+#
+# A genuine incomplete rc=0 exit (no completion proof) STILL counts as a
+# protocol violation and auto-blocks on first occurrence — the carve-out is
+# surgical, not a blanket "never count clean exits".
+# ---------------------------------------------------------------------------
+
+
+def _stage_clean_exit(conn, kb_mod, tid, pid):
+    """Point ``tid`` at a dead host-local pid whose reap record is rc=0."""
+    host = kb_mod._claimer_id().split(":", 1)[0]
+    kb.claim_task(conn, tid, claimer=f"{host}:w")
+    conn.execute(
+        "UPDATE tasks SET worker_pid = ?, consecutive_failures = 0 WHERE id = ?",
+        (pid, tid),
+    )
+    conn.commit()
+    # W_EXITCODE(0, 0) == 0 → _classify_worker_exit returns ("clean_exit", 0).
+    kb_mod._record_worker_exit(pid, _exited_status(0))
+
+
+def test_clean_exit_after_completed_run_not_counted_as_failure(
+    kanban_home, monkeypatch,
+):
+    """rc=0 with no terminal verb, but a completed run exists within the
+    guard window → benign no-op, not a protocol violation. The task is
+    released back to ``ready`` (a later dispatch tick / respawn guard picks
+    it up) WITHOUT counting a failure, so a completed card is never falsely
+    stranded in ``blocked``.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="done-but-quiet", assignee="a")
+        now = int(time.time())
+        # Proof the lane work already succeeded: a completed run recently.
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (tid, now - 120, now - 60),
+        )
+        conn.commit()
+
+        _stage_clean_exit(conn, _kb, tid, 65001)
+        crashed = kb.detect_crashed_workers(conn)
+
+        # Not a crash and not counted as a failure.
+        assert tid not in crashed, (
+            "clean exit after a completed run must not be treated as a crash"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            f"provably-done clean exit should release ready, got {task.status}"
+        )
+        assert task.consecutive_failures == 0, (
+            "provably-done clean exit must not increment the failure counter, "
+            f"got {task.consecutive_failures}"
+        )
+
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "protocol_violation" not in kinds, (
+            f"provably-done clean exit must not flag protocol_violation, got {kinds}"
+        )
+        assert "gave_up" not in kinds, (
+            f"provably-done clean exit must not trip the breaker, got {kinds}"
+        )
+
+
+def test_clean_exit_after_pr_comment_not_counted_as_failure(
+    kanban_home, monkeypatch,
+):
+    """rc=0 with no terminal verb, but a PR URL sits in a recent comment
+    (a prior run posted ready-for-review) → benign no-op, not a protocol
+    violation. This is the reported incident shape: run N opened the PR /
+    posted ready-for-review then crashed; run N+1 re-verified and exited
+    rc=0 without kanban_complete.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pr-posted", assignee="a")
+        kb.add_comment(
+            conn, tid, "worker",
+            "ready for review: https://github.com/cwest/hermes-agent/pull/123",
+        )
+
+        _stage_clean_exit(conn, _kb, tid, 65002)
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid not in crashed
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            f"clean exit after ready-for-review PR should release ready, "
+            f"got {task.status}"
+        )
+        assert task.consecutive_failures == 0, (
+            "clean exit after ready-for-review PR must not count a failure, "
+            f"got {task.consecutive_failures}"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "protocol_violation" not in kinds, kinds
+        assert "gave_up" not in kinds, kinds
+
+
+def test_clean_exit_without_proof_still_protocol_violation(
+    kanban_home, monkeypatch,
+):
+    """No completion proof → a bare rc=0-without-terminal-verb is STILL a
+    protocol violation and auto-blocks on first occurrence. The carve-out
+    must not mask a genuinely-incomplete quiet exit (no regression that
+    hides real breakage).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="quiet-incomplete", assignee="a")
+
+        _stage_clean_exit(conn, _kb, tid, 65003)
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid in crashed, "quiet incomplete exit should be detected"
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"protocol violation without proof should auto-block, got {task.status}"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "protocol_violation" in kinds, kinds
+        assert "gave_up" in kinds, kinds
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):

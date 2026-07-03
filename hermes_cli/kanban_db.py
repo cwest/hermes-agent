@@ -7090,6 +7090,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     on the first occurrence — retrying a worker whose CLI keeps
     returning 0 without a terminal transition just loops forever.
 
+    EXCEPTION — a clean (rc=0) exit whose lane work is *provably done*
+    (a completed run within the success window, or a PR / ready-for-review
+    URL in a recent comment; see :func:`_lane_work_provably_done`) is NOT a
+    protocol violation. It is the completed-but-un-signposted exit: the
+    worker finished the lane correctly but exited without the terminal verb.
+    Counting it would trip a FALSE ``gave_up`` and strand a finished card in
+    ``blocked``. It is released as a benign no-op WITHOUT counting a failure
+    (mirroring the rate-limit carve-out); the respawn guard's
+    recent_success / active_pr check then defers a duplicate spawn. The ids
+    are surfaced via the ``_last_clean_exit_after_done`` function attribute.
+
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
     provider quota wall, NOT a task failure. Such tasks are released back
@@ -7101,6 +7112,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    # Provably-done clean exits (rc=0 without a terminal verb, but the lane
+    # work already landed) — a benign no-op release, neither a crash nor a
+    # failure. Surfaced via a side-channel for observability, like
+    # ``rate_limited``.
+    clean_exit_after_done_ids: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -7188,11 +7204,35 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
-            if kind == "clean_exit":
+            clean_exit_after_done = False
+            if kind == "clean_exit" and _lane_work_provably_done(conn, row["id"]):
+                # Worker returned 0 without a terminal verb, BUT the lane's
+                # work is provably done (a prior completed run, or a PR URL /
+                # ready-for-review handoff in a recent comment). This is the
+                # completed-but-un-signposted exit — indistinguishable at the
+                # row level from a real protocol violation, but NOT a failure:
+                # counting it trips a FALSE ``gave_up`` and strands a finished
+                # card in ``blocked``. Treat it as a benign no-op: release the
+                # task (a later tick / the respawn guard's recent_success /
+                # active_pr check handles it) and do NOT count a failure —
+                # mirroring the rate-limited carve-out below.
+                protocol_violation = False
+                clean_exit_after_done = True
+                error_text = (
+                    f"pid {pid} exited cleanly (rc=0) after its lane work was "
+                    f"provably done — benign no-op, not counted as a failure"
+                )
+                event_kind = "clean_exit_after_done"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Retrying won't
-                # help.
+                # ``kanban_complete`` / ``kanban_block`` AND there is no proof
+                # the lane work landed. Retrying won't help.
                 protocol_violation = True
                 error_text = (
                     "worker exited cleanly (rc=0) without calling "
@@ -7269,10 +7309,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (restore_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Rate-limited requeues and provably-done clean exits are a
+                # clean release, not a crash — record the run outcome
+                # accordingly so the board history doesn't show a phantom crash
+                # for a quota wall or a completed-but-un-signposted exit.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif clean_exit_after_done:
+                    _run_outcome = "clean_exit_after_done"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -7295,6 +7341,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif clean_exit_after_done:
+                    # Benign no-op: the lane work already landed. Do NOT stamp
+                    # ``last_failure_error`` and do NOT add to ``crash_details``
+                    # (no failure counted). The task is released to
+                    # ``ready``/``review``; the respawn guard's recent_success /
+                    # active_pr check defers a duplicate spawn, and the correct
+                    # lifecycle transition happens on the next tick / by the
+                    # orchestrator recognizing the already-done lane.
+                    clean_exit_after_done_ids.append(row["id"])
                 else:
                     crashed.append(row["id"])
                     crash_details.append(
@@ -7343,6 +7398,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Same side-channel for provably-done clean exits — benign no-ops that did
+    # NOT count a failure and are NOT crashes; kept out of the ``crashed``
+    # return so a completed card is never falsely stranded.
+    detect_crashed_workers._last_clean_exit_after_done = clean_exit_after_done_ids  # type: ignore[attr-defined]
     return crashed
 
 
@@ -7562,6 +7621,53 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 
 # Legacy alias for test-code and anything else that still imports it.
 _clear_spawn_failures = _clear_failure_counter
+
+
+def _lane_work_provably_done(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when there is durable proof the task's lane work already
+    landed, so a subsequent rc=0-without-terminal-verb exit is a benign
+    no-op rather than a protocol violation.
+
+    A worker that FINISHES its lane correctly but exits rc=0 WITHOUT calling
+    ``kanban_complete`` / ``kanban_block`` is, at the row level,
+    indistinguishable from a worker that answered conversationally and never
+    did the work — both leave the task ``running`` and reap as ``clean_exit``.
+    Counting the former as a ``protocol_violation`` trips a FALSE ``gave_up``
+    on the first occurrence (``failure_limit=1``) and strands a
+    fully-completed card in ``blocked``, forcing a human to rescue it.
+
+    We disambiguate using the SAME durable signals ``check_respawn_guard``
+    already trusts as proof of a landed lane, so the two paths never disagree:
+
+    * a completed run within ``_RESPAWN_GUARD_SUCCESS_WINDOW`` (recent_success), or
+    * a GitHub PR URL in a comment within ``_RESPAWN_GUARD_PR_WINDOW`` (active_pr) —
+      the ready-for-review handoff the implementer lane posts on PR open.
+
+    Only proof is a carve-out; absence of proof keeps the strict
+    protocol-violation behavior (a genuinely-incomplete quiet exit STILL
+    counts), so this cannot mask real breakage.
+    """
+    now = int(time.time())
+
+    # Proof 1: a completed run within the success window.
+    cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
+    if conn.execute(
+        "SELECT id FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
+        (task_id, cutoff),
+    ).fetchone():
+        return True
+
+    # Proof 2: a GitHub PR URL in a recent comment (ready-for-review handoff).
+    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    for c in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        (task_id, pr_cutoff),
+    ).fetchall():
+        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            return True
+
+    return False
 
 
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
