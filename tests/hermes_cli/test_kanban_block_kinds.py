@@ -131,6 +131,150 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Review-bounce cycles must not false-trip the loop breaker
+# ---------------------------------------------------------------------------
+#
+# A healthy multi-round review cycle (CHANGES-REQUESTED -> rework -> a NEW,
+# different finding -> CHANGES-REQUESTED again) is blocked with the SAME
+# ``kind`` every round, so the pure ``prev_kind == kind`` classifier counted
+# each healthy round as "the same failure repeating" and routed the card to
+# ``triage`` at the limit -- stranding it off the ``auto_route_review_bounce``
+# path. The fix: a ``review-changes-requested`` re-block whose reason MATERIALLY
+# DIFFERS from the prior round is progress, not a loop, and must not increment
+# (it resets to 1). A same-reason review bounce IS a real loop and still trips.
+
+
+def test_review_bounce_distinct_findings_do_not_route_to_triage(
+    kanban_home: Path,
+) -> None:
+    """Round 2 with a DIFFERENT finding is progress, not a loop."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(
+            conn, tid,
+            reason="review-changes-requested: fix the null deref in foo()",
+            kind="needs_input",
+        )
+        assert kb.get_task(conn, tid).block_recurrences == 1
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # Distinct finding on the second round.
+        kb.block_task(
+            conn, tid,
+            reason="review-changes-requested: add a test for the retry path",
+            kind="needs_input",
+        )
+        t = kb.get_task(conn, tid)
+        assert t.status == "blocked", "distinct-finding review bounce must stay blocked"
+        assert t.block_recurrences == 1, "distinct finding resets the loop counter"
+
+
+def test_review_bounce_three_distinct_rounds_never_triage(
+    kanban_home: Path,
+) -> None:
+    """A 3-round review cycle with distinct findings never escalates."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        findings = [
+            "review-changes-requested: finding A",
+            "review-changes-requested: finding B",
+            "review-changes-requested: finding C",
+        ]
+        for i, reason in enumerate(findings):
+            if i > 0:
+                _make_running_again(conn, tid)
+            kb.block_task(conn, tid, reason=reason, kind="needs_input")
+            t = kb.get_task(conn, tid)
+            assert t.status == "blocked", f"round {i} must stay blocked"
+            assert t.block_recurrences == 1
+            kb.unblock_task(conn, tid)
+
+
+def test_review_bounce_same_finding_still_escalates(kanban_home: Path) -> None:
+    """A reviewer bouncing the IDENTICAL unfixed finding IS a real loop."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        reason = "review-changes-requested: fix the null deref in foo()"
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        t = kb.get_task(conn, tid)
+        assert t.status == "triage", "identical-finding repeat is a genuine loop"
+        assert t.block_recurrences == 2
+
+
+def test_review_bounce_same_finding_whitespace_insensitive(
+    kanban_home: Path,
+) -> None:
+    """Trivial whitespace/case differences are NOT a material change."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(
+            conn, tid,
+            reason="review-changes-requested: Fix the null deref",
+            kind="needs_input",
+        )
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # Same finding, only whitespace/case jitter -> still the same cause.
+        kb.block_task(
+            conn, tid,
+            reason="review-changes-requested:   fix the null   deref  ",
+            kind="needs_input",
+        )
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_review_bounce_distinct_then_same_escalates(kanban_home: Path) -> None:
+    """Progress resets the counter; a later repeat of that finding trips."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(
+            conn, tid,
+            reason="review-changes-requested: finding A",
+            kind="needs_input",
+        )
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # Distinct finding B -> reset to 1, stays blocked.
+        kb.block_task(
+            conn, tid,
+            reason="review-changes-requested: finding B",
+            kind="needs_input",
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).block_recurrences == 1
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # Finding B repeats unfixed -> now a real loop.
+        kb.block_task(
+            conn, tid,
+            reason="review-changes-requested: finding B",
+            kind="needs_input",
+        )
+        t = kb.get_task(conn, tid)
+        assert t.status == "triage"
+        assert t.block_recurrences == 2
+
+
+def test_non_review_same_reason_loop_still_escalates(kanban_home: Path) -> None:
+    """Regression guard: a non-review needs_input loop still trips even when
+    the reason text changes -- the material-difference reset is review-only."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="need the API key", kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # A NON-review re-block with a DIFFERENT reason but the same kind must
+        # still count -- only review bounces get the distinct-finding reset.
+        kb.block_task(conn, tid, reason="need a different secret", kind="needs_input")
+        t = kb.get_task(conn, tid)
+        assert t.status == "triage"
+        assert t.block_recurrences == 2
+
+
+# ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
 
