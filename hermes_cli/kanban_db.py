@@ -3537,6 +3537,34 @@ def _last_block_reason(
     return reason if isinstance(reason, str) else None
 
 
+def _prior_block_reason(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return the reason of the SECOND-most-recent ``blocked`` event, or None.
+
+    :func:`_last_block_reason` returns the newest ``blocked`` event — which, in a
+    context that reads a card ALREADY re-blocked (e.g. ``auto_route_review_bounce``,
+    where the current sticky block is the newest event), is the CURRENT round, not
+    the prior one. To decide whether the current bounce's finding differs from the
+    round before it, we need the one before the newest — this returns exactly that.
+    Returns None when there are fewer than two ``blocked`` events.
+    """
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY id DESC LIMIT 2",
+        (task_id,),
+    ).fetchall()
+    if len(rows) < 2 or not rows[1]["payload"]:
+        return None
+    try:
+        payload = json.loads(rows[1]["payload"])
+    except (ValueError, TypeError):
+        return None
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return reason if isinstance(reason, str) else None
+
+
 def _is_review_bounce_reason(reason: Optional[str]) -> bool:
     """True iff ``reason`` is the reviewer's review-changes-requested bounce.
 
@@ -3666,6 +3694,21 @@ def auto_route_review_bounce(
             # Unresolvable author, or the card is already assigned to the author
             # (nothing to route) — leave it for a human rather than guessing.
             continue
+        # A genuine author-rework transition — a review bounce whose finding
+        # MATERIALLY DIFFERS from the prior round — is a FRESH cycle, not a
+        # continuation of the loop, so its ``block_recurrences`` should reset to 0
+        # (mirroring the reset in ``complete_task``). This recovers a card whose
+        # counter was inflated by prior churn without weakening the breaker: a
+        # bounce repeating the IDENTICAL finding is a real same-unfixed-finding
+        # loop and its counter is LEFT intact so it still escalates to triage at
+        # ``BLOCK_RECURRENCE_LIMIT``. The same-vs-different test reuses the PR #48
+        # ``_review_bounce_finding`` classifier so this stays consistent with the
+        # loop breaker in ``block_task``.
+        prior_reason = _prior_block_reason(conn, task_id)
+        finding_differs = (
+            _is_review_bounce_reason(prior_reason)
+            and _review_bounce_finding(reason) != _review_bounce_finding(prior_reason)
+        )
         # Reassign to the author, then unblock. unblock_task emits the
         # ``unblocked`` cutoff event (clears the active_pr guard) and resets
         # consecutive_failures, exactly like a manual block→unblock cutoff.
@@ -3680,6 +3723,13 @@ def auto_route_review_bounce(
             _append_event(
                 conn, task_id, "assigned",
                 {"from": row["assignee"], "to": author, "by": "dispatcher:auto-route"},
+            )
+        if finding_differs:
+            # Fresh cycle — clear the inflated loop counter via the sanctioned API
+            # (emits its own ``block_recurrences_reset`` audit event).
+            reset_block_recurrences(
+                conn, task_id, actor="dispatcher:auto-route",
+                reason="review-bounce rework (finding changed) — fresh cycle",
             )
         if not unblock_task(conn, task_id):
             continue
@@ -5638,6 +5688,57 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             {"status": new_status} if new_status != "ready" else None,
         )
         return True
+
+
+def reset_block_recurrences(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: Optional[str] = None,
+) -> bool:
+    """Sanctioned reset of an inflated ``block_recurrences`` loop counter.
+
+    The loop breaker in :func:`block_task` escalates a card to ``triage`` once
+    ``block_recurrences`` reaches :data:`BLOCK_RECURRENCE_LIMIT`. That counter is
+    reset ONLY inside :func:`complete_task` — so a card whose counter is already
+    inflated (by prior buggy-code runs, or an operator's repeated block->unblock
+    while diagnosing) has no sanctioned recovery: every ``block``->``unblock``
+    re-trips straight to ``triage``. This is the explicit escape hatch — it zeroes
+    ``block_recurrences`` through the sanctioned API and emits a
+    ``block_recurrences_reset`` audit event, so operators never need the
+    ``move_card`` workaround or a direct DB write.
+
+    Deliberately does NOT touch ``block_kind``, ``status``, or any claim/run state
+    — it is a pure counter reset, orthogonal to the lane transition. Pair it with
+    an ``unblock`` (or the ``--reset-loop`` CLI flag, which does both) to return the
+    card to the work pool.
+
+    ``actor`` names who requested the reset (recorded on the audit event).
+    ``reason`` is an optional free-form note. Returns ``True`` on a successful reset
+    (even when the counter was already 0 — the deliberate operator action is still
+    audited), ``False`` when the task does not exist (a clean no-op, mirroring the
+    other recovery primitives).
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT block_recurrences FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        previous = (
+            int(row["block_recurrences"])
+            if row["block_recurrences"] is not None
+            else 0
+        )
+        conn.execute(
+            "UPDATE tasks SET block_recurrences = 0 WHERE id = ?", (task_id,)
+        )
+        _append_event(
+            conn, task_id, "block_recurrences_reset",
+            {"previous": previous, "actor": actor, "reason": reason},
+        )
+    return True
 
 
 def specify_triage_task(
