@@ -3509,6 +3509,34 @@ def _latest_sticky_block_reason(
     return reason if isinstance(reason, str) else None
 
 
+def _last_block_reason(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return the reason of the most recent ``blocked`` event, or None.
+
+    Unlike :func:`_latest_sticky_block_reason`, this is NOT gated on the block
+    still being "sticky" — it reads the last ``blocked`` event even when an
+    intervening ``unblocked`` cleared the stickiness. That is exactly what the
+    loop breaker needs: to compare THIS re-block's reason against the PRIOR
+    round's reason, the prior round having already been unblocked (which is the
+    only way ``block_task`` fires again from ``running``/``ready``).
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (ValueError, TypeError):
+        return None
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return reason if isinstance(reason, str) else None
+
+
 def _is_review_bounce_reason(reason: Optional[str]) -> bool:
     """True iff ``reason`` is the reviewer's review-changes-requested bounce.
 
@@ -3517,6 +3545,26 @@ def _is_review_bounce_reason(reason: Optional[str]) -> bool:
     acceptance block) nor any other block reason.
     """
     return bool(reason) and reason.lstrip().startswith(_REVIEW_BOUNCE_REASON_PREFIX)
+
+
+def _review_bounce_finding(reason: Optional[str]) -> str:
+    """Return the normalized finding text of a review-changes-requested reason.
+
+    Strips the ``review-changes-requested`` prefix (and any leading separator
+    punctuation) then collapses whitespace and lowercases, so trivial jitter
+    (case, spacing, a trailing colon) is NOT treated as a new finding. Returns
+    ``""`` for a non-review or empty reason. Used by :func:`block_task` to tell a
+    genuine same-finding review loop (escalate) from a healthy multi-round cycle
+    whose finding changes each round (progress, not a loop).
+    """
+    if not _is_review_bounce_reason(reason):
+        return ""
+    assert reason is not None  # guaranteed by _is_review_bounce_reason above
+    body = reason.lstrip()[len(_REVIEW_BOUNCE_REASON_PREFIX):]
+    # Drop a leading separator (``: ``, ``- ``, whitespace) between the prefix
+    # and the finding so ``...requested: X`` and ``...requested X`` compare equal.
+    body = body.lstrip(" \t:-")
+    return " ".join(body.split()).lower()
 
 
 def _resolve_review_author(
@@ -5325,6 +5373,30 @@ def block_task(
         # means: blocked → unblocked → about-to-re-block for the same cause.
         # An un-typed (None) block compares as "same" to a prior un-typed block.
         same_cause = prev_kind == kind
+
+        # Review-bounce exception: a healthy multi-round review cycle
+        # (changes-requested → rework → a NEW, different finding →
+        # changes-requested again) is re-blocked with the SAME kind every
+        # round, so the pure ``prev_kind == kind`` test above would count each
+        # healthy round as "the same failure repeating" and escalate the card
+        # to triage at the limit — stranding it OFF the ``auto_route_review_bounce``
+        # path (which only scans ``status = 'blocked'``). The loop breaker is
+        # meant to catch a task re-blocking on the SAME UNRESOLVED cause, not a
+        # review whose finding changes each round. So: when BOTH the incoming and
+        # the prior sticky block are ``review-changes-requested`` bounces AND
+        # their normalized finding text MATERIALLY DIFFERS, this is progress, not
+        # a loop — treat it as a fresh cause (counter resets to 1). A review
+        # bounce repeating the IDENTICAL finding still counts (a reviewer bouncing
+        # the same unfixed finding forever IS a real loop worth escalating), and
+        # non-review kinds are entirely unaffected.
+        if same_cause and _is_review_bounce_reason(reason):
+            prior_reason = _last_block_reason(conn, task_id)
+            if _is_review_bounce_reason(prior_reason) and (
+                _review_bounce_finding(reason)
+                != _review_bounce_finding(prior_reason)
+            ):
+                same_cause = False
+
         recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
