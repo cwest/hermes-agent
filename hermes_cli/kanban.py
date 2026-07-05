@@ -587,6 +587,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
+    p_unblock.add_argument(
+        "--reset-loop",
+        action="store_true",
+        help=(
+            "Also zero the unblock-loop counter (block_recurrences) via the "
+            "sanctioned API, emitting an audit event. Use to recover a card stuck "
+            "by an inflated counter that keeps re-tripping straight to triage — no "
+            "DB edit or move_card workaround needed."
+        ),
+    )
     p_unblock.add_argument("task_ids", nargs="+")
 
     p_promote = sub.add_parser(
@@ -2019,17 +2029,40 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = getattr(args, "reason", None)
     if reason is not None:
         reason = reason.strip() or None
-    author = _profile_author() if reason else None
+    reset_loop = bool(getattr(args, "reset_loop", False))
+    author = _profile_author() if (reason or reset_loop) else None
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
+            # Zero the unblock-loop counter FIRST (independent of the lane
+            # transition) so a card stuck by an inflated block_recurrences is
+            # recovered even when it is parked in triage (where unblock_task does
+            # not apply). Emits its own auditable block_recurrences_reset event.
+            if reset_loop:
+                if not kb.reset_block_recurrences(
+                    conn, tid, actor=author or "user", reason=reason,
+                ):
+                    failed.append(tid)
+                    print(f"cannot reset loop counter for {tid} (not found?)",
+                          file=sys.stderr)
+                    continue
             if not kb.unblock_task(conn, tid):
-                failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                if reset_loop:
+                    # The counter reset succeeded; only the lane flip did not
+                    # apply (e.g. the card is in triage, not blocked/scheduled).
+                    print(
+                        f"Reset loop counter for {tid} "
+                        f"(not blocked/scheduled — left in place)"
+                    )
+                else:
+                    failed.append(tid)
+                    print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
-                print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
+                suffix = f": {reason}" if reason else ""
+                prefix = "Unblocked + reset loop counter" if reset_loop else "Unblocked"
+                print(f"{prefix} {tid}{suffix}")
     return 0 if not failed else 1
 
 
