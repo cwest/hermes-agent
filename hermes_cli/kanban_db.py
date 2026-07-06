@@ -9628,6 +9628,29 @@ def add_notify_sub(
     now = int(time.time())
     seed = int(initial_cursor) if initial_cursor is not None else 0
     with write_txn(conn):
+        # Guard against a thread-less sub that would MISROUTE a wake.
+        #
+        # The transition-wake destination is read verbatim off the sub row, so a
+        # thread-born card that already carries a concrete-origin sub
+        # (``discord:<chat>:<thread>``) must not gain a second thread-less sub
+        # (``discord:<home>:`` — e.g. the review-stage defensive re-subscribe to
+        # the Home channel). Two rows = two wakes: one to the origin thread
+        # (correct) and one to Home/thread=None (dark to Casey). When THIS write
+        # is thread-less and the same (task, platform) already has ANY
+        # thread-bearing sub, skip the insert — the origin sub already delivers.
+        # A genuinely channel-born card (no thread sub anywhere) is unaffected.
+        if not (thread_id or "").strip():
+            existing_thread = conn.execute(
+                """
+                SELECT 1 FROM kanban_notify_subs
+                 WHERE task_id = ? AND platform = ?
+                   AND thread_id IS NOT NULL AND thread_id != ''
+                 LIMIT 1
+                """,
+                (task_id, platform),
+            ).fetchone()
+            if existing_thread is not None:
+                return
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
