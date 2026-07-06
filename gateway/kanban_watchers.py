@@ -407,6 +407,31 @@ class GatewayKanbanWatchersMixin:
                             subs = _kb.list_notify_subs(conn)
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
+                            # Wake-egress dedup: a card that carries BOTH an
+                            # origin thread sub and a thread-less channel/Home sub
+                            # would fire TWO transition wakes — one to the origin
+                            # thread (correct) and one to Home/thread=None (dark
+                            # to Casey). Collapse to a single wake target per
+                            # card (thread-bearing preferred) and gate the
+                            # emit-claim below on membership so the thread-less
+                            # duplicate never claims/fires a wake. The chat-ping
+                            # path is intentionally left untouched (a separate
+                            # cursor); only the AGENT-WAKE egress is deduped here.
+                            try:
+                                from gateway.kanban_transition_emit import (
+                                    dedupe_wake_subs as _dedupe_wake_subs,
+                                )
+                                _wake_eligible = {
+                                    (
+                                        s.get("task_id"), s.get("platform"),
+                                        s.get("chat_id"), (s.get("thread_id") or ""),
+                                    )
+                                    for s in _dedupe_wake_subs(subs)
+                                }
+                            except Exception:
+                                # Never let a dedup import/logic error suppress
+                                # wakes — fall back to every sub being eligible.
+                                _wake_eligible = None
                             for sub in subs:
                                 owner_profile = sub.get("notifier_profile") or None
                                 if owner_profile and owner_profile != notifier_profile:
@@ -443,7 +468,19 @@ class GatewayKanbanWatchersMixin:
                                 # BEFORE the ping claim's `if not events:
                                 # continue` so a sub with only emit-relevant
                                 # events is not skipped.
-                                if transition_emit_secret:
+                                # Skip the agent-wake claim for a sub that the
+                                # wake-egress dedup collapsed away (a thread-less
+                                # duplicate of a thread-born card) so the card
+                                # fires exactly one wake — to its origin thread.
+                                _sub_wake_key = (
+                                    sub.get("task_id"), sub.get("platform"),
+                                    sub.get("chat_id"), (sub.get("thread_id") or ""),
+                                )
+                                _wake_ok = (
+                                    _wake_eligible is None
+                                    or _sub_wake_key in _wake_eligible
+                                )
+                                if transition_emit_secret and _wake_ok:
                                     try:
                                         from gateway.kanban_transition_emit import (
                                             should_emit_transition as _should_emit,

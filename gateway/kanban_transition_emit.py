@@ -265,6 +265,47 @@ def resolve_transition_target(
     }
 
 
+def dedupe_wake_subs(subs: list[dict]) -> list[dict]:
+    """Collapse a card's notify-subs to a single wake target per ``task_id``.
+
+    The wake destination is taken verbatim from the subscription row (the
+    notifier reads ``chat_id``/``thread_id`` straight off ``e_sub``), so a card
+    that carries BOTH a concrete-origin sub (``discord:<chat>:<thread>``, stamped
+    at filing) AND a thread-less channel/fallback sub (``discord:<home>:``, e.g.
+    the review-stage defensive re-subscribe) fires TWO wakes: one to the origin
+    thread (correct) and one to Home/thread=None — the wake that "goes dark" to
+    Casey. Deduping here guarantees exactly ONE wake per card, preferring the
+    thread-bearing sub, even on a legacy DB that already has both rows.
+
+    Contract:
+    - Group by ``(task_id, platform)``. Within a group, if ANY sub carries a
+      non-empty ``thread_id`` (a real origin thread), DROP the thread-less
+      duplicates and keep only the thread-bearing one(s).
+    - A group with NO thread-bearing sub (a genuinely channel-born card) keeps
+      its single channel sub — the fallback stays functional.
+    - DISTINCT real threads for the same card are all preserved; only the
+      thread-LESS duplicate of a thread-born card is discarded.
+    - Input order is irrelevant to the outcome; relative order of surviving subs
+      is preserved for determinism.
+    """
+    # Which (task_id, platform) groups have at least one real thread sub?
+    has_thread: set[tuple] = set()
+    for s in subs:
+        if (s.get("thread_id") or "").strip():
+            has_thread.add((s.get("task_id"), s.get("platform")))
+
+    out: list[dict] = []
+    for s in subs:
+        key = (s.get("task_id"), s.get("platform"))
+        thread = (s.get("thread_id") or "").strip()
+        # Drop a thread-less sub only when the SAME card+platform also has a
+        # real thread sub; otherwise keep it (channel-born card / fallback).
+        if not thread and key in has_thread:
+            continue
+        out.append(s)
+    return out
+
+
 def route_url(cfg: dict) -> str:
     host = cfg.get("webhook_host", DEFAULT_WEBHOOK_HOST)
     port = int(cfg.get("webhook_port", DEFAULT_WEBHOOK_PORT))
