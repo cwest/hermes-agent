@@ -395,3 +395,75 @@ def test_emit_kinds_config_hot_reloads_mid_run(tmp_path, monkeypatch):
         "for `blocked` on the next tick with NO restart (config was cached once "
         "before the loop -> restart-gated)"
     )
+
+
+# --- (e) wake egress: a card with dup subs fires ONE wake, to the thread ------
+
+
+def test_dup_subs_fire_a_single_wake_to_the_origin_thread(tmp_path, monkeypatch):
+    """A thread-born card carrying BOTH an origin thread sub AND a thread-less
+    Home sub (e.g. the review-stage Home re-subscribe on a legacy DB) must fire
+    exactly ONE transition wake — to the origin thread, never a second to
+    Home/thread=None (the wake that goes dark to Casey).
+
+    Locks the wake-egress dedup wiring: the thread-less duplicate is collapsed
+    away before the emit-claim so it never fires its own wake.
+    """
+    db_path = tmp_path / "dup_wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _install_config(monkeypatch, _base_config(emit_enabled=True))
+
+    thread_chat = "1523789197662748683"
+    home_chat = FALLBACK_CHANNEL
+    conn = kb.connect()
+    try:
+        tid = _running_task(conn, title="thread-born dup")
+        # Origin thread sub (stamped at filing).
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram",
+            chat_id=thread_chat, thread_id=thread_chat,
+            notifier_profile="default",
+        )
+        # A pre-existing thread-less Home sub, written directly to simulate a
+        # legacy DB row (the add_notify_sub guard would now skip this write, so
+        # we insert it raw to prove the wake-side dedup ALSO defends).
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO kanban_notify_subs
+                    (task_id, platform, chat_id, thread_id, user_id,
+                     notifier_profile, last_event_id, created_at)
+                VALUES (?, 'telegram', ?, '', NULL, 'default', 0, 0)
+                """,
+                (tid, home_chat),
+            )
+        # Two distinct sub rows exist for the card.
+        assert len(kb.list_notify_subs(conn, task_id=tid)) == 2
+        # A lane change to wake on.
+        kb.block_task(conn, tid, reason="wake once", kind="capability")
+    finally:
+        conn.close()
+
+    calls = []
+
+    async def fake_emit(cfg_arg, payload, secret):
+        calls.append(payload)
+        return True
+
+    monkeypatch.setattr(
+        "gateway.kanban_transition_emit.emit_transition", fake_emit
+    )
+
+    adapter = _RecordingAdapter()
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    blocked = [p for p in calls if p["kind"] == "blocked"]
+    assert len(blocked) == 1, (
+        "a card with a thread sub AND a thread-less Home sub must fire exactly "
+        f"ONE wake, got {len(blocked)}: {[p.get('origin_chat_id') for p in blocked]}"
+    )
+    # The single wake must carry the ORIGIN THREAD, not Home/thread=None.
+    assert blocked[0].get("origin_chat_id") == thread_chat
+    assert blocked[0].get("origin_thread_id") == thread_chat
+
