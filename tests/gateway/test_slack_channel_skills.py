@@ -100,6 +100,83 @@ class TestSlackResolveChannelSkills:
         assert _resolve(adapter, "D0ABC") is None
 
 
+class TestResolveChannelSkillsAccumulate:
+    """resolve_channel_skills must ACCUMULATE skills across every binding entry
+    whose id matches the channel/parent id, not return on the first match."""
+
+    def test_two_entries_same_id_accumulate_in_order(self):
+        """Legacy multi-entry form: two entries share one id -> both load,
+        in declaration order, instead of the second being silently dropped."""
+        adapter = _make_adapter({
+            "channel_skill_bindings": [
+                {"id": "C0RESEARCH", "skills": ["stage-research-request"]},
+                {"id": "C0RESEARCH", "skill": "discord-message-formatting"},
+            ]
+        })
+        assert _resolve(adapter, "C0RESEARCH") == [
+            "stage-research-request",
+            "discord-message-formatting",
+        ]
+
+    def test_accumulate_dedups_across_entries(self):
+        """A skill repeated across matching entries appears once, at first
+        occurrence, preserving overall order."""
+        adapter = _make_adapter({
+            "channel_skill_bindings": [
+                {"id": "C0X", "skills": ["a", "b"]},
+                {"id": "C0X", "skills": ["b", "c"]},
+            ]
+        })
+        assert _resolve(adapter, "C0X") == ["a", "b", "c"]
+
+    def test_channel_matches_precede_parent_matches(self):
+        """When both a channel-id entry and a parent-id (thread) entry match,
+        the channel entry's skills come first."""
+        adapter = _make_adapter({
+            "channel_skill_bindings": [
+                {"id": "C0PARENT", "skills": ["parent-skill"]},
+                {"id": "C0CHILD", "skills": ["child-skill"]},
+            ]
+        })
+        assert _resolve(adapter, "C0CHILD", parent_id="C0PARENT") == [
+            "child-skill",
+            "parent-skill",
+        ]
+
+    def test_channel_and_parent_dedup_across_precedence(self):
+        """A skill present in both a channel entry and a parent entry appears
+        once, at its channel-precedence position."""
+        adapter = _make_adapter({
+            "channel_skill_bindings": [
+                {"id": "C0PARENT", "skills": ["shared", "parent-only"]},
+                {"id": "C0CHILD", "skills": ["child-only", "shared"]},
+            ]
+        })
+        assert _resolve(adapter, "C0CHILD", parent_id="C0PARENT") == [
+            "child-only",
+            "shared",
+            "parent-only",
+        ]
+
+    def test_single_entry_list_form_unchanged(self):
+        """The preferred single-entry list form keeps working exactly as before."""
+        adapter = _make_adapter({
+            "channel_skill_bindings": [
+                {"id": "C0X", "skills": ["only-a", "only-b"]},
+            ]
+        })
+        assert _resolve(adapter, "C0X") == ["only-a", "only-b"]
+
+    def test_single_skill_string_form_unchanged(self):
+        """The single ``skill:`` string form keeps working."""
+        adapter = _make_adapter({
+            "channel_skill_bindings": [
+                {"id": "C0X", "skill": "solo"},
+            ]
+        })
+        assert _resolve(adapter, "C0X") == ["solo"]
+
+
 class TestSlackMessageEventAutoSkill:
     """Integration-style test: verify auto_skill propagates to MessageEvent."""
 
