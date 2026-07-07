@@ -953,6 +953,42 @@ class GatewayKanbanWatchersMixin:
                             e_title = (
                                 (e_task.title if e_task else e_sub["task_id"])[:120]
                             )
+                            # Belt-and-suspenders wake suppression at the SOURCE.
+                            # Two classes must never fire a human-facing agent-run
+                            # wake (they land as noise in Casey's Home channel):
+                            #   1. write-time-sweep bookkeeping cards
+                            #      (`curate: write-time sweep @ <sha>`) — internal
+                            #      OKF corpus-health accounting, not a human report.
+                            #   2. no-origin cards routed to the Home fallback — a
+                            #      thread-less sub whose chat_id == fallback_chat_id
+                            #      is a synthesized fallback, not a human origin
+                            #      ("no origin => no human post"). The chat-ping
+                            #      accounting (deliveries above) is UNAFFECTED; only
+                            #      this agent-run wake egress is gated.
+                            try:
+                                from gateway.kanban_transition_emit import (
+                                    should_emit_wake as _should_emit_wake,
+                                )
+                                _wake_allowed = _should_emit_wake(
+                                    title=e_title,
+                                    sub_thread_id=e_sub.get("thread_id"),
+                                    sub_chat_id=e_sub.get("chat_id"),
+                                    fallback_chat_id=fallback_chat_id,
+                                )
+                            except Exception:
+                                # Never let the gate's own failure suppress a wake
+                                # that would otherwise be legitimate.
+                                _wake_allowed = True
+                            if not _wake_allowed:
+                                logger.debug(
+                                    "kanban transition emit: suppressing "
+                                    "human-facing wake for %s (title=%r "
+                                    "chat=%s thread=%s) — sweep/no-origin card",
+                                    e_sub.get("task_id"), e_title,
+                                    e_sub.get("chat_id"),
+                                    e_sub.get("thread_id"),
+                                )
+                                continue
                             origin_sid = (
                                 getattr(e_task, "session_id", None)
                                 if e_task else None
