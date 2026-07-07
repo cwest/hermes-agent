@@ -139,6 +139,81 @@ def should_emit_transition(cfg: Optional[dict], kind: str) -> bool:
     return kind in set(kinds)
 
 
+# Title prefix of the automatic OKF write-time-sweep bookkeeping card. The
+# curation machinery files exactly one ``curate: write-time sweep @ <sha>`` card
+# on every push to the knowledge base (see the ``stage-curation-sweep`` skill).
+# These are internal corpus-health passes — NOT a report any human needs — so
+# their transition wakes must never post to a Discord channel.
+_SWEEP_CARD_TITLE_PREFIX = "curate: write-time sweep @"
+
+
+def is_sweep_card_title(title: Optional[str]) -> bool:
+    """True when ``title`` is an automatic write-time-sweep bookkeeping card.
+
+    The write-time-sweep card class (``curate: write-time sweep @ <sha>``) is
+    internal OKF curation bookkeeping spawned automatically on every knowledge
+    base push. It carries no human origin and its completion is not a synopsis
+    trigger, so a human-facing transition wake for it is pure noise (it lands in
+    Casey's Home channel). Matching is on the title prefix, tolerant of leading
+    whitespace; ``None``/empty never matches.
+    """
+    if not title:
+        return False
+    return title.strip().startswith(_SWEEP_CARD_TITLE_PREFIX)
+
+
+def should_emit_wake(
+    *,
+    title: Optional[str],
+    sub_thread_id: Optional[str],
+    sub_chat_id: Optional[str],
+    fallback_chat_id: Optional[str],
+) -> bool:
+    """True when a transition wake for this card+sub should POST a human-facing run.
+
+    This is the belt-and-suspenders gate the notifier applies before firing the
+    origin-wake POST (``should_emit_transition`` already decided the *kind* is
+    wake-eligible; this decides whether the *destination* is a legitimate human
+    origin). Two classes are suppressed at the source so nothing downstream can
+    mishandle them:
+
+    1. **Write-time-sweep bookkeeping cards** (``is_sweep_card_title``) — internal
+       curation accounting, never a human report. Suppressed unconditionally,
+       regardless of any (accidental) origin routing.
+    2. **No-origin cards routed to the Home fallback** — a card with no real
+       thread origin gets a synthesized, thread-less fallback subscription
+       pointed at the Home channel (``fallback_chat_id``). That is not a human
+       origin: "no origin => no human post." A thread-less sub whose ``chat_id``
+       equals ``fallback_chat_id`` is exactly this case and is suppressed.
+
+    A genuinely human-born card — a thread-bearing sub (real origin thread), or a
+    thread-less sub on a real, non-fallback channel — is allowed through, so the
+    working synopsis / commissioning wakes keep firing to their origin thread.
+
+    Why the no-origin test is structural (``chat == fallback_chat_id``) rather
+    than a read of the ``is_fallback`` flag ``resolve_transition_target`` stamps:
+    that flag lives only on the *synthesized delivery sub* the notifier builds
+    in-memory for the chat-ping path. The wake this gate protects is fired from a
+    *persisted* notify-sub row (``add_notify_sub`` writes a thread-less Home-
+    channel sub the first time a no-origin card has no subscription), and a plain
+    DB row carries no ``is_fallback`` field. On the next tick that persisted row
+    is enumerated as an ordinary sub and feeds the emit-wake path — which is
+    exactly the F3 leak that put a sweep card's wake into Home. Deriving the
+    condition from the row's own shape (no thread + chat is the fallback channel)
+    is what catches that persisted row; the flag would silently miss it.
+    """
+    if is_sweep_card_title(title):
+        return False
+    thread = (sub_thread_id or "").strip()
+    chat = (sub_chat_id or "").strip()
+    fb = (fallback_chat_id or "").strip()
+    # No real thread AND targeting the Home fallback channel => synthesized/
+    # persisted no-origin fallback, not a human origin. Suppress the wake.
+    if not thread and fb and chat == fb:
+        return False
+    return True
+
+
 def build_transition_payload(
     *,
     task_id: str,
