@@ -20,7 +20,9 @@ from __future__ import annotations
 from gateway.kanban_transition_emit import (
     DEFAULT_EMIT_KINDS,
     build_transition_payload,
+    is_sweep_card_title,
     should_emit_transition,
+    should_emit_wake,
 )
 
 
@@ -50,6 +52,90 @@ def test_explicit_kinds_override_default():
     cfg = _cfg(enabled=True, kinds=["completed"])
     assert should_emit_transition(cfg, "completed") is True
     assert should_emit_transition(cfg, "blocked") is False
+
+
+# --- Sweep-card class discriminator (internal OKF bookkeeping, never a human wake) --
+
+
+def test_is_sweep_card_title_matches_write_time_sweep_prefix():
+    # The exact title the OKF write-time-sweep machinery files.
+    assert is_sweep_card_title("curate: write-time sweep @ 9c63aa9") is True
+    # Leading/trailing whitespace and a longer sha suffix must still match.
+    assert is_sweep_card_title("  curate: write-time sweep @ deadbeef123") is True
+
+
+def test_is_sweep_card_title_rejects_real_curation_cards():
+    # A genuine cycle-terminal curate card (has a human synopsis) is NOT a sweep.
+    assert (
+        is_sweep_card_title("curate: audit & steward the intent-driven-development brief")
+        is False
+    )
+    assert is_sweep_card_title("research: what is X?") is False
+    assert is_sweep_card_title("fix(gateway): something") is False
+    # Defensive: never crash on None/empty.
+    assert is_sweep_card_title("") is False
+    assert is_sweep_card_title(None) is False
+
+
+# --- should_emit_wake: the belt for the human-facing wake POST ------------------
+
+
+def test_should_emit_wake_suppresses_sweep_card_even_with_real_origin():
+    # A sweep card must NOT wake a human channel regardless of its (accidental)
+    # origin routing — internal bookkeeping never posts.
+    assert (
+        should_emit_wake(
+            title="curate: write-time sweep @ 9c63aa9",
+            sub_thread_id="1523894059851186186",
+            sub_chat_id="1515909683171557416",
+            fallback_chat_id="1515879019269197885",
+        )
+        is False
+    )
+
+
+def test_should_emit_wake_suppresses_home_fallback_no_origin_card():
+    # A card with no real origin: the notifier synthesizes a thread-less
+    # fallback sub pointed at the Home channel. That is NOT a human origin —
+    # no origin => no human post.
+    assert (
+        should_emit_wake(
+            title="curate: some non-sweep bookkeeping card",
+            sub_thread_id="",
+            sub_chat_id="1515879019269197885",  # == fallback_chat_id (Home)
+            fallback_chat_id="1515879019269197885",
+        )
+        is False
+    )
+
+
+def test_should_emit_wake_allows_real_origin_thread_card():
+    # A card born in a real Discord thread (thread-bearing sub, non-Home) is a
+    # legitimate human origin: the wake MUST fire (regression guard for the
+    # working synopsis/commissioning path).
+    assert (
+        should_emit_wake(
+            title="curate: audit & steward the intent-driven-development brief",
+            sub_thread_id="1523894059851186186",
+            sub_chat_id="1515909683171557416",
+            fallback_chat_id="1515879019269197885",
+        )
+        is True
+    )
+
+
+def test_should_emit_wake_allows_real_channel_origin_even_if_thread_less():
+    # A genuinely channel-born card (thread-less) whose channel is NOT the Home
+    # fallback is a real origin and should still wake.
+    assert (
+        should_emit_wake(
+            title="research: normal card",
+            sub_thread_id="",
+            sub_chat_id="9999999999",  # a real, non-fallback channel
+            fallback_chat_id="1515879019269197885",
+        )
+        is True
+    )
 
 
 def test_payload_carries_routing_context():
@@ -308,4 +394,147 @@ def test_notifier_skips_bridge_for_unconfigured_kind(tmp_path, monkeypatch):
 
     assert len(adapter.sent) == 1  # done chat ping delivered
     assert calls == []  # but no agent-run bridge for completed
+
+
+# --- Suppress human-facing wakes for internal bookkeeping / no-origin cards ----
+#
+# Two production noise sources this closes (root-caused from card t_4f402284,
+# a `curate: write-time sweep @ 9c63aa9` card that posted 992 chars to Casey's
+# Home channel): a write-time-sweep bookkeeping card, and any card with no real
+# origin whose wake falls back to the Home channel. Both must NOT fire the
+# agent-run wake, while the chat-ping accounting is unaffected.
+
+# The notifier's default fallback (Home) channel — see _resolve_transition_cfg's
+# kanban.notify_fallback.chat_id default. A thread-less sub pointed here is a
+# synthesized no-origin fallback, not a human origin.
+_HOME_FALLBACK_CHAT_ID = "1515879019269197885"
+
+
+def test_notifier_suppresses_wake_for_write_time_sweep_card(tmp_path, monkeypatch):
+    """A `curate: write-time sweep @ <sha>` card fires the chat ping but NOT the
+    agent-run wake — internal OKF bookkeeping never wakes a human channel, even
+    when the card carries an (accidental) origin subscription."""
+    db_path = tmp_path / "emit-sweep.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _enable_emit(monkeypatch)  # default emit_kinds == ("blocked",)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="curate: write-time sweep @ 9c63aa9", assignee="avram",
+        )
+        # A real (non-Home) origin sub — proves the suppression is by CARD CLASS,
+        # not merely by the no-origin fallback path.
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            notifier_profile="default",
+        )
+        kb.block_task(conn, tid, reason="internal sweep bookkeeping")
+    finally:
+        conn.close()
+
+    calls = []
+
+    async def fake_emit(cfg, payload, secret):
+        calls.append(payload)
+        return True
+
+    monkeypatch.setattr(
+        "gateway.kanban_transition_emit.emit_transition", fake_emit
+    )
+
+    adapter = _RecordingAdapter()
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    # Chat-ping accounting is unaffected; the human-facing agent-run wake is
+    # suppressed at the source.
+    assert len(adapter.sent) == 1
+    assert calls == [], "a write-time-sweep card must not fire a human-facing wake"
+
+
+def test_notifier_suppresses_wake_for_home_fallback_no_origin_card(
+    tmp_path, monkeypatch
+):
+    """A card whose ONLY subscription is a thread-less Home-fallback sub has no
+    real human origin: no origin => no human post. The agent-run wake must not
+    fire to Home."""
+    db_path = tmp_path / "emit-home-fallback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _enable_emit(monkeypatch)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="some no-origin bookkeeping card", assignee="worker",
+        )
+        # Thread-less sub pointed at the Home fallback channel — the synthesized
+        # no-origin fallback the notifier persists for a sub-less transition.
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram",
+            chat_id=_HOME_FALLBACK_CHAT_ID,
+            notifier_profile="default",
+        )
+        kb.block_task(conn, tid, reason="no human origin")
+    finally:
+        conn.close()
+
+    calls = []
+
+    async def fake_emit(cfg, payload, secret):
+        calls.append(payload)
+        return True
+
+    monkeypatch.setattr(
+        "gateway.kanban_transition_emit.emit_transition", fake_emit
+    )
+
+    adapter = _RecordingAdapter()
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    assert len(adapter.sent) == 1  # chat ping still delivered
+    assert calls == [], "a no-origin card must not fire a wake to the Home channel"
+
+
+def test_notifier_still_fires_wake_for_real_origin_card(tmp_path, monkeypatch):
+    """Regression guard: a genuinely origin-born card (real, non-Home channel)
+    STILL fires the agent-run wake — the suppression must not break the working
+    synopsis / commissioning wake path."""
+    db_path = tmp_path / "emit-real-origin.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _enable_emit(monkeypatch)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="curate: audit & steward the intent-driven-development brief",
+            assignee="avram",
+        )
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="real-thread-chat",
+            notifier_profile="default",
+        )
+        kb.block_task(conn, tid, reason="awaiting-casey-signoff: merge PR #99")
+    finally:
+        conn.close()
+
+    calls = []
+
+    async def fake_emit(cfg, payload, secret):
+        calls.append(payload)
+        return True
+
+    monkeypatch.setattr(
+        "gateway.kanban_transition_emit.emit_transition", fake_emit
+    )
+
+    adapter = _RecordingAdapter()
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert len(calls) == 1, "a real origin-born card must still fire its wake"
+    assert calls[0]["task_id"] == tid
 
