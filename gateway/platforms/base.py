@@ -2200,38 +2200,60 @@ def resolve_channel_skills(
     (useful for forum threads / Slack threads inheriting the parent channel's
     binding).
 
+    Accumulates skills from *every* matching binding entry (not just the first),
+    so the legacy multi-entry form (several entries sharing one id) loads all of
+    them instead of silently dropping every entry after the first. Channel-id
+    matches are ordered ahead of parent-id (thread) matches; within that,
+    declaration order is preserved and names are de-duplicated (first
+    occurrence wins).
+
     Returns a deduplicated list of skill names (order preserved), or None if
     no match is found.
     """
     bindings = config_extra.get("channel_skill_bindings") or []
     if not isinstance(bindings, list) or not bindings:
         return None
-    ids_to_check: set[str] = set()
-    if channel_id:
-        ids_to_check.add(str(channel_id))
-    if parent_id:
-        ids_to_check.add(str(parent_id))
-    if not ids_to_check:
+    channel_key = str(channel_id) if channel_id else None
+    parent_key = str(parent_id) if parent_id else None
+    if not channel_key and not parent_key:
         return None
+
+    def _entry_skills(entry: dict) -> list[str]:
+        """Normalize an entry's ``skills``/``skill`` field to a list of
+        non-empty, stripped skill names (order preserved)."""
+        raw = entry.get("skills") or entry.get("skill")
+        if isinstance(raw, str):
+            s = raw.strip()
+            return [s] if s else []
+        if isinstance(raw, list):
+            names: list[str] = []
+            for name in raw:
+                if not isinstance(name, str):
+                    continue
+                nm = name.strip()
+                if nm:
+                    names.append(nm)
+            return names
+        return []
+
+    # Collect channel-id matches first, then parent-id matches, so channel
+    # bindings take precedence in the merged order.
+    channel_skills: list[str] = []
+    parent_skills: list[str] = []
     for entry in bindings:
         if not isinstance(entry, dict):
             continue
         entry_id = str(entry.get("id", ""))
-        if entry_id in ids_to_check:
-            skills = entry.get("skills") or entry.get("skill")
-            if isinstance(skills, str):
-                s = skills.strip()
-                return [s] if s else None
-            if isinstance(skills, list) and skills:
-                seen: list[str] = []
-                for name in skills:
-                    if not isinstance(name, str):
-                        continue
-                    nm = name.strip()
-                    if nm and nm not in seen:
-                        seen.append(nm)
-                return seen or None
-    return None
+        if channel_key and entry_id == channel_key:
+            channel_skills.extend(_entry_skills(entry))
+        elif parent_key and entry_id == parent_key:
+            parent_skills.extend(_entry_skills(entry))
+
+    seen: list[str] = []
+    for name in (*channel_skills, *parent_skills):
+        if name not in seen:
+            seen.append(name)
+    return seen or None
 
 
 def _strip_media_directives(text: str) -> str:
