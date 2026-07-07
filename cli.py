@@ -15903,19 +15903,30 @@ def main(
                         # ``rate_limited`` exit and releases the task back to
                         # ``ready`` WITHOUT incrementing the failure counter, so a
                         # 5-hour quota window can't trip the circuit breaker and
-                        # permanently block the card. Non-kanban runs keep the
+                        # permanently block the card.
+                        #
+                        # A sibling case: when the run failed purely because the
+                        # model endpoint was transiently unreachable
+                        # (APIConnectionError / connection-refused / provider 5xx
+                        # → classified ``timeout`` / ``overloaded`` /
+                        # ``server_error`` / ``upstream_rate_limit`` after the
+                        # in-process retries were exhausted), exit with the
+                        # EX_UNAVAILABLE sentinel. The dispatcher maps that to a
+                        # ``transient`` exit and requeues WITHOUT counting a
+                        # failure, so an infra blip doesn't ``gave_up`` a card
+                        # that would otherwise succeed. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
+                            if os.environ.get("HERMES_KANBAN_TASK"):
                                 try:
                                     from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+                                        kanban_worker_exit_code as _kb_exit,
                                     )
-                                    _exit_code = _RL_CODE
+                                    _exit_code = _kb_exit(
+                                        result.get("failure_reason")
+                                    )
                                 except Exception:
                                     _exit_code = 1
                         sys.exit(_exit_code)

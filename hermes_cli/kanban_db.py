@@ -252,6 +252,59 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
 
+# Sentinel exit code a kanban worker uses to signal "I bailed because the
+# model endpoint was transiently unreachable (APIConnectionError /
+# connection-refused / provider 5xx), not because the task failed." The
+# dispatcher's reap classifier maps this to a ``transient`` exit kind so
+# ``detect_crashed_workers`` can release the task back to ``ready`` WITHOUT
+# counting a failure (an environmental flake must never trip the circuit
+# breaker — the whole point is that a proxy blip doesn't ``gave_up`` a card
+# that would otherwise succeed). Distinct from the rate-limit sentinel so the
+# board history / observability can tell a quota wall from an infra flake.
+# 69 == BSD ``EX_UNAVAILABLE`` (sysexits.h) — "service unavailable", exactly
+# a transiently-unreachable dependency, and well clear of both the 0/1/2 codes
+# the worker uses for success / generic failure / usage error and the
+# rate-limit sentinel (75).
+KANBAN_TRANSIENT_EXIT_CODE = 69
+
+
+# Failure-reason values (``FailoverReason`` / agent result ``failure_reason``)
+# that mean "the run died on a transient infra flake reaching the model
+# endpoint, not a task defect" — an APIConnectionError / connection-refused /
+# provider 5xx that exhausted the in-process retries. A kanban worker exits
+# with ``KANBAN_TRANSIENT_EXIT_CODE`` for these so the dispatcher requeues the
+# card WITHOUT counting a failure. ``rate_limit`` / ``billing`` are handled
+# separately (the rate-limit sentinel) — they are quota walls, not infra
+# flakes, and get their own cooldown-stamped requeue path.
+KANBAN_TRANSIENT_FAILURE_REASONS = frozenset({
+    "timeout",
+    "overloaded",
+    "server_error",
+    "upstream_rate_limit",
+})
+
+
+def kanban_worker_exit_code(failure_reason: "Optional[str]") -> int:
+    """Map a failed kanban worker's ``failure_reason`` to its process exit code.
+
+    Single source of truth for the worker-side sentinel selection (used by the
+    ``hermes`` CLI's kanban worker path) so the dispatcher's reap classifier
+    and the worker never disagree on which failures are benign requeues:
+
+    * ``rate_limit`` / ``billing`` → ``KANBAN_RATE_LIMIT_EXIT_CODE`` (quota
+      wall — requeue, no failure counted).
+    * a transient infra reason (see ``KANBAN_TRANSIENT_FAILURE_REASONS``) →
+      ``KANBAN_TRANSIENT_EXIT_CODE`` (endpoint blip — requeue, no failure
+      counted).
+    * anything else → ``1`` (a genuine task failure the breaker should count).
+    """
+    if failure_reason in ("rate_limit", "billing"):
+        return KANBAN_RATE_LIMIT_EXIT_CODE
+    if failure_reason in KANBAN_TRANSIENT_FAILURE_REASONS:
+        return KANBAN_TRANSIENT_EXIT_CODE
+    return 1
+
+
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
 
@@ -6637,6 +6690,13 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    transient: list[str] = field(default_factory=list)
+    """Task ids whose workers bailed on a transient endpoint-unreachable
+    failure (EX_UNAVAILABLE sentinel exit: APIConnectionError /
+    connection-refused / provider 5xx) and were released back to ``ready``
+    WITHOUT counting a failure. Like ``rate_limited`` these never trip the
+    breaker — an infra flake must not ``gave_up`` a card that would otherwise
+    succeed; the respawn guard spaces the retry on a cooldown."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -6695,6 +6755,13 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"transient"`` — ``WIFEXITED`` with status
+      ``KANBAN_TRANSIENT_EXIT_CODE``. The worker bailed because the model
+      endpoint was transiently unreachable (APIConnectionError /
+      connection-refused / provider 5xx), NOT because the task failed. Like
+      the rate-limit case, ``detect_crashed_workers`` releases the task back
+      to ``ready`` without counting a failure so an infra flake can't trip
+      the breaker; the respawn guard then spaces the retry on a cooldown.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -6716,6 +6783,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_TRANSIENT_EXIT_CODE:
+                return ("transient", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -7323,6 +7392,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    # Transient (endpoint-unreachable) requeues — like rate_limited, a benign
+    # no-op release that does NOT count a failure. Surfaced via a side-channel
+    # so an infra flake never appears as a crash in the board history.
+    transient: list[str] = []
     # Provably-done clean exits (rc=0 without a terminal verb, but the lane
     # work already landed) — a benign no-op release, neither a crash nor a
     # failure. Surfaced via a side-channel for observability, like
@@ -7415,22 +7488,37 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            transient_exit = False
             clean_exit_after_done = False
-            if kind == "clean_exit" and _lane_work_provably_done(conn, row["id"]):
-                # Worker returned 0 without a terminal verb, BUT the lane's
-                # work is provably done (a prior completed run, or a PR URL /
-                # ready-for-review handoff in a recent comment). This is the
-                # completed-but-un-signposted exit — indistinguishable at the
-                # row level from a real protocol violation, but NOT a failure:
-                # counting it trips a FALSE ``gave_up`` and strands a finished
-                # card in ``blocked``. Treat it as a benign no-op: release the
-                # task (a later tick / the respawn guard's recent_success /
-                # active_pr check handles it) and do NOT count a failure —
-                # mirroring the rate-limited carve-out below.
+            if kind in ("clean_exit", "unknown") and _lane_work_provably_done(
+                conn, row["id"]
+            ):
+                # Worker's task is still ``running`` but the lane's work is
+                # provably done (a prior completed run, or a PR URL /
+                # ready-for-review handoff in a recent comment). Two reap
+                # shapes reach here:
+                #   * ``clean_exit`` — rc=0 captured in the reap registry
+                #     (the exit the worker itself made), and
+                #   * ``unknown`` — the worker's exit was NOT captured (reaped
+                #     by init, or gone between the reap tick and this liveness
+                #     check), so it would otherwise fall into the generic
+                #     "pid not alive" → ``crashed`` branch below.
+                # Both are the completed-but-un-signposted exit —
+                # indistinguishable at the row level from a real crash /
+                # protocol violation, but NOT a failure: counting either trips
+                # a FALSE ``gave_up`` and strands a finished card (a draft-PR
+                # handoff, an edit-in-place card). Treat it as a benign no-op:
+                # release the task (a later tick / the respawn guard's
+                # recent_success / active_pr check handles it) and do NOT count
+                # a failure — mirroring the rate-limited carve-out below.
                 protocol_violation = False
                 clean_exit_after_done = True
+                _how = (
+                    "cleanly (rc=0)" if kind == "clean_exit"
+                    else "without a captured status (pid not alive)"
+                )
                 error_text = (
-                    f"pid {pid} exited cleanly (rc=0) after its lane work was "
+                    f"pid {pid} exited {_how} after its lane work was "
                     f"provably done — benign no-op, not counted as a failure"
                 )
                 event_kind = "clean_exit_after_done"
@@ -7438,6 +7526,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
+                    "exit_kind": kind,
                 }
             elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -7470,6 +7559,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     f"requeued without counting a failure"
                 )
                 event_kind = "rate_limited"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
+            elif kind == "transient":
+                # Worker bailed because the model endpoint was transiently
+                # unreachable (EX_UNAVAILABLE sentinel: APIConnectionError /
+                # connection-refused / provider 5xx that exhausted the
+                # in-process retries). This is NOT a task failure — the task is
+                # fine, the infra just blipped. Release it back to ``ready`` so
+                # the respawn guard defers it on a short cooldown, and crucially
+                # do NOT count a failure (skip ``_record_task_failure``) so a
+                # transient flake can't trip the circuit breaker and ``gave_up``
+                # a card that would otherwise succeed. Mirrors the rate-limit
+                # carve-out; kept a DISTINCT kind/outcome so the board history
+                # can tell an infra flake from a quota wall.
+                protocol_violation = False
+                transient_exit = True
+                error_text = (
+                    f"pid {pid} exited transient (endpoint unreachable) — "
+                    f"requeued without counting a failure"
+                )
+                event_kind = "transient"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
@@ -7520,12 +7633,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (restore_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues and provably-done clean exits are a
-                # clean release, not a crash — record the run outcome
-                # accordingly so the board history doesn't show a phantom crash
-                # for a quota wall or a completed-but-un-signposted exit.
+                # Rate-limited / transient requeues and provably-done clean
+                # exits are a clean release, not a crash — record the run
+                # outcome accordingly so the board history doesn't show a
+                # phantom crash for a quota wall, an infra flake, or a
+                # completed-but-un-signposted exit.
                 if rate_limited_exit:
                     _run_outcome = "rate_limited"
+                elif transient_exit:
+                    _run_outcome = "transient"
                 elif clean_exit_after_done:
                     _run_outcome = "clean_exit_after_done"
                 else:
@@ -7552,6 +7668,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif transient_exit:
+                    # Stamp the failure-error column so ``check_respawn_guard``
+                    # applies the cooldown and spaces the retry — WITHOUT
+                    # touching ``consecutive_failures`` (no breaker trip on an
+                    # infra flake). Same shape as the rate-limit path.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    transient.append(row["id"])
                 elif clean_exit_after_done:
                     # Benign no-op: the lane work already landed. Do NOT stamp
                     # ``last_failure_error`` and do NOT add to ``crash_details``
@@ -7609,6 +7735,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Same side-channel for transient (endpoint-unreachable) requeues — these
+    # did NOT count a failure and are NOT crashes, so they stay out of the
+    # ``crashed`` return; an infra flake never trips the breaker.
+    detect_crashed_workers._last_transient = transient  # type: ignore[attr-defined]
     # Same side-channel for provably-done clean exits — benign no-ops that did
     # NOT count a failure and are NOT crashes; kept out of the ``crashed``
     # return so a completed card is never falsely stranded.
@@ -7958,16 +8088,18 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # rate-limited or auth-blocked reviewer should defer like any other spawn.
     is_review = row["status"] == "review"
 
-    # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
-    #    (quota wall) — defer while inside the cooldown window, then allow a
-    #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
-    #    rate-limit requeue stamps a quota-flavored last_failure_error that
-    #    the regex would otherwise match → defer forever (no failure counter
-    #    increment on this path means the breaker can never free it).
+    # 1. Rate-limit / transient cooldown. The most recent run ended
+    #    ``rate_limited`` (quota wall) or ``transient`` (endpoint unreachable)
+    #    — both are benign requeues that did NOT count a failure. Defer while
+    #    inside the cooldown window, then allow a cheap probe. Must run BEFORE
+    #    the blocker_auth regex check, because these paths stamp a
+    #    quota/infra-flavored last_failure_error that the regex would otherwise
+    #    match → defer forever (no failure counter increment on these paths
+    #    means the breaker can never free the card).
     #
     #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
-    #    newer crash/completion superseded the rate-limit run, this guard
-    #    no longer applies and the normal paths take over.
+    #    newer crash/completion superseded the requeue run, this guard no
+    #    longer applies and the normal paths take over.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
@@ -7977,20 +8109,20 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ).fetchone()
     if (
         latest_run is not None
-        and latest_run["outcome"] == "rate_limited"
+        and latest_run["outcome"] in ("rate_limited", "transient")
     ):
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, and skip the
-            # blocker_auth regex so the stamped rate-limit text doesn't
+            # blocker_auth regex so the stamped requeue text doesn't
             # re-trap the task.
             return None
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
             return "rate_limit_cooldown"
         # Cooldown elapsed — allow the respawn. Return early so the
-        # blocker_auth check below doesn't catch the rate-limit text we
+        # blocker_auth check below doesn't catch the requeue text we
         # stamped on the task; this path intentionally retries forever
-        # (cheaply, spaced by the cooldown) until quota returns or a real
+        # (cheaply, spaced by the cooldown) until the wall clears or a real
         # crash/completion supersedes it.
         return None
 
@@ -8292,6 +8424,14 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Transient (endpoint-unreachable) requeues (no failure counted) — surface
+    # for telemetry / tests. These tasks went back to ``ready`` and the respawn
+    # guard defers them on a cooldown until the infra flake clears.
+    _crash_transient = getattr(
+        detect_crashed_workers, "_last_transient", []
+    )
+    if _crash_transient:
+        result.transient.extend(_crash_transient)
     result.timed_out = enforce_max_runtime(conn)
     # Auto-route reviewer review-changes-requested blocks back to the author
     # (close the reviewer→author hop the GitHub webhook can't when reviewer and

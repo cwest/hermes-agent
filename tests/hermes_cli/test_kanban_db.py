@@ -1568,6 +1568,346 @@ def test_clean_exit_without_proof_still_protocol_violation(
         assert "gave_up" in kinds, kinds
 
 
+# ---------------------------------------------------------------------------
+# Sibling path (#47 missed): the "pid not alive" / ``unknown`` reap path.
+#
+# #47 carved out the provably-done case for a reap-registry ``clean_exit``
+# (rc=0 captured). But when the worker's exit is NOT in the reap registry —
+# reaped by init, or gone between the reap tick and the liveness check —
+# ``_classify_worker_exit`` returns ``unknown`` and ``detect_crashed_workers``
+# falls into the generic "pid not alive" → ``crashed`` branch, which counts a
+# failure. A worker that finished its lane cleanly (draft-PR handoff /
+# edit-in-place card) but whose exit wasn't captured is thus STILL falsely
+# flagged ``crashed`` → ``gave_up``. The provably-done carve-out must cover the
+# ``unknown`` path too, using the same durable proof signals.
+# ---------------------------------------------------------------------------
+
+
+def _stage_unknown_exit(conn, kb_mod, tid, pid):
+    """Point ``tid`` at a dead host-local pid with NO reap record.
+
+    ``_classify_worker_exit`` returns ``("unknown", None)`` for a pid absent
+    from the reap registry — the "pid not alive" branch. Mirrors a worker
+    reaped by init before the dispatcher captured its exit status.
+    """
+    host = kb_mod._claimer_id().split(":", 1)[0]
+    kb.claim_task(conn, tid, claimer=f"{host}:w")
+    conn.execute(
+        "UPDATE tasks SET worker_pid = ?, consecutive_failures = 0 WHERE id = ?",
+        (pid, tid),
+    )
+    conn.commit()
+    # Deliberately do NOT call _record_worker_exit → classified "unknown".
+
+
+def test_unknown_exit_after_completed_run_not_counted_as_failure(
+    kanban_home, monkeypatch,
+):
+    """"pid not alive" (unknown reap) after a completed run within the guard
+    window → benign no-op, not a crash. This is the sibling of the #47
+    clean_exit carve-out on the reap-miss path: a card whose worker finished
+    cleanly but was reaped out-of-band must never be falsely stranded.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="done-unknown-exit", assignee="a")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (tid, now - 120, now - 60),
+        )
+        conn.commit()
+
+        _stage_unknown_exit(conn, _kb, tid, 66001)
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid not in crashed, (
+            "unknown exit after a completed run must not be treated as a crash"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            f"provably-done unknown exit should release ready, got {task.status}"
+        )
+        assert task.consecutive_failures == 0, (
+            "provably-done unknown exit must not increment the failure counter, "
+            f"got {task.consecutive_failures}"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "crashed" not in kinds, (
+            f"provably-done unknown exit must not emit a crashed event, got {kinds}"
+        )
+        assert "gave_up" not in kinds, (
+            f"provably-done unknown exit must not trip the breaker, got {kinds}"
+        )
+        cead = getattr(
+            _kb.detect_crashed_workers, "_last_clean_exit_after_done", []
+        )
+        assert tid in cead, (
+            "provably-done unknown exit should be surfaced via the "
+            "clean_exit_after_done side-channel"
+        )
+
+
+def test_unknown_exit_after_pr_comment_not_counted_as_failure(
+    kanban_home, monkeypatch,
+):
+    """"pid not alive" (unknown reap) with a ready-for-review PR URL in a
+    recent comment → benign no-op, not a crash. This is the exact reported
+    incident shape: a worker correctly declined to kanban_complete a draft PR,
+    ended its run, and the dispatcher logged ``crashed {pid not alive}`` →
+    ``gave_up``.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="draft-pr-unknown-exit", assignee="a")
+        kb.add_comment(
+            conn, tid, "worker",
+            "PR opened (draft): https://github.com/cwest/hermes-agent/pull/358",
+        )
+
+        _stage_unknown_exit(conn, _kb, tid, 66002)
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid not in crashed
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            f"unknown exit after a draft-PR handoff should release ready, "
+            f"got {task.status}"
+        )
+        assert task.consecutive_failures == 0, (
+            "unknown exit after a draft-PR handoff must not count a failure, "
+            f"got {task.consecutive_failures}"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "crashed" not in kinds, kinds
+        assert "gave_up" not in kinds, kinds
+
+
+def test_unknown_exit_without_proof_still_crashes(kanban_home, monkeypatch):
+    """No completion proof → an "unknown" (pid not alive) exit is STILL a
+    genuine crash that counts toward the breaker. The carve-out must not mask
+    a worker that actually died mid-work — a truly dead mid-work worker must
+    still gave_up after the limit (#47 non-regression, on the sibling path).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="dead-midwork", assignee="a")
+
+        for i in range(_kb.DEFAULT_FAILURE_LIMIT):
+            pid = 67000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?", (pid, tid),
+            )
+            conn.commit()
+            # No reap record and no completion proof → real crash.
+            crashed = kb.detect_crashed_workers(conn)
+            assert tid in crashed, f"iter {i}: dead mid-work worker must crash"
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"a repeatedly-dead mid-work worker must gave_up, got {task.status}"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "crashed" in kinds, kinds
+        assert "gave_up" in kinds, kinds
+
+
+# ---------------------------------------------------------------------------
+# Sibling path (#47 missed): transient API / connection failures.
+#
+# A worker whose run dies because the model endpoint was transiently
+# unreachable (APIConnectionError / connection-refused / provider 5xx →
+# classified ``timeout`` / ``overloaded`` / ``server_error``) is an
+# environmental flake, NOT a worker defect. The worker exits with the
+# transient sentinel (EX_UNAVAILABLE, 69), which the dispatcher must classify
+# as ``transient`` and requeue WITHOUT counting a failure — mirroring the
+# rate-limit carve-out — so a proxy blip doesn't gave_up a card that would
+# otherwise succeed. A genuine non-zero crash (not the sentinel) still counts.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_worker_exit_recognizes_transient_sentinel(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    pid = 41337
+    _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_TRANSIENT_EXIT_CODE))
+    kind, code = _kb._classify_worker_exit(pid)
+    assert kind == "transient"
+    assert code == _kb.KANBAN_TRANSIENT_EXIT_CODE
+
+    # The transient sentinel is distinct from the rate-limit sentinel.
+    assert _kb.KANBAN_TRANSIENT_EXIT_CODE != _kb.KANBAN_RATE_LIMIT_EXIT_CODE
+
+    # A plain non-zero exit is still a normal crash, not transient.
+    _kb._record_worker_exit(pid + 1, _exited_status(1))
+    assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
+
+
+def test_kanban_worker_exit_code_maps_failure_reasons(kanban_home):
+    """The worker-side sentinel selector (single source of truth used by the
+    CLI kanban worker path) maps quota walls to the rate-limit sentinel,
+    transient infra flakes to the transient sentinel, and everything else —
+    including a genuine task failure — to a plain 1 the breaker counts.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    # Quota walls → rate-limit sentinel.
+    assert _kb.kanban_worker_exit_code("rate_limit") == _kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert _kb.kanban_worker_exit_code("billing") == _kb.KANBAN_RATE_LIMIT_EXIT_CODE
+
+    # Transient infra flakes (APIConnectionError → timeout, provider 5xx →
+    # overloaded / server_error, upstream throttle) → transient sentinel.
+    for reason in ("timeout", "overloaded", "server_error", "upstream_rate_limit"):
+        assert _kb.kanban_worker_exit_code(reason) == _kb.KANBAN_TRANSIENT_EXIT_CODE, reason
+
+    # Genuine failures and unclassified reasons → plain 1 (breaker counts it).
+    for reason in ("format_error", "content_policy_blocked", "unknown", None, ""):
+        assert _kb.kanban_worker_exit_code(reason) == 1, reason
+
+
+def test_transient_exit_requeues_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """A transient-sentinel exit releases the task to ``ready`` and leaves
+    ``consecutive_failures`` untouched — a transient infra flake must never
+    trip the breaker, even across many hits, so a proxy blip can't gave_up a
+    card that would otherwise succeed.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="transient", assignee="a")
+
+        # Far more hits than DEFAULT_FAILURE_LIMIT (2). If any counted as a
+        # failure the task would be blocked.
+        for i in range(6):
+            pid = 72000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
+                (pid, 0, tid),
+            )
+            conn.commit()
+            _kb._record_worker_exit(
+                pid, _exited_status(_kb.KANBAN_TRANSIENT_EXIT_CODE)
+            )
+
+            crashed = kb.detect_crashed_workers(conn)
+            assert tid not in crashed, f"hit {i}: transient exit is not a crash"
+            transient = getattr(
+                _kb.detect_crashed_workers, "_last_transient", []
+            )
+            assert tid in transient, f"hit {i}: not surfaced as transient"
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"hit {i}: should requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"hit {i}: transient must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "transient" in outcomes
+        assert "crashed" not in outcomes
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "gave_up" not in kinds, kinds
+
+
+def test_transient_carveout_does_not_mask_real_crash(kanban_home, monkeypatch):
+    """Non-regression: a genuine non-zero crash (exit code 1, not the
+    transient sentinel) still counts toward the breaker and trips gave_up —
+    the transient carve-out is surgical, not a blanket "never count crashes".
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="real-crash", assignee="a")
+
+        for i in range(_kb.DEFAULT_FAILURE_LIMIT):
+            pid = 73000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid),
+            )
+            conn.commit()
+            _kb._record_worker_exit(pid, _exited_status(1))
+            crashed = kb.detect_crashed_workers(conn)
+            assert tid in crashed, f"iter {i}: real nonzero crash must count"
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"a repeatedly-crashing worker must gave_up, got {task.status}"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "gave_up" in kinds, kinds
+
+
+def test_respawn_guard_defers_transient_within_cooldown(
+    kanban_home, monkeypatch,
+):
+    """Within the cooldown after a transient requeue the guard defers the
+    respawn; after the cooldown it allows a probe — and does NOT fall into
+    ``blocker_auth`` (which would defer forever). Mirrors the rate-limit
+    cooldown so a transient flake bounces cheaply, then retries.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 6_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="transient-guard", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='transient', status='transient', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited transient (endpoint unreachable) — requeued", tid),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):
