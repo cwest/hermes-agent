@@ -189,14 +189,26 @@ def should_emit_wake(
     A genuinely human-born card — a thread-bearing sub (real origin thread), or a
     thread-less sub on a real, non-fallback channel — is allowed through, so the
     working synopsis / commissioning wakes keep firing to their origin thread.
+
+    Why the no-origin test is structural (``chat == fallback_chat_id``) rather
+    than a read of the ``is_fallback`` flag ``resolve_transition_target`` stamps:
+    that flag lives only on the *synthesized delivery sub* the notifier builds
+    in-memory for the chat-ping path. The wake this gate protects is fired from a
+    *persisted* notify-sub row (``add_notify_sub`` writes a thread-less Home-
+    channel sub the first time a no-origin card has no subscription), and a plain
+    DB row carries no ``is_fallback`` field. On the next tick that persisted row
+    is enumerated as an ordinary sub and feeds the emit-wake path — which is
+    exactly the F3 leak that put a sweep card's wake into Home. Deriving the
+    condition from the row's own shape (no thread + chat is the fallback channel)
+    is what catches that persisted row; the flag would silently miss it.
     """
     if is_sweep_card_title(title):
         return False
     thread = (sub_thread_id or "").strip()
     chat = (sub_chat_id or "").strip()
     fb = (fallback_chat_id or "").strip()
-    # No real thread AND targeting the Home fallback channel => synthesized
-    # no-origin fallback, not a human origin. Suppress the human-facing wake.
+    # No real thread AND targeting the Home fallback channel => synthesized/
+    # persisted no-origin fallback, not a human origin. Suppress the wake.
     if not thread and fb and chat == fb:
         return False
     return True
