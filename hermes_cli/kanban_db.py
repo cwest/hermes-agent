@@ -9603,6 +9603,81 @@ def notifier_delivery_profile() -> str:
         return "default"
 
 
+def parse_origin_session(
+    session_id: Optional[str],
+) -> Optional[tuple[str, str, Optional[str]]]:
+    """Parse a card's origin ``session_id`` into notify-sub columns.
+
+    Returns ``(platform, chat_id, thread_id)`` suitable for :func:`add_notify_sub`,
+    or ``None`` when the string carries no usable origin. This is the shared
+    resolver the CLI ``create`` path and any programmatic ``create_task`` caller
+    use so a card filed with ``--session-id`` registers the SAME notify sub the
+    gateway ``/kanban create`` path and the ``submit_card`` gate materialize —
+    without which per-card transition wakes have no thread-targeted sub to fire
+    from and fall back to the parent channel.
+
+    Two accepted string shapes:
+
+    - A canonical session KEY (what the gateway stamps for a threaded origin):
+      ``agent:main:<platform>:<chat_type>:<chat_id>[:<thread_id>]`` — e.g.
+      ``agent:main:discord:thread:123:123``.
+    - A bare ``<platform>:<chat_id>[:<thread_id>]`` triple — e.g.
+      ``discord:<parent_channel>:<thread>`` (what a hand/webhook filing passes).
+
+    Thread-mirror normalization (the SECONDARY defect): the transition wake key
+    is rebuilt from the sub row's ``chat_id``/``thread_id`` (see
+    ``gateway/platforms/webhook.py::_build_origin_source`` ->
+    ``gateway/session.py::build_session_key``). The live inbound path represents
+    a platform thread with ``chat_id == thread_id`` (a thread IS its own channel;
+    the Discord adapter sets both to the thread id). So when a thread is present
+    the sub's ``chat_id`` is set to the thread id too, ensuring the wake lands on
+    the live inbound thread key ``...:thread:<thread>:<thread>`` and never on the
+    parent-channel session — even when the source string named the parent
+    channel as the middle component.
+    """
+    if not session_id:
+        return None
+    raw = str(session_id).strip()
+    if not raw:
+        return None
+    parts = raw.split(":")
+
+    platform: Optional[str] = None
+    chat_id: Optional[str] = None
+    thread_id: Optional[str] = None
+
+    if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
+        # Canonical session key: agent:main:<platform>:<chat_type>:<chat_id>[:<extra>]
+        platform = parts[2]
+        chat_type = parts[3]
+        chat_id = parts[4]
+        # The 6th element is only an unambiguous thread id for dm/thread keys;
+        # for group/channel it may be a per-user id, so leave thread unset there
+        # (mirrors gateway.run._parse_session_key).
+        if len(parts) > 5 and chat_type in {"dm", "thread"}:
+            thread_id = parts[5]
+    elif len(parts) >= 2:
+        # Bare triple: <platform>:<chat_id>[:<thread_id>]
+        platform = parts[0]
+        chat_id = parts[1]
+        if len(parts) >= 3 and parts[2].strip():
+            thread_id = parts[2]
+    else:
+        return None
+
+    platform = (platform or "").strip()
+    chat_id = (chat_id or "").strip()
+    thread_id = (thread_id or "").strip() or None
+    if not platform or not chat_id:
+        return None
+
+    # Thread-mirror: a thread is its own channel — the live inbound source sets
+    # chat_id == thread_id, so mirror that here so the rebuilt wake key matches.
+    if thread_id:
+        chat_id = thread_id
+    return platform, chat_id, thread_id
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,

@@ -1374,6 +1374,36 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
+        # Register the origin notify subscription so every terminal transition of
+        # this card wakes back to the session/thread it was born in. Without this
+        # a card filed with --session-id records the origin on the task row but
+        # has NO kanban_notify_subs row, so the per-card thread-targeted wake has
+        # nothing to fire from and the channel-level default sub fires instead —
+        # landing the wake in the parent channel (thread=None), never the origin
+        # thread. This mirrors the gateway /kanban create + submit_card gate
+        # paths so CLI-filed and gate-filed cards behave identically. Idempotent
+        # (add_notify_sub is INSERT OR IGNORE) and non-fatal — a subscription
+        # failure must never fail the create.
+        origin = kb.parse_origin_session(getattr(args, "session_id", None) or None)
+        if origin is not None:
+            plat, chat_id, thread_id = origin
+            try:
+                kb.add_notify_sub(
+                    conn,
+                    task_id=task_id,
+                    platform=plat,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    # Own the sub with the profile of the gateway that DELIVERS
+                    # notifications (the canonical resolver), not the creator's —
+                    # else the notifier's owner-profile gate silently drops it.
+                    notifier_profile=kb.notifier_delivery_profile(),
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                print(
+                    f"kanban: warning: could not register origin notify sub: {exc}",
+                    file=sys.stderr,
+                )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
