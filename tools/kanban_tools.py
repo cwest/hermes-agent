@@ -1001,7 +1001,34 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     platform = ""
     chat_id = ""
     try:
-        from gateway.session_context import get_session_env
+        from gateway.session_context import (
+            capture_kanban_origin_from_session,
+            get_session_env,
+        )
+        # Prefer the INHERITED kanban origin over the running process's own
+        # session identity. In a live gateway session these are identical (the
+        # root capture snapshots the live session). But once the workstream
+        # crosses a spawn boundary into a detached context (dispatched worker /
+        # delegate_task / background process / nested create), HERMES_SESSION_*
+        # names the detached run, not the human origin — so a card stamped from
+        # it would have a wake with nowhere real to land. The origin channel
+        # (get_kanban_origin, folded into capture_*) carries the human origin
+        # across that boundary. See gateway/session_context.set_kanban_origin.
+        origin = capture_kanban_origin_from_session()
+        if origin is not None:
+            platform = origin.get("platform") or ""
+            chat_id = origin.get("chat_id") or ""
+            if platform and chat_id:
+                thread_id = origin.get("thread_id") or None
+                user_id = origin.get("user_id") or None
+                from hermes_cli import kanban_db as _kb
+                _kb.add_notify_sub(
+                    conn, task_id=task_id,
+                    platform=platform, chat_id=chat_id,
+                    thread_id=thread_id, user_id=user_id,
+                    notifier_profile=os.environ.get("HERMES_PROFILE"),
+                )
+                return True
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         if not platform or not chat_id:
@@ -1132,6 +1159,68 @@ def _handle_link(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_link failed")
         return tool_error(f"kanban_link: {e}")
+
+
+def _handle_reassign_origin(args: dict, **kw) -> str:
+    """Re-point a card's origin (its notify-sub) to a new delivery surface.
+
+    Lets an orchestrator that mints a new thread for a fork designate it the
+    origin for all future wakes on that card. Beyond re-pointing the card's
+    notify-sub via ``reassign_task_origin``, this refreshes the caller's
+    ``HERMES_KANBAN_ORIGIN`` so any child card created *after* this call inherits
+    the reassigned surface too.
+    """
+    tid = args.get("task_id")
+    platform = str(args.get("platform") or "").strip()
+    chat_id = str(args.get("chat_id") or "").strip()
+    if not tid:
+        return tool_error("task_id is required")
+    if not platform or not chat_id:
+        return tool_error("platform and chat_id are required")
+    thread_id = args.get("thread_id")
+    thread_id = str(thread_id).strip() or None if thread_id else None
+    user_id = args.get("user_id")
+    user_id = str(user_id).strip() or None if user_id else None
+    include_descendants = bool(args.get("include_descendants") or False)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            row = kb.reassign_task_origin(
+                conn,
+                task_id=str(tid),
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                notifier_profile=kb.notifier_delivery_profile(),
+                include_descendants=include_descendants,
+            )
+        finally:
+            conn.close()
+        # Refresh the caller's origin so subsequently-created child cards inherit
+        # the reassigned surface (the fork's new thread), not the old one.
+        try:
+            from gateway.session_context import set_kanban_origin
+            set_kanban_origin(
+                platform=platform, chat_id=chat_id,
+                thread_id=thread_id, user_id=user_id,
+            )
+        except Exception:
+            logger.warning("reassign_origin: failed to refresh context origin", exc_info=True)
+        return _ok(
+            task_id=str(tid),
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            include_descendants=include_descendants,
+            row=row,
+        )
+    except ValueError as e:
+        return tool_error(f"kanban_reassign_origin: {e}")
+    except Exception as e:
+        logger.exception("kanban_reassign_origin failed")
+        return tool_error(f"kanban_reassign_origin: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1621,6 +1710,50 @@ KANBAN_LINK_SCHEMA = {
 }
 
 
+KANBAN_REASSIGN_ORIGIN_SCHEMA = {
+    "name": "kanban_reassign_origin",
+    "description": (
+        "Re-point a card's ORIGIN — the concrete delivery surface its "
+        "transition wakes and completion notifications route to — to a new "
+        "(platform, chat_id, thread_id). Use when a workstream forks and you "
+        "mint a fresh thread that should own all future wakes for that card: "
+        "this atomically replaces the card's notify-subscription for that "
+        "platform (preserving any other-platform fan-out) and seeds the new "
+        "subscription so NO back-history is replayed. It also refreshes the "
+        "current session's inherited origin, so child cards you create AFTER "
+        "this call inherit the new surface too. Idempotent: re-pointing to the "
+        "surface a card already has is a no-op."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Card whose origin to re-point."},
+            "platform": {
+                "type": "string",
+                "description": "Delivery platform (e.g. 'discord', 'telegram').",
+            },
+            "chat_id": {"type": "string", "description": "Destination chat/channel id."},
+            "thread_id": {
+                "type": "string",
+                "description": "Destination thread id within the channel (omit for a channel-level origin).",
+            },
+            "user_id": {
+                "type": "string",
+                "description": "Optional participant id for per-user-isolated group chats.",
+            },
+            "include_descendants": {
+                "type": "boolean",
+                "description": (
+                    "When true, also re-point every descendant card linked under "
+                    "this one — 'move the whole fork to the new thread'. Default false."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "platform", "chat_id"],
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -1704,4 +1837,13 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_reassign_origin",
+    toolset="kanban",
+    schema=KANBAN_REASSIGN_ORIGIN_SCHEMA,
+    handler=_handle_reassign_origin,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🎯",
 )

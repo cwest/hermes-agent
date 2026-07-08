@@ -9225,6 +9225,25 @@ def _default_spawn(
         env["GIT_COMMITTER_NAME"] = _git_name
         env["GIT_COMMITTER_EMAIL"] = _git_email
 
+    # Seed the kanban ORIGIN so any card the worker creates re-inherits the human
+    # origin of this workstream, not the detached worker's own (contextless)
+    # session. The worker is a fresh subprocess; without this, a nested
+    # kanban_create would stamp an inert origin and its wakes would have nowhere
+    # to land. Read the card's origin notify-sub and pass it through the
+    # inheritable HERMES_KANBAN_ORIGIN channel (see gateway/session_context and
+    # kanban_db.worker_origin_env). Best-effort: a card with no routable origin
+    # sub leaves the worker as a plain detached context.
+    try:
+        _conn = connect(board=board)
+        try:
+            _origin_blob = worker_origin_env(_conn, task.id)
+        finally:
+            _conn.close()
+        if _origin_blob:
+            env["HERMES_KANBAN_ORIGIN"] = _origin_blob
+    except Exception:
+        _log.debug("worker origin seed failed for %s", task.id, exc_info=True)
+
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
@@ -9743,6 +9762,42 @@ def notifier_delivery_profile() -> str:
         return "default"
 
 
+def worker_origin_env(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the ``HERMES_KANBAN_ORIGIN`` seed for a dispatched worker.
+
+    The dispatcher spawns a worker as a detached subprocess whose own session is
+    contextless. So any card the worker creates would, without help, stamp an
+    inert origin. This reads the card's origin ``kanban_notify_subs`` row and
+    encodes it as the JSON blob the worker inherits via ``HERMES_KANBAN_ORIGIN``,
+    so descendant cards re-inherit the human origin (design §3.1 point 2).
+
+    Selection: prefer a thread-bearing sub over a bare-channel one (a thread is
+    the most specific delivery surface); skip ``tui`` subs (a local single-UI
+    channel, not a routable chat surface an autonomous wake can address). Returns
+    ``None`` when the card has no routable origin sub — the worker then behaves as
+    a plain detached context (no origin to inherit).
+    """
+    rows = [dict(r) for r in list_notify_subs(conn, task_id)]
+    routable = [
+        r for r in rows
+        if (r.get("platform") or "") and (r.get("platform") != "tui")
+        and (r.get("chat_id") or "")
+    ]
+    if not routable:
+        return None
+    # Prefer a thread-bearing origin (most specific surface).
+    routable.sort(key=lambda r: 0 if (r.get("thread_id") or "").strip() else 1)
+    best = routable[0]
+    blob = {
+        "platform": best.get("platform"),
+        "chat_id": best.get("chat_id"),
+        "thread_id": (best.get("thread_id") or "").strip() or None,
+        "user_id": best.get("user_id") or None,
+        "session_id": None,
+    }
+    return json.dumps(blob)
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -9840,6 +9895,117 @@ def remove_notify_sub(
             (task_id, platform, chat_id, thread_id or ""),
         )
     return cur.rowcount > 0
+
+
+def reassign_task_origin(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    include_descendants: bool = False,
+) -> dict:
+    """Atomically re-point a card's origin for ``platform`` to a new surface.
+
+    When a workstream forks, an orchestrator mints a new thread and designates it
+    the origin for future wakes. This replaces the card's existing
+    ``kanban_notify_subs`` row(s) **for that platform** with exactly one new
+    ``(platform, chat_id, thread_id)`` row.
+
+    Two properties that make this correct:
+
+    - **Same-platform only.** Deleting only the rows for ``platform`` preserves a
+      multi-platform fan-out (e.g. a telegram sub survives a discord re-point) and
+      sidesteps the thread-less MISROUTE guard in :func:`add_notify_sub` (that
+      guard only blocks *adds* against an existing thread-bearing row; the
+      delete+insert here has no such conflict).
+    - **No history replay.** The new row's ``last_event_id`` is seeded to the
+      task's latest existing event id, so a transition wake *after* the re-point
+      fires only on strictly-future events — a re-point never floods the new
+      thread with the card's back-history.
+
+    Idempotent: re-pointing to the surface the card already has is a no-op — the
+    existing row (and its live cursor) is left untouched, never rewound.
+
+    ``include_descendants`` optionally walks the card's child links and repoints
+    each the same way ("move the whole fork to the new thread"). Ships behind this
+    flag; default single-card.
+
+    Returns the new (or unchanged) origin row as a dict.
+    """
+    thread_norm = (thread_id or "").strip() or None
+
+    def _reassign_one(tid: str) -> dict:
+        with write_txn(conn):
+            # D2 idempotency: if the exact target row already exists, no-op.
+            # Do NOT delete+reinsert — that would rewind the live cursor and
+            # replay history the existing sub has already delivered.
+            existing = conn.execute(
+                """
+                SELECT * FROM kanban_notify_subs
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                """,
+                (tid, platform, chat_id, thread_norm or ""),
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+
+            # Seed the new cursor to the task's latest event id so the re-point
+            # never replays back-history onto the new surface.
+            row = conn.execute(
+                "SELECT MAX(id) AS max_id FROM task_events WHERE task_id = ?",
+                (tid,),
+            ).fetchone()
+            seed = int(row["max_id"]) if row and row["max_id"] is not None else 0
+
+            # Drop every existing same-platform sub (the old origin thread[s]).
+            conn.execute(
+                "DELETE FROM kanban_notify_subs WHERE task_id = ? AND platform = ?",
+                (tid, platform),
+            )
+            now = int(time.time())
+            conn.execute(
+                """
+                INSERT INTO kanban_notify_subs
+                    (task_id, platform, chat_id, thread_id, user_id, notifier_profile, last_event_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (tid, platform, chat_id, thread_norm or "", user_id,
+                 notifier_profile, seed, now),
+            )
+            new_row = conn.execute(
+                """
+                SELECT * FROM kanban_notify_subs
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                """,
+                (tid, platform, chat_id, thread_norm or ""),
+            ).fetchone()
+            return dict(new_row) if new_row is not None else {}
+
+    result = _reassign_one(task_id)
+
+    if include_descendants:
+        # Walk child links breadth-first and repoint each descendant.
+        seen: set[str] = {task_id}
+        frontier = [task_id]
+        while frontier:
+            parent = frontier.pop()
+            child_rows = conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ?",
+                (parent,),
+            ).fetchall()
+            for cr in child_rows:
+                child = cr["child_id"]
+                if child in seen:
+                    continue
+                seen.add(child)
+                frontier.append(child)
+                _reassign_one(child)
+
+    return result
 
 
 def unseen_events_for_sub(

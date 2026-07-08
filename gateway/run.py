@@ -8424,6 +8424,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reset_session_vars()
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
+        # Symmetric leak guard for the kanban origin channel: drop any origin
+        # inherited into this task's ContextVar from a concurrent sibling (the
+        # same copy_context window as above). The live turn rebinds its own
+        # origin in _set_session_env; a legitimately-inherited worker origin
+        # rides the os.environ mirror (untouched here) across the spawn boundary.
+        try:
+            from gateway.session_context import reset_kanban_origin
+            reset_kanban_origin()
+        except Exception:
+            logger.debug("reset_kanban_origin failed at handler entry", exc_info=True)
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
@@ -14233,7 +14243,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        return set_session_vars(
+        tokens = set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
@@ -14244,6 +14254,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             async_delivery=_async_delivery,
         )
+        # ROOT capture of the kanban origin: a live gateway turn is authoritative
+        # for the origin any card it (or a subprocess it spawns) creates. This
+        # rebinds the origin from the just-bound live session, overriding a
+        # sibling value that leaked into this task's ContextVar (already reset to
+        # _UNSET at handler entry). It is what lets a wake for work spawned by
+        # this turn route back to the exact surface the work came from. See
+        # gateway/session_context.capture_root_origin_if_absent.
+        try:
+            from gateway.session_context import capture_root_origin_if_absent
+            capture_root_origin_if_absent()
+        except Exception:
+            logger.debug("capture_root_origin_if_absent failed at session bind", exc_info=True)
+        return tokens
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
