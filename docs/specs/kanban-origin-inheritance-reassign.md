@@ -1,6 +1,6 @@
 # Spec: Kanban origin inheritance + reassignability
 
-Status: draft (design gate — review before TDD)
+Status: implemented (design gate approved; TDD complete)
 Base: `cwest/integration` @ `45a2a2aeb`
 Card: t_81acbc3c
 Scope: origin **inheritance** (C) + **reassignability** (D). The active-origin
@@ -197,10 +197,14 @@ Behaviour-contract tests, not snapshots. Resolution ORDER and invariants:
   (row unchanged, cursor not rewound).
 - **D3 (fork inheritance after reassign):** after `kanban_reassign_origin`, a
   newly created child card inherits the reassigned surface.
-- **E2E:** temp `HERMES_HOME`, real notifier tick + a simulated live origin
-  session; assert an inherited-origin card's wake enters the origin session's
-  turn loop (owning-adapter dispatch), and a reassigned card's wake lands on the
-  new thread.
+- **E2E:** temp `HERMES_HOME` exercising the real chain end to end —
+  ``worker_origin_env`` (dispatcher seed) → real ``kanban_create`` in a detached
+  worker session (foreign ``HERMES_SESSION_*``) → real ``_maybe_auto_subscribe``
+  stamps the inherited origin → real ``build_transition_payload`` reads that sub
+  → assert the transition-wake body routes to the inherited origin thread; and a
+  reassigned card's wake body routes to the new thread. (Asserts the wake's
+  resolved delivery target, which is the observable contract; the owning-adapter
+  turn-loop dispatch that consumes this body is the already-merged A/B path.)
 
 ## 5. Guard rails honoured
 
@@ -218,15 +222,31 @@ Behaviour-contract tests, not snapshots. Resolution ORDER and invariants:
 
 ## 6. Files touched (planned)
 
-- `gateway/session_context.py` — `_KANBAN_ORIGIN` var + `_VAR_MAP` entry +
-  `set_kanban_origin` / `get_kanban_origin` / `capture_kanban_origin_from_session`.
-- `tools/environments/local.py` — carry `HERMES_KANBAN_ORIGIN` in the subprocess
-  run env.
+- `gateway/session_context.py` — standalone `_KANBAN_ORIGIN` ContextVar + its
+  `os.environ` mirror (NOT a `_VAR_MAP` member — see §3.1) +
+  `set_kanban_origin` / `get_kanban_origin` / `capture_kanban_origin_from_session`
+  + `capture_root_origin_if_absent` (root capture) + `reset_kanban_origin`
+  (handler-entry leak guard).
 - `tools/kanban_tools.py` — `_maybe_auto_subscribe` prefers inherited origin;
-  new `kanban_reassign_origin` tool.
-- `hermes_cli/kanban_db.py` — `reassign_task_origin` primitive.
-- Root capture at session bind (in `_handle_message` / `set_session_vars`
-  caller) + dispatcher/delegate/background env seeding.
-- Tests: `tests/gateway/test_kanban_origin_inheritance.py`,
-  `tests/gateway/test_kanban_origin_reassign.py`, plus an E2E under the existing
-  gateway E2E harness.
+  new `kanban_reassign_origin` tool (handler + schema + registration).
+- `hermes_cli/kanban_db.py` — `reassign_task_origin` primitive +
+  `worker_origin_env` (dispatcher origin seed) + `_default_spawn` seeds
+  `HERMES_KANBAN_ORIGIN` into the worker env.
+- `gateway/run.py` — `reset_kanban_origin()` at handler entry (leak guard,
+  symmetric with `reset_session_vars`) + `capture_root_origin_if_absent()` in
+  `_set_session_env` (root capture at session bind).
+- `toolsets.py` + `agent/transports/hermes_tools_mcp_server.py` — expose
+  `kanban_reassign_origin` in the kanban / hermes-cli toolsets and the MCP
+  orchestrator allowlist.
+- Tests: `tests/gateway/test_kanban_origin_context.py`,
+  `tests/gateway/test_kanban_origin_reassign.py`,
+  `tests/gateway/test_kanban_worker_origin_seed.py`,
+  `tests/gateway/test_kanban_origin_e2e.py`,
+  `tests/tools/test_kanban_origin_bridge.py`,
+  `tests/tools/test_kanban_origin_inheritance.py`,
+  `tests/tools/test_kanban_reassign_origin_tool.py`.
+
+Note: the subprocess-env bridge (`tools/environments/local.py`) needs NO change —
+because `HERMES_KANBAN_ORIGIN` is deliberately outside `_VAR_MAP`, it rides the
+already-copied `os.environ` through every spawn surface untouched (locked in by
+`tests/tools/test_kanban_origin_bridge.py`).

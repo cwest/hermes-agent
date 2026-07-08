@@ -105,6 +105,33 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
+# ---------------------------------------------------------------------------
+# Kanban origin — the inheritable delivery surface of a workstream
+# ---------------------------------------------------------------------------
+#
+# A kanban card's "origin" is the concrete delivery surface a transition wake
+# (or terminal-state notification) routes to. It is stamped onto the card's
+# ``kanban_notify_subs`` row at card-create time. For a card created INSIDE a
+# live gateway session that is simply the session's own identity. But the moment
+# a workstream crosses a spawn boundary into a DETACHED context — a dispatched
+# kanban worker, a delegate_task subagent, a background process, or a nested
+# ``kanban_create`` from any of those — the running process's ``HERMES_SESSION_*``
+# no longer names the human-origin session; it names the detached run itself.
+# A card stamped from that inert identity has a wake with nowhere real to land.
+#
+# 🟢 Why this rides a SEPARATE channel, NOT _VAR_MAP. The session-identity vars
+# are deliberately reset per message (reset_session_vars) and stripped from a
+# child env when _UNSET (the _inject_session_context_env engaged-strip) — both
+# guards exist to stop one session's identity leaking into a sibling's
+# subprocess (production incident 2026-06-21). Origin has the OPPOSITE
+# requirement: it must SURVIVE the spawn boundary into a detached child that
+# legitimately has an _UNSET session. So it cannot obey the identity-strip rule.
+# It rides its own ContextVar with an os.environ mirror (like
+# ``set_current_session_id``), crossing the process boundary via the
+# already-copied os.environ, and is overwritten only by an explicit
+# ``set_kanban_origin`` (a root capture or a reassign) — never implicitly.
+_KANBAN_ORIGIN: ContextVar = ContextVar("HERMES_KANBAN_ORIGIN", default=_UNSET)
+
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -141,6 +168,156 @@ def set_current_session_id(session_id: str) -> None:
 
     os.environ["HERMES_SESSION_ID"] = session_id
     _SESSION_ID.set(session_id)
+
+
+# ---------------------------------------------------------------------------
+# Kanban origin helpers
+# ---------------------------------------------------------------------------
+
+_KANBAN_ORIGIN_ENV = "HERMES_KANBAN_ORIGIN"
+_KANBAN_ORIGIN_FIELDS = ("platform", "chat_id", "thread_id", "user_id", "session_id")
+
+
+def set_kanban_origin(
+    platform: str,
+    chat_id: str,
+    thread_id: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Bind the kanban origin for this context and mirror it to ``os.environ``.
+
+    The origin is the concrete delivery surface a transition wake for any card
+    created under this context should route to. Unlike the session-identity
+    vars, this is *intended* to propagate to child processes/subagents — the
+    ``os.environ`` mirror is what crosses the spawn boundary (the child inherits
+    the copied environ; its own ContextVar is ``_UNSET`` so it reads the mirror).
+
+    Overwrites any previously-bound origin — call it only for a genuine ROOT
+    capture (top of a human-initiated workstream) or a deliberate reassign,
+    never implicitly per message.
+    """
+    import json
+    import os
+
+    blob = {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "user_id": user_id,
+        "session_id": session_id,
+    }
+    encoded = json.dumps(blob)
+    _KANBAN_ORIGIN.set(encoded)
+    os.environ[_KANBAN_ORIGIN_ENV] = encoded
+
+
+def get_kanban_origin() -> dict | None:
+    """Return the bound kanban origin as a dict, or ``None`` when unset.
+
+    Resolution order mirrors :func:`get_session_env`: the ContextVar wins when
+    set in this context; otherwise the ``os.environ`` mirror (the value a child
+    process inherits across the spawn boundary). ``None`` when neither is set or
+    the stored blob can't be parsed.
+    """
+    import json
+    import os
+
+    raw: Any = _KANBAN_ORIGIN.get()
+    if raw is _UNSET:
+        raw = os.environ.get(_KANBAN_ORIGIN_ENV)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return {k: parsed.get(k) for k in _KANBAN_ORIGIN_FIELDS}
+
+
+def capture_kanban_origin_from_session() -> dict | None:
+    """Resolve the origin to stamp on a card being created in this context.
+
+    Resolution order (design §3.1):
+      1. **INHERIT** — an origin is already bound (ContextVar or os.environ
+         mirror): return it verbatim. This is the spawn-boundary case — a
+         detached worker/subagent whose *session* is foreign but which carries
+         the human origin it inherited.
+      2. **ROOT capture** — no inherited origin but a live session
+         (``HERMES_SESSION_PLATFORM`` + ``_CHAT_ID`` bound): snapshot the live
+         session identity as the origin. This is the top of a human-initiated
+         workstream.
+      3. Neither → ``None`` (a truly detached CLI/cron/test context with no
+         live surface to route to).
+    """
+    inherited = get_kanban_origin()
+    if inherited is not None:
+        return inherited
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    if not platform or not chat_id:
+        return None
+    return {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
+        "user_id": get_session_env("HERMES_SESSION_USER_ID", "") or None,
+        "session_id": get_session_env("HERMES_SESSION_ID", "") or None,
+    }
+
+
+def capture_root_origin_if_absent() -> dict | None:
+    """Bind the ROOT kanban origin from the live session.
+
+    Called at session bind (the top of a gateway turn). It is the point where a
+    workstream's origin is captured: the live session's surface becomes the
+    origin every card created under this turn (and every child process it spawns)
+    routes its wakes back to.
+
+    A live gateway turn is ALWAYS authoritative for its own origin, so when a
+    live session (``HERMES_SESSION_PLATFORM`` + ``_CHAT_ID``) is present this
+    (re)binds the origin from it — overwriting any value inherited into this
+    task's ContextVar from a concurrent sibling (the copy_context leak window).
+    The handler-entry reset (``reset_kanban_origin``) drops the sibling value to
+    ``_UNSET`` first; this then stamps THIS turn's surface. Returns the bound
+    origin dict, or ``None`` when there is no live session to bind (a detached
+    context, which keeps whatever legitimately-inherited origin it carries).
+
+    Detached workers never reach this path — they are subprocesses, not gateway
+    turns; their origin arrives via the seeded ``HERMES_KANBAN_ORIGIN`` env and
+    is read directly by the card-create subscribe.
+    """
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    if not platform or not chat_id:
+        return None
+    set_kanban_origin(
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
+        user_id=get_session_env("HERMES_SESSION_USER_ID", "") or None,
+        session_id=get_session_env("HERMES_SESSION_ID", "") or None,
+    )
+    return get_kanban_origin()
+
+
+def reset_kanban_origin() -> None:
+    """Drop this task's inherited origin ContextVar (handler-entry leak guard).
+
+    Symmetric with :func:`reset_session_vars`: a per-message task spawned via
+    ``create_task`` inherits the spawning context's ContextVars, including a
+    concurrent sibling's kanban origin. Reset it to ``_UNSET`` at handler entry
+    so a live gateway turn rebinds its OWN origin (via
+    :func:`capture_root_origin_if_absent`) rather than acting on the sibling's.
+
+    Only the task-local ContextVar is reset — the ``os.environ`` mirror is
+    process-global and left intact (a live turn overwrites it when it rebinds;
+    a legitimately-inherited worker origin rides the mirror across the spawn
+    boundary and must survive).
+    """
+    _KANBAN_ORIGIN.set(_UNSET)
 
 
 def set_session_vars(
