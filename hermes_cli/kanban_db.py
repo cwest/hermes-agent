@@ -4857,6 +4857,93 @@ def _scan_prose_for_phantom_ids(
     return [m for m in unique if m not in existing]
 
 
+# The workspace kind that means "this card builds in an isolated git worktree"
+# (a branch cut for feature work) and therefore owes a reviewable PR before it
+# can be ``done``. ONLY ``worktree`` qualifies: it materializes a real linked
+# git worktree on a ``topic/*`` branch (see ``_ensure_git_worktree`` /
+# ``branch_name`` is worktree-only) — the exact shape the implementer→PR flow
+# uses. ``scratch`` (throwaway tmp dir) and ``dir`` (a plain shared directory —
+# e.g. a persistent build dir, or a ``~/.hermes`` config / live-install edit)
+# are NOT PR-backed and legitimately complete with no PR, so they are excluded.
+_PR_REQUIRING_WORKSPACE_KINDS = frozenset({"worktree"})
+
+
+def _card_requires_pr(workspace_kind: Optional[str], workspace_path: Optional[str]) -> bool:
+    """Return True when a card's own contract requires a reviewable PR artifact.
+
+    The signal is derived from the card's workspace (zero schema footprint,
+    no per-card flag): a card requires a PR when it builds in an isolated git
+    worktree — ``workspace_kind == 'worktree'`` with a ``workspace_path`` that
+    is NOT under ``~/.hermes``. That is precisely the implementer→PR shape (a
+    linked git worktree on a ``topic/*`` branch). Edit-in-place / shared-dir
+    cards (``scratch`` and ``dir`` kinds — throwaway build dirs, or a
+    ``~/.hermes`` workdir for config / live-install edits, e.g.
+    ``cwest/hermes-config`` homestead work) are NOT PR-requiring and complete
+    exactly as before.
+
+    Keyed on the workspace rather than a stored ``requires_pr`` column so the
+    guard reads the semantic that already exists ("this card has a git
+    worktree to open a PR from") without a migration, and so existing cards
+    are classified correctly with no backfill. The ``~/.hermes`` path carve-out
+    is belt-and-suspenders: a ``worktree`` card is never anchored under
+    ``~/.hermes`` in practice, but excluding it keeps any future edit-in-place
+    worktree completable.
+    """
+    if (workspace_kind or "scratch") not in _PR_REQUIRING_WORKSPACE_KINDS:
+        return False
+    path = (workspace_path or "").strip()
+    if not path:
+        # A worktree/dir card with no resolved path is not a real repo
+        # worktree we can hold to a PR — treat as not-PR-requiring rather
+        # than trapping it uncompletable.
+        return False
+    try:
+        resolved = Path(path).expanduser()
+    except Exception:
+        return False
+    # Exclude edit-in-place workspaces anchored under a ~/.hermes tree
+    # (config / live-install edits — ``cwest/hermes-config`` homestead work
+    # — correctly complete with no PR). Check both the shared Hermes root
+    # (``get_default_hermes_root()``, which honours HERMES_HOME for Docker /
+    # custom deployments) and the canonical ``~/.hermes`` under $HOME, so a
+    # profile-scoped or non-default home still classifies correctly.
+    hermes_roots: list[Path] = []
+    try:
+        from hermes_constants import get_default_hermes_root
+        hermes_roots.append(Path(get_default_hermes_root()))
+    except Exception:
+        pass
+    try:
+        hermes_roots.append(Path.home() / ".hermes")
+    except Exception:
+        pass
+    for root in hermes_roots:
+        try:
+            resolved.relative_to(root)
+            return False
+        except ValueError:
+            continue
+    return True
+
+
+def _card_has_pr_artifact(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when the card carries a resolvable GitHub PR reference.
+
+    Reuses the existing PR->card linkage idiom: a ``pull/<n>`` URL in any task
+    comment (the ready-for-review handoff the implementer lane posts on PR
+    open), matched by the same :data:`_RESPAWN_GUARD_PR_URL_RE` the
+    ``active_pr`` respawn guard and :func:`_lane_work_provably_done` already
+    trust as durable proof of a landed lane. Extend, don't duplicate — the
+    guard and the respawn logic agree on what "has a PR" means.
+    """
+    for row in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ?", (task_id,)
+    ).fetchall():
+        if row["body"] and _RESPAWN_GUARD_PR_URL_RE.search(row["body"]):
+            return True
+    return False
+
+
 class HallucinatedCardsError(ValueError):
     """Raised by ``complete_task`` when ``created_cards`` contains ids
     that don't exist or weren't created by the completing worker.
@@ -4993,6 +5080,50 @@ def complete_task(
                         },
                     )
                 return False
+
+    # Required-artifact guard: refuse to complete a card whose own contract
+    # required a reviewable PR when no PR artifact exists. ``done`` must mean
+    # "the declared reviewable artifact exists" — a worker that builds in a git
+    # worktree but exits WITHOUT committing / pushing / opening a PR (then calls
+    # kanban_complete) would otherwise flip the card to ``done`` on a PR that was
+    # never opened, and gated children auto-promote onto a foundation that does
+    # not exist (the live 2026-07-08 failure). Opt-in per card: only cards that
+    # build in a real git repo worktree (``_card_requires_pr``) are guarded, so
+    # edit-in-place / no-PR cards (scratch, or a ~/.hermes workdir) complete
+    # exactly as before. The artifact is a resolvable ``pull/<n>`` URL in a task
+    # comment (``_card_has_pr_artifact``, reusing the active_pr linkage). Runs
+    # before the write txn — a rejected completion never mutates task state,
+    # exactly like the two guards above — and emits an auditable
+    # ``completion_refused_missing_pr`` event. Casey's merge path
+    # (``allow_acceptance_complete=True``) bypasses this guard, as it does the
+    # acceptance guard.
+    #
+    # ORDER: this guard runs BEFORE the author-lane→review redirect below. A
+    # PR-requiring card in the author lane with no PR must be REFUSED, not
+    # silently shunted into review — the missing-PR refusal is the stricter gate
+    # and takes precedence over the redirect.
+    if not allow_acceptance_complete:
+        _ws_row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if _ws_row is not None and _card_requires_pr(
+            _ws_row["workspace_kind"], _ws_row["workspace_path"]
+        ) and not _card_has_pr_artifact(conn, task_id):
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_refused_missing_pr",
+                    {
+                        "workspace_kind": _ws_row["workspace_kind"],
+                        "workspace_path": _ws_row["workspace_path"],
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result)
+                            else None
+                        ),
+                    },
+                )
+            return False
 
     # Author-lane redirect: an AUTHOR finishing their lane MOVES the card to the
     # REVIEW lane, it does NOT go straight to ``done``. ``done`` means "Casey
