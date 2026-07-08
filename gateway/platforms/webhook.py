@@ -798,6 +798,16 @@ class WebhookAdapter(BasePlatformAdapter):
         # unrelated in-progress/queued turn.
         if is_transition_wake:
             event.metadata["kanban_transition_wake"] = True
+            # Carry the authoritative origin_session_id (= task.session_id) so
+            # the woken turn RESUMES that persisted session's history instead of
+            # trusting coordinate-derived key resolution that can diverge from
+            # the live session key (the context-blind-wake defect). The turn
+            # loop reads this in _resume_origin_session_for_wake and switches to
+            # it before loading the transcript. Only stamped when present, so
+            # non-origin webhooks and origin-less wakes fall through unchanged.
+            _origin_sid = payload.get("origin_session_id")
+            if isinstance(_origin_sid, str) and _origin_sid.strip():
+                event.metadata["kanban_origin_session_id"] = _origin_sid.strip()
 
         logger.info(
             "[webhook] %s event=%s route=%s prompt_len=%d delivery=%s",

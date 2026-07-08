@@ -10171,6 +10171,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    def _resume_origin_session_for_wake(self, event, source, session_entry):
+        """Resume the authoritative origin session for a kanban-transition wake.
+
+        A transition wake carries the authoritative ``origin_session_id``
+        (= task.session_id) in ``event.metadata["kanban_origin_session_id"]``.
+        The turn's session was already resolved by ``get_or_create_session`` from
+        the wake's coordinate source, but that coordinate-derived key can diverge
+        from the live session key (e.g. a Discord thread whose persisted sub
+        carries the PARENT channel as chat_id, while the live key is
+        ``thread:<thread>:<thread>``). When it diverges the resolved session is a
+        phantom/empty one and the woken turn loads no live history — the
+        context-blind-wake defect.
+
+        When the wake carries an ``origin_session_id`` that differs from the
+        resolved entry, switch the resolved key to it via the EXISTING
+        ``SessionStore.switch_session`` (/resume) mechanism so ``load_transcript``
+        loads the live thread's transcript. Returns the switched entry; on any
+        no-op or failure returns ``session_entry`` unchanged so the turn is never
+        lost (backward-compatible with today's coordinate-based behavior).
+        """
+        try:
+            meta = getattr(event, "metadata", None) or {}
+            if not meta.get("kanban_transition_wake"):
+                return session_entry
+            origin_sid = meta.get("kanban_origin_session_id")
+            if not origin_sid or not str(origin_sid).strip():
+                return session_entry
+            origin_sid = str(origin_sid).strip()
+            if origin_sid == session_entry.session_id:
+                return session_entry  # healthy chat==thread case: no-op
+            store = getattr(self, "session_store", None)
+            if store is None:
+                return session_entry
+            switched = store.switch_session(session_entry.session_key, origin_sid)
+            if switched is None:
+                logger.warning(
+                    "kanban wake: could not resume origin session %s for key %s; "
+                    "falling back to coordinate-resolved session %s "
+                    "(woken turn may be history-blind)",
+                    origin_sid, session_entry.session_key, session_entry.session_id,
+                )
+                return session_entry
+            logger.info(
+                "kanban wake: resumed origin session %s (was %s) for key %s so the "
+                "woken turn carries the live thread history",
+                origin_sid, session_entry.session_id, session_entry.session_key,
+            )
+            return switched
+        except Exception:
+            logger.debug(
+                "kanban wake: origin-session resume failed; using coordinate "
+                "session", exc_info=True,
+            )
+            return session_entry
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -10201,6 +10256,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
         session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+        # Kanban-transition wake: resume the authoritative origin session so the
+        # woken turn carries the live thread's conversation history (C2). No-op
+        # for normal turns and for wakes whose coordinate key already resolves to
+        # the origin session; see _resume_origin_session_for_wake.
+        session_entry = self._resume_origin_session_for_wake(
+            event, source, session_entry,
+        )
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
