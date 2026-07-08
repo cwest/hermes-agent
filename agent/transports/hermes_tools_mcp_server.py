@@ -146,6 +146,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_create",
     "kanban_unblock",
     "kanban_link",
+    "kanban_reassign_origin",
 )
 
 
