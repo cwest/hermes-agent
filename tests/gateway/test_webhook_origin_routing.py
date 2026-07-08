@@ -124,6 +124,69 @@ def test_origin_source_unknown_platform_falls_back():
 
 
 @pytest.mark.asyncio
+async def test_wake_event_carries_origin_session_id_for_history_resume():
+    """The authoritative ``origin_session_id`` (task.session_id) must be stamped
+    onto the event metadata so the turn can RESUME that persisted session's
+    history — not just addressed by coordinates that can diverge from the live
+    session key (the context-blind-wake defect)."""
+    adapter = _make_adapter(_kt_route())
+    captured = {}
+
+    async def _capture(event):
+        captured["event"] = event
+
+    adapter.handle_message = AsyncMock(side_effect=_capture)
+
+    async with TestClient(TestServer(_app(adapter))) as cli:
+        resp = await cli.post(
+            "/webhooks/kanban-transition",
+            json={
+                "event_type": "status_changed",
+                "task_id": "t_abc",
+                "title": "probe card",
+                "origin_session_id": "20260707_125345_deadbeef",
+                "origin_platform": "discord",
+                "origin_chat_id": "1515879019269197885",
+                "origin_thread_id": "1523994741836873811",
+            },
+        )
+        assert resp.status == 202
+
+    ev = captured["event"]
+    assert ev.metadata.get("kanban_origin_session_id") == "20260707_125345_deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_wake_event_omits_origin_session_id_when_absent():
+    """No ``origin_session_id`` in the payload → the metadata key is not set, so
+    the resume path falls through to today's coordinate-based behavior."""
+    adapter = _make_adapter(_kt_route())
+    captured = {}
+
+    async def _capture(event):
+        captured["event"] = event
+
+    adapter.handle_message = AsyncMock(side_effect=_capture)
+
+    async with TestClient(TestServer(_app(adapter))) as cli:
+        resp = await cli.post(
+            "/webhooks/kanban-transition",
+            json={
+                "event_type": "status_changed",
+                "task_id": "t_abc",
+                "title": "probe card",
+                "origin_platform": "discord",
+                "origin_chat_id": "1515879019269197885",
+                "origin_thread_id": "1523994741836873811",
+            },
+        )
+        assert resp.status == 202
+
+    ev = captured["event"]
+    assert "kanban_origin_session_id" not in ev.metadata
+
+
+@pytest.mark.asyncio
 async def test_wake_event_is_tagged_for_busy_bypass():
     """Defect 1: the origin-routed wake event must be TAGGED so the adapter's
     busy path never text-merges/debounces it (it produces its own turn)."""
