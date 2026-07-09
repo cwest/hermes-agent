@@ -5165,6 +5165,33 @@ def test_review_skills_for_card_legacy_defaults_to_sdlc(kanban_home):
         ]
 
 
+def test_review_skills_for_card_ignores_owner_map_in_non_submit_comment(kanban_home):
+    """Only the SUBMIT-stage audit comment is authoritative for the owner map.
+
+    Guards the reader-equivalence contract with stage-pr-review's resolve_reviewer
+    (which filters stage=="submit" before parsing the map). A NON-submit comment
+    that merely echoes a state_owners={...} fragment with a DIFFERENT review owner
+    — and here is stamped BEFORE the real submit note so comment order can't be
+    relied on — must be ignored: the submit note's review owner (perkins -> the
+    writing team) wins, not the echoed one (lamport).
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="writing: a post", assignee="perkins")
+        # A rework/echo comment carrying a CONFLICTING owner map, stamped first.
+        kb.add_comment(
+            conn, t, "dispatcher",
+            "[audit] actor=dispatcher stage=rework ts=2026-07-09T17:00:00Z\n"
+            "notes: state_owners={ready: eckert, review: lamport, "
+            "blocked-acceptance: casey}",
+        )
+        # The authoritative submit-stage owner map (review -> perkins).
+        _stamp_owner_map(conn, t, ready="orwell", review="perkins", team="writing")
+        _set_task_status(conn, t, "review")
+        claimed = kb.get_task(conn, t)
+        assert kb._review_owner_from_owner_map(conn, t) == "perkins"
+        assert kb.review_skills_for_card(conn, claimed) == ["editorial-review"]
+
+
 def test_dispatch_review_writing_card_spawns_editorial_skill(
     kanban_home, all_assignees_spawnable,
 ):

@@ -190,6 +190,17 @@ _WRITING_REVIEWERS = frozenset({"perkins"})
 # trail), so the dispatcher resolves the review team from this fragment.
 _OWNER_MAP_RE = re.compile(r"state_owners=\{([^}]*)\}")
 
+# Identifies the ONE comment the owner map is authoritative in: the card's
+# ``submit``-stage §9.1 audit comment (header ``[audit] … stage=submit …``).
+# ``resolve_reviewer`` keys off exactly this comment (it filters
+# ``parse_audit(...)["stage"] == "submit"`` before reading the map), so the
+# dispatcher must match the SAME comment — otherwise a later comment that merely
+# echoes a ``state_owners={…}`` fragment (a different stage's note, quoted prose)
+# could be read as the owner map and resolve a reviewer that disagrees with the
+# lane the card was actually moved into. Requiring the submit header keeps the two
+# readers provably equivalent regardless of comment order.
+_SUBMIT_AUDIT_RE = re.compile(r"^\[audit\][^\n]*\bstage=submit\b", re.MULTILINE)
+
 # Matches a GitHub pull-request URL and captures owner/repo/number so two
 # spellings of the same PR (trailing path, query string, or surrounding prose)
 # collapse to one canonical identity. The host is matched case-insensitively;
@@ -3192,12 +3203,20 @@ def _review_owner_from_owner_map(conn: sqlite3.Connection, task_id: str) -> Opti
 
     Reads the ``state_owners={ready: …, review: …, …}`` fragment recorded in the
     card's ``submit``-stage audit comment (the owner map lives in the audit trail,
-    not a column — the same signal ``stage-pr-review``'s ``resolve_reviewer`` uses).
-    Returns the ``review`` owner when stamped, else ``None`` so the caller can fall
-    back to the card's assignee / the code-review default.
+    not a column). Only the ``submit``-stage audit comment is authoritative: this
+    keys off the SAME comment ``stage-pr-review``'s ``resolve_reviewer`` reads
+    (which filters ``parse_audit(...)["stage"] == "submit"`` before parsing the
+    map), so the two readers resolve the same owner regardless of comment order.
+    A later comment that merely echoes a ``state_owners={…}`` fragment (a
+    different stage's note, quoted prose) is ignored. Returns the ``review`` owner
+    when stamped, else ``None`` so the caller can fall back to the card's assignee
+    / the code-review default.
     """
     for c in list_comments(conn, task_id):
-        m = _OWNER_MAP_RE.search(c.body or "")
+        body = c.body or ""
+        if not _SUBMIT_AUDIT_RE.search(body):
+            continue
+        m = _OWNER_MAP_RE.search(body)
         if not m:
             continue
         for pair in m.group(1).split(","):
