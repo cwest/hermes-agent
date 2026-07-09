@@ -169,6 +169,27 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
 # ``_review_pr_url`` and the PR-URL dedup guard in ``create_task``.
 REVIEW_SKILL = "github-code-review"
 
+# The two review-lane operating skills the dispatcher force-loads onto a worker
+# it spawns on a ``review``-status card. Which one is chosen is team/kind-aware
+# (see ``review_skills_for_card``): a CODE card loads the code-review skill; a
+# WRITING card loads the editorial-review skill so a prose piece is reviewed with
+# an editorial lens (voice, style, structure, fact/link checks), not a code lens.
+SDLC_REVIEW_SKILL = "sdlc-review"
+EDITORIAL_REVIEW_SKILL = "editorial-review"
+
+# Review-lane owners (owner map ``review`` lane) that belong to the WRITING team
+# and therefore review with the editorial skill rather than the code-review one.
+# Everything else (the engineering reviewer, an unknown/legacy reviewer) falls
+# through to the code-review default, preserving the historical behavior.
+_WRITING_REVIEWERS = frozenset({"perkins"})
+
+# Parses the ``state_owners={lane: owner, ...}`` owner-map fragment out of a
+# card's ``submit``-stage audit comment. This is the SAME signal the
+# ``stage-pr-review`` skill's ``resolve_reviewer`` reads — there is deliberately
+# no ``team``/``kind`` column on the card row (the owner map lives in the audit
+# trail), so the dispatcher resolves the review team from this fragment.
+_OWNER_MAP_RE = re.compile(r"state_owners=\{([^}]*)\}")
+
 # Matches a GitHub pull-request URL and captures owner/repo/number so two
 # spellings of the same PR (trailing path, query string, or surrounding prose)
 # collapse to one canonical identity. The host is matched case-insensitively;
@@ -3164,6 +3185,46 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
         )
         for r in rows
     ]
+
+
+def _review_owner_from_owner_map(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the ``review``-lane owner from a card's stamped owner map, if any.
+
+    Reads the ``state_owners={ready: …, review: …, …}`` fragment recorded in the
+    card's ``submit``-stage audit comment (the owner map lives in the audit trail,
+    not a column — the same signal ``stage-pr-review``'s ``resolve_reviewer`` uses).
+    Returns the ``review`` owner when stamped, else ``None`` so the caller can fall
+    back to the card's assignee / the code-review default.
+    """
+    for c in list_comments(conn, task_id):
+        m = _OWNER_MAP_RE.search(c.body or "")
+        if not m:
+            continue
+        for pair in m.group(1).split(","):
+            if ":" not in pair:
+                continue
+            lane, owner = pair.split(":", 1)
+            if lane.strip() == "review" and owner.strip():
+                return owner.strip()
+    return None
+
+
+def review_skills_for_card(conn: sqlite3.Connection, task: "Task") -> list[str]:
+    """Return the review skill(s) to force-load for a ``review``-status card.
+
+    Team/kind-aware selection: a WRITING card is reviewed with the editorial
+    skill (voice / style / structure / fact-and-link checks), a CODE card with
+    the code-review skill. The selection reads the card's OWN owner map — the
+    ``state_owners[\"review\"]`` owner stamped in its submit-stage audit comment —
+    falling back to the review card's ``assignee`` (which the stage transition
+    materializes from that same map), and finally to the code-review default for
+    a legacy / un-stamped card. No ``team``/``kind`` column is read or added, so
+    the resolution is cache-safe and consistent with the one-card owner-map model.
+    """
+    reviewer = _review_owner_from_owner_map(conn, task.id) or (task.assignee or "")
+    if reviewer in _WRITING_REVIEWERS:
+        return [EDITORIAL_REVIEW_SKILL]
+    return [SDLC_REVIEW_SKILL]
 
 
 # ---------------------------------------------------------------------------
@@ -8766,12 +8827,15 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        # Force-load the review skill matched to the card's kind/team — the
+        # code-review skill (sdlc-review) for a code card, the editorial-review
+        # skill for a writing card — so a prose PR is reviewed with an editorial
+        # lens, not a code one. The selection reads the card's OWN owner map
+        # (see ``review_skills_for_card``), not a hardcoded skill. The mandatory
+        # kanban lifecycle is already injected into every worker's system prompt
+        # via KANBAN_GUIDANCE, so this is the only extra skill the review agent
+        # needs.
+        claimed.skills = review_skills_for_card(conn, claimed)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
