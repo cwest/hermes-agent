@@ -3812,6 +3812,49 @@ def auto_route_review_bounce(
 _ACCEPTANCE_SIGNOFF_REASON_PREFIX = "awaiting-casey-signoff"
 
 
+# The card's per-lane owner map lives in its ``submit``-stage §9.1 audit comment
+# (there is no ``state_owners`` column — the map is stamped in the audit trail by
+# design, the same signal ``stage-pr-review`` / ``bounce-review-to-author`` read).
+# A ``submit`` comment records it in the free-text ``notes:`` line as e.g.
+# ``state_owners={ready: eckert, review: lamport, blocked-acceptance: casey}``.
+_OWNER_MAP_RE = re.compile(r"state_owners=\{([^}]*)\}")
+
+
+def _review_owner_from_owner_map(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return a card's ``state_owners["review"]`` owner, or None if unstamped.
+
+    Reads the card's materialized owner map from its ``submit``-stage audit
+    comment (the map lives in the audit trail, not a column — same reader shape
+    the one-card lane resolvers use). Returns the ``review``-lane owner when the
+    card carries a stamped map with that lane, else None.
+
+    Deliberately has NO kind-default fallback: a card with no stamped review lane
+    (a legacy / un-stamped card, or a plain non-pipeline task) must NOT be shunted
+    into review by :func:`complete_task` — None keeps its completion on the
+    ``-> done`` path unchanged. Only a card that explicitly declared a review lane
+    is redirected.
+    """
+    for comment in list_comments(conn, task_id):
+        body = comment.body or ""
+        if not body.lstrip().startswith("[audit]"):
+            continue
+        # Only the submit-stage audit comment carries the materialized map.
+        if "stage=submit" not in body:
+            continue
+        m = _OWNER_MAP_RE.search(body)
+        if not m:
+            continue
+        for pair in m.group(1).split(","):
+            if ":" not in pair:
+                continue
+            lane, owner = pair.split(":", 1)
+            if lane.strip() == "review" and owner.strip():
+                return owner.strip()
+    return None
+
+
 def _resolve_stray_acceptance_owner(
     conn: sqlite3.Connection, task_id: str, *, reviewer: Optional[str] = None,
 ) -> Optional[str]:
@@ -4870,6 +4913,102 @@ def complete_task(
                         },
                     )
                 return False
+
+    # Author-lane redirect: an AUTHOR finishing their lane MOVES the card to the
+    # REVIEW lane, it does NOT go straight to ``done``. ``done`` means "Casey
+    # merged/accepted"; an author's end-of-lane completion is not that. Code cards
+    # were only accidentally rescued by the ``github-prs`` webhook (stage-pr-review
+    # moves them to review on PR-open); a writing card whose review is board-driven
+    # had no such rescue and landed in ``done`` past the reviewer and past Casey.
+    # This makes the board-native path correct for BOTH kinds.
+    #
+    # The redirect fires only when ALL hold:
+    #   * the merge override is NOT set (Casey's merge is the one legit ``->done``);
+    #   * the card is in the author lane — ``running`` or ``ready`` — so the
+    #     acceptance refusal above and the manual-complete-a-stuck-``blocked``-card
+    #     flow are both untouched;
+    #   * the card's OWN stamped owner map declares a ``review`` owner (no
+    #     kind-default fallback — an un-stamped / no-review-lane card completes to
+    #     ``done`` exactly as before, so research/plain cards are never shunted).
+    #
+    # Idempotency with the webhook path is structural: once the card is in
+    # ``review`` it is no longer ``running``/``ready``, so a second completion here
+    # is skipped AND the ``-> done`` UPDATE below (``status IN ('running','ready',
+    # 'blocked')``) does not match — a clean no-op (returns False). A rework
+    # re-completion from ``ready`` after a review bounce correctly moves back to
+    # review for re-review.
+    if not allow_acceptance_complete:
+        _row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if _row is not None and _row["status"] in ("running", "ready"):
+            _review_owner = _review_owner_from_owner_map(conn, task_id)
+            if _review_owner:
+                with write_txn(conn):
+                    if expected_run_id is None:
+                        cur = conn.execute(
+                            """
+                            UPDATE tasks
+                               SET status       = 'review',
+                                   assignee     = ?,
+                                   claim_lock   = NULL,
+                                   claim_expires= NULL,
+                                   worker_pid   = NULL,
+                                   block_kind   = NULL,
+                                   block_recurrences = 0
+                             WHERE id = ?
+                               AND status IN ('running', 'ready')
+                            """,
+                            (_review_owner, task_id),
+                        )
+                    else:
+                        cur = conn.execute(
+                            """
+                            UPDATE tasks
+                               SET status       = 'review',
+                                   assignee     = ?,
+                                   claim_lock   = NULL,
+                                   claim_expires= NULL,
+                                   worker_pid   = NULL,
+                                   block_kind   = NULL,
+                                   block_recurrences = 0
+                             WHERE id = ?
+                               AND status IN ('running', 'ready')
+                               AND current_run_id = ?
+                            """,
+                            (_review_owner, task_id, int(expected_run_id)),
+                        )
+                    if cur.rowcount != 1:
+                        # Card moved between the status read and the write (a race
+                        # with the webhook or a stale expected_run_id) — no-op.
+                        return False
+                    _prev_status = _row["status"]
+                    # End the author's run as completed: the author DID finish
+                    # their lane; the card advancing to review is the handoff.
+                    run_id = _end_run(
+                        conn, task_id,
+                        outcome="completed", status="review",
+                        summary=summary if summary is not None else result,
+                        metadata=metadata,
+                    )
+                    if run_id is None and (summary or metadata or result):
+                        run_id = _synthesize_ended_run(
+                            conn, task_id,
+                            outcome="completed",
+                            summary=summary if summary is not None else result,
+                            metadata=metadata,
+                        )
+                    _append_event(
+                        conn, task_id, "status_changed",
+                        {
+                            "from": _prev_status,
+                            "to": "review",
+                            "assignee": _review_owner,
+                            "by": "onecard:complete-task",
+                        },
+                        run_id=run_id,
+                    )
+                return True
 
     with write_txn(conn):
         if expected_run_id is None:
