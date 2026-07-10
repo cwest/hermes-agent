@@ -5090,6 +5090,146 @@ def test_dispatch_review_spawns_with_correct_skills(
     assert spawned_tasks[0].skills == ["sdlc-review"]
 
 
+# ---------------------------------------------------------------------------
+# Team/kind-aware review-skill selection (review_skills_for_card)
+# ---------------------------------------------------------------------------
+#
+# The dispatcher must load the review skill appropriate to the card's kind/team
+# — a writing card reviewed by perkins must NOT load the code-review skill
+# (sdlc-review); it loads editorial-review. The signal of record is the card's
+# OWN owner map (state_owners={...}) stamped in its submit-stage audit comment
+# (the same signal stage-pr-review's resolve_reviewer reads), falling back to the
+# review card's assignee, then to the code-review default for legacy/unstamped
+# cards. There is deliberately no team/kind COLUMN, so the resolution reads the
+# audit trail — cache-safe, no schema change.
+
+_SUBMIT_NOTE_TMPL = (
+    "[audit] actor=hollis stage=submit ts=2026-07-09T16:53:47Z\n"
+    "notes: state_owners={{ready: {ready}, review: {review}, "
+    "blocked-acceptance: casey}} triager=hollis team={team}"
+)
+
+
+def _stamp_owner_map(conn, task_id, *, ready, review, team):
+    """Record the submit-stage owner-map audit comment core reads for routing."""
+    kb.add_comment(
+        conn, task_id, "hollis",
+        _SUBMIT_NOTE_TMPL.format(ready=ready, review=review, team=team),
+    )
+
+
+def test_review_skills_for_card_writing_owner_map_selects_editorial(kanban_home):
+    """A writing card (owner-map review lane = perkins) loads editorial-review."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="writing: a post", assignee="perkins")
+        _stamp_owner_map(conn, t, ready="orwell", review="perkins", team="writing")
+        _set_task_status(conn, t, "review")
+        claimed = kb.get_task(conn, t)
+        assert kb.review_skills_for_card(conn, claimed) == ["editorial-review"]
+
+
+def test_review_skills_for_card_code_owner_map_selects_sdlc(kanban_home):
+    """A code card (owner-map review lane = lamport) loads sdlc-review."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fix: a bug", assignee="lamport")
+        _stamp_owner_map(conn, t, ready="eckert", review="lamport", team="engineering")
+        _set_task_status(conn, t, "review")
+        claimed = kb.get_task(conn, t)
+        assert kb.review_skills_for_card(conn, claimed) == ["sdlc-review"]
+
+
+def test_review_skills_for_card_assignee_fallback_when_unstamped(kanban_home):
+    """No owner map stamped: fall back to the review card's assignee."""
+    with kb.connect() as conn:
+        # Writing reviewer as assignee, no owner-map comment -> editorial.
+        tw = kb.create_task(conn, title="writing: unstamped", assignee="perkins")
+        _set_task_status(conn, tw, "review")
+        assert kb.review_skills_for_card(conn, kb.get_task(conn, tw)) == [
+            "editorial-review"
+        ]
+        # Code reviewer as assignee, no owner-map comment -> sdlc.
+        tc = kb.create_task(conn, title="fix: unstamped", assignee="lamport")
+        _set_task_status(conn, tc, "review")
+        assert kb.review_skills_for_card(conn, kb.get_task(conn, tc)) == [
+            "sdlc-review"
+        ]
+
+
+def test_review_skills_for_card_legacy_defaults_to_sdlc(kanban_home):
+    """A legacy card with no owner map and an unknown reviewer defaults to sdlc."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="alice")
+        _set_task_status(conn, t, "review")
+        assert kb.review_skills_for_card(conn, kb.get_task(conn, t)) == [
+            "sdlc-review"
+        ]
+
+
+def test_review_skills_for_card_ignores_owner_map_in_non_submit_comment(kanban_home):
+    """Only the SUBMIT-stage audit comment is authoritative for the owner map.
+
+    Guards the reader-equivalence contract with stage-pr-review's resolve_reviewer
+    (which filters stage=="submit" before parsing the map). A NON-submit comment
+    that merely echoes a state_owners={...} fragment with a DIFFERENT review owner
+    — and here is stamped BEFORE the real submit note so comment order can't be
+    relied on — must be ignored: the submit note's review owner (perkins -> the
+    writing team) wins, not the echoed one (lamport).
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="writing: a post", assignee="perkins")
+        # A rework/echo comment carrying a CONFLICTING owner map, stamped first.
+        kb.add_comment(
+            conn, t, "dispatcher",
+            "[audit] actor=dispatcher stage=rework ts=2026-07-09T17:00:00Z\n"
+            "notes: state_owners={ready: eckert, review: lamport, "
+            "blocked-acceptance: casey}",
+        )
+        # The authoritative submit-stage owner map (review -> perkins).
+        _stamp_owner_map(conn, t, ready="orwell", review="perkins", team="writing")
+        _set_task_status(conn, t, "review")
+        claimed = kb.get_task(conn, t)
+        assert kb._review_owner_from_owner_map(conn, t) == "perkins"
+        assert kb.review_skills_for_card(conn, claimed) == ["editorial-review"]
+
+
+def test_dispatch_review_writing_card_spawns_editorial_skill(
+    kanban_home, all_assignees_spawnable,
+):
+    """End-to-end: a writing review card is spawned with editorial-review."""
+    spawned_tasks = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="writing: a post", assignee="perkins")
+        _stamp_owner_map(conn, t, ready="orwell", review="perkins", team="writing")
+        _set_task_status(conn, t, "review")
+        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+    assert len(spawned_tasks) == 1
+    assert spawned_tasks[0].skills == ["editorial-review"]
+
+
+def test_dispatch_review_code_card_spawns_sdlc_skill(
+    kanban_home, all_assignees_spawnable,
+):
+    """End-to-end: a code review card still spawns with sdlc-review (unchanged)."""
+    spawned_tasks = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fix: a bug", assignee="lamport")
+        _stamp_owner_map(conn, t, ready="eckert", review="lamport", team="engineering")
+        _set_task_status(conn, t, "review")
+        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+    assert len(spawned_tasks) == 1
+    assert spawned_tasks[0].skills == ["sdlc-review"]
+
+
 def test_dispatch_review_skips_unassigned(kanban_home):
     """Unassigned review tasks go to skipped_unassigned, not spawned."""
     with kb.connect() as conn:
