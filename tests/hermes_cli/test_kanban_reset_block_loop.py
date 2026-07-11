@@ -309,8 +309,9 @@ def test_cli_unblock_reset_loop_recovers_card_stuck_in_triage(
     kanban_home: Path, capsys
 ) -> None:
     """A card already escalated to ``triage`` (the exact live symptom) is recovered
-    by ``--reset-loop``: the counter is zeroed even though ``unblock`` cannot flip a
-    triage card, so a subsequent normal cycle no longer re-trips to triage."""
+    by ``--reset-loop``: the counter is zeroed AND ``unblock`` now flips the triage
+    card back to the work pool (``unblock_task`` transitions from triage too), so a
+    subsequent normal cycle no longer re-trips to triage."""
     from hermes_cli import kanban as kb_cli
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="stuck in triage", assignee="eckert")
@@ -323,7 +324,9 @@ def test_cli_unblock_reset_loop_recovers_card_stuck_in_triage(
     assert rc == 0
 
     with kb.connect() as conn:
-        # unblock does not apply to triage, but the counter is cleared and audited.
+        # unblock now applies to triage: the card returns to the work pool and the
+        # counter is cleared and audited.
+        assert kb.get_task(conn, tid).status == "ready"
         assert _recurrences(conn, tid) == 0
         n = conn.execute(
             "SELECT count(*) c FROM task_events WHERE task_id=? AND kind='block_recurrences_reset'",
@@ -350,4 +353,115 @@ def test_cli_unblock_without_reset_loop_leaves_counter(kanban_home: Path, capsys
             (tid,),
         ).fetchone()["c"]
         assert n == 0
+
+
+# ---------------------------------------------------------------------------
+# RED 6 — the OUTER feedback-loop wedge: unblock_task must transition from
+# ``triage`` too, emitting the ``unblocked`` cutoff event so the ``active_pr``
+# respawn guard clears. This reproduces the live 2026-07-11 symptom: a card
+# escalated to ``triage`` (by the block-loop breaker) that still carries an OPEN
+# PR comment stays guarded forever because the standard block->unblock cutoff
+# silently no-ops from triage.
+# ---------------------------------------------------------------------------
+
+
+def _triage_with_open_pr(conn, *, assignee: str = "orwell",
+                         recurrences: int | None = None) -> str:
+    """Create a card parked in ``triage`` (escalated by the loop breaker) that
+    carries an OPEN-PR handoff comment — the exact live wedge shape.
+
+    The PR comment is what trips the ``active_pr`` respawn guard; the card is in
+    ``triage`` with an inflated ``block_recurrences`` because repeated churn on
+    the outer feedback loop escalated it there.
+    """
+    if recurrences is None:
+        recurrences = kb.BLOCK_RECURRENCE_LIMIT
+    tid = kb.create_task(conn, title="writing card, casey feedback", assignee=assignee)
+    now = int(time.time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='triage', block_recurrences=? WHERE id=?",
+            (recurrences, tid),
+        )
+        # An OPEN PR handoff comment (this is what the active_pr guard keys on).
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR opened: https://github.com/cwest/writing/pull/1', ?)",
+            (tid, now - 30),
+        )
+    return tid
+
+
+def test_triage_card_with_open_pr_is_wedged_before_unblock(kanban_home: Path, monkeypatch) -> None:
+    """Ground truth (the bug): a card escalated to ``triage`` while carrying an
+    OPEN PR is respawn-guarded on ``active_pr``, because nothing has emitted an
+    ``unblocked`` cutoff after the PR comment. This documents the wedge that the
+    fix must clear."""
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
+    with kb.connect() as conn:
+        tid = _triage_with_open_pr(conn)
+        assert kb.get_task(conn, tid).status == "triage"
+        # The guard fires: the dispatcher would refuse to spawn every tick.
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_unblock_from_triage_emits_cutoff_and_clears_active_pr(
+    kanban_home: Path, monkeypatch
+) -> None:
+    """THE FIX (RED->GREEN): ``unblock_task`` on a card parked in ``triage`` must
+    transition it out of triage, emit the ``unblocked`` cutoff event, and thereby
+    clear the ``active_pr`` respawn guard so the outer feedback loop self-heals.
+
+    Before the fix ``unblock_task`` only matched ``status IN ('blocked',
+    'scheduled')`` — a triage card matched zero rows, returned False, emitted no
+    event, and the guard stayed tripped forever (the live 2026-07-11 wedge)."""
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
+    with kb.connect() as conn:
+        tid = _triage_with_open_pr(conn)
+
+        # The sanctioned unblock now applies from triage.
+        assert kb.unblock_task(conn, tid) is True, \
+            "unblock_task must transition a card out of triage"
+        # No pending parents -> ready (the normal work pool).
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # It emitted the load-bearing 'unblocked' cutoff event.
+        n = conn.execute(
+            "SELECT count(*) c FROM task_events WHERE task_id=? AND kind='unblocked'",
+            (tid,),
+        ).fetchone()["c"]
+        assert n == 1, "unblocking from triage must emit the 'unblocked' cutoff event"
+
+        # And that cutoff clears the active_pr guard: the PR comment predates the
+        # unblock, so it no longer guards.
+        assert kb.check_respawn_guard(conn, tid) is None, \
+            "the active_pr guard must clear after an unblock from triage"
+
+
+def test_unblock_from_triage_rechecks_parent_gate(kanban_home: Path) -> None:
+    """A triage card with an undone parent must land in ``todo`` (not ``ready``)
+    when unblocked — the same parent-completion invariant unblock_task enforces
+    for blocked/scheduled cards applies to the triage path too."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(conn, title="child", assignee="a", parents=[parent])
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (child,))
+        # Parent still open -> child unblocks to 'todo', not 'ready'.
+        assert kb.unblock_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_unblock_from_triage_preserves_block_recurrences(kanban_home: Path) -> None:
+    """Unblocking from triage must NOT reset ``block_recurrences`` — the loop
+    breaker's counter survives an unblock exactly as it does from ``blocked``
+    (the counter is reset only on completion or via the sanctioned
+    ``reset_block_recurrences``). This preserves the breaker: the counter reset
+    remains an explicit operator action, not a side effect of the lane flip."""
+    with kb.connect() as conn:
+        tid = _triage_with_open_pr(conn, recurrences=kb.BLOCK_RECURRENCE_LIMIT)
+        assert kb.unblock_task(conn, tid) is True
+        assert _recurrences(conn, tid) == kb.BLOCK_RECURRENCE_LIMIT, \
+            "unblock (from triage) must not reset the loop counter"
 

@@ -2038,8 +2038,10 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             # Zero the unblock-loop counter FIRST (independent of the lane
             # transition) so a card stuck by an inflated block_recurrences is
-            # recovered even when it is parked in triage (where unblock_task does
-            # not apply). Emits its own auditable block_recurrences_reset event.
+            # returned to a clean cycle. ``unblock_task`` transitions from triage
+            # too, so the reset + unblock together fully recover a card the
+            # loop breaker escalated to triage. Emits its own auditable
+            # block_recurrences_reset event.
             if reset_loop:
                 if not kb.reset_block_recurrences(
                     conn, tid, actor=author or "user", reason=reason,
@@ -2051,14 +2053,15 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             if not kb.unblock_task(conn, tid):
                 if reset_loop:
                     # The counter reset succeeded; only the lane flip did not
-                    # apply (e.g. the card is in triage, not blocked/scheduled).
+                    # apply (the card was not in a transitionable status —
+                    # blocked/scheduled/triage).
                     print(
                         f"Reset loop counter for {tid} "
-                        f"(not blocked/scheduled — left in place)"
+                        f"(not blocked/scheduled/triage — left in place)"
                     )
                 else:
                     failed.append(tid)
-                    print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                    print(f"cannot unblock {tid} (not blocked/scheduled/triage?)", file=sys.stderr)
             else:
                 suffix = f": {reason}" if reason else ""
                 prefix = "Unblocked + reset loop counter" if reset_loop else "Unblocked"
