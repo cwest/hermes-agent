@@ -3161,6 +3161,17 @@ DEFAULT_CONFIG = {
         #       # model: gemini-3.1-flash-lite-image  # Lite (drops in when the
         #       #                                       proxy serves it)
         #       # runtime: custom:vertex-llm-proxy  # proxy credentials entry
+        "nano-banana": {
+            # Output resolution for the nano-banana image models, config-only
+            # (no per-call parameter — every generation uses this size). Sent to
+            # the proxy as image_config.image_size; one of "1K" / "2K" / "4K"
+            # (uppercase K). Composes with aspect ratio on text-to-image (e.g.
+            # 4K + 16:9 → 5504×3072); edits tend to preserve the source image's
+            # dimensions regardless, so this primarily affects text-to-image. A
+            # model that caps lower (e.g. Lite = 1K) degrades gracefully. 4K is
+            # the default ("start big; downscale is cheaper than a re-gen").
+            "resolution": "4K",
+        },
     },
 
     # Config schema version - bump this when adding new required fields
