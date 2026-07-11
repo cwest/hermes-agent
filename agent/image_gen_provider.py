@@ -236,6 +236,136 @@ def _images_cache_dir() -> Path:
     return path
 
 
+# ---------------------------------------------------------------------------
+# Shared cache GC janitor
+# ---------------------------------------------------------------------------
+#
+# ``$HERMES_HOME/cache/images/`` is shared by every image_gen backend, so the
+# retention policy is framework-level (one dir, one janitor) rather than
+# per-backend. It runs opportunistically at save time — no cron needed — and is
+# safe by construction: durable copies of anything that matters already live in
+# the consuming workflow's destination (a blog/writing repo, etc.); the cache is
+# disposable machine-local state.
+
+_DEFAULT_CACHE_MAX_AGE_DAYS = 30
+_DEFAULT_CACHE_MAX_TOTAL_MB = 2048  # ~2 GB
+
+
+def _load_image_gen_config() -> Dict[str, Any]:
+    """Read the ``image_gen`` section from config.yaml (``{}`` on failure)."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
+        return section if isinstance(section, dict) else {}
+    except Exception as exc:  # noqa: BLE001 - config is best-effort
+        logger.debug("could not load image_gen config: %s", exc)
+        return {}
+
+
+def _load_cache_config() -> Dict[str, int]:
+    """Resolve the cache-GC caps, applying defaults for anything unset.
+
+    Reads ``image_gen.cache.max_age_days`` / ``image_gen.cache.max_total_mb``
+    from config.yaml. Config, not env vars, per the contribution rubric.
+    """
+    max_age = _DEFAULT_CACHE_MAX_AGE_DAYS
+    max_total = _DEFAULT_CACHE_MAX_TOTAL_MB
+    cache = _load_image_gen_config().get("cache")
+    if isinstance(cache, dict):
+        raw_age = cache.get("max_age_days")
+        if isinstance(raw_age, (int, float)) and raw_age > 0:
+            max_age = int(raw_age)
+        raw_total = cache.get("max_total_mb")
+        if isinstance(raw_total, (int, float)) and raw_total > 0:
+            max_total = int(raw_total)
+    return {"max_age_days": max_age, "max_total_mb": max_total}
+
+
+def _prune_image_cache(keep: Optional[Path] = None) -> None:
+    """Prune the shared image cache to stay under the configured caps.
+
+    Deletes files (oldest-first, by mtime) when EITHER a file's age exceeds
+    ``max_age_days`` OR the cache's total size exceeds ``max_total_mb``. The
+    file at ``keep`` (typically the one just written) is never deleted. Emits a
+    single INFO line when it prunes, and stays silent otherwise.
+
+    Best-effort: any error is swallowed (logged at debug) so a GC hiccup can
+    never fail an image save.
+    """
+    try:
+        caps = _load_cache_config()
+        max_age_days = caps["max_age_days"]
+        max_total_bytes = caps["max_total_mb"] * 1024 * 1024
+
+        cache_dir = _images_cache_dir()
+        keep_resolved = keep.resolve() if isinstance(keep, Path) else None
+
+        entries: List[Tuple[float, int, Path]] = []
+        for entry in cache_dir.iterdir():
+            if not entry.is_file():
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, entry))
+
+        if not entries:
+            return
+
+        # Oldest first — the deletion order for both age and size passes.
+        entries.sort(key=lambda t: t[0])
+
+        now = datetime.datetime.now().timestamp()
+        age_cutoff = now - max_age_days * 86400
+        total_size = sum(size for _, size, _ in entries)
+
+        pruned_count = 0
+        freed_bytes = 0
+        survivors: List[Tuple[float, int, Path]] = []
+
+        # Pass 1 — age: drop anything older than the cutoff.
+        for mtime, size, path in entries:
+            if keep_resolved is not None and path.resolve() == keep_resolved:
+                survivors.append((mtime, size, path))
+                continue
+            if mtime < age_cutoff:
+                try:
+                    path.unlink()
+                    pruned_count += 1
+                    freed_bytes += size
+                    total_size -= size
+                except OSError:
+                    survivors.append((mtime, size, path))
+            else:
+                survivors.append((mtime, size, path))
+
+        # Pass 2 — size: keep dropping oldest survivors until under the cap.
+        for mtime, size, path in survivors:
+            if total_size <= max_total_bytes:
+                break
+            if keep_resolved is not None and path.resolve() == keep_resolved:
+                continue
+            try:
+                path.unlink()
+                pruned_count += 1
+                freed_bytes += size
+                total_size -= size
+            except OSError:
+                continue
+
+        if pruned_count:
+            logger.info(
+                "image cache GC: pruned %d files, freed %.1f MB",
+                pruned_count,
+                freed_bytes / (1024 * 1024),
+            )
+    except Exception as exc:  # noqa: BLE001 - GC must never fail a save
+        logger.debug("image cache GC skipped: %s", exc)
+
+
 def save_b64_image(
     b64_data: str,
     *,
@@ -253,6 +383,10 @@ def save_b64_image(
     short = uuid.uuid4().hex[:8]
     path = _images_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
     path.write_bytes(raw)
+    try:
+        _prune_image_cache(keep=path)
+    except Exception as exc:  # noqa: BLE001 - GC must never fail a save
+        logger.debug("image cache GC skipped: %s", exc)
     return path
 
 
@@ -335,6 +469,10 @@ def save_url_image(
             pass
         raise ValueError(f"Image at {url} returned 0 bytes; refusing to cache.")
 
+    try:
+        _prune_image_cache(keep=path)
+    except Exception as exc:  # noqa: BLE001 - GC must never fail a save
+        logger.debug("image cache GC skipped: %s", exc)
     return path
 
 
