@@ -1,0 +1,5 @@
+name: nano-banana
+version: 1.0.0
+description: "Google nano-banana Gemini image generation via the local OpenAI-compatible proxy (chat-completions image output; text-to-image, edit, and reference-grounded). Saves to $HERMES_HOME/cache/images/."
+author: Hermes Agent
+kind: backend
