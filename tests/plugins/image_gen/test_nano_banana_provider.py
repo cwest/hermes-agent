@@ -301,6 +301,142 @@ class TestGenerate:
 
 
 # ---------------------------------------------------------------------------
+# Resolution control (config-only; default 4K)
+# ---------------------------------------------------------------------------
+
+
+class TestResolutionPrecedence:
+    def test_default_is_4k(self):
+        with _patch_cfg({}):
+            assert _provider()._resolve_resolution() == "4K"
+
+    def test_scoped_config_override(self):
+        with _patch_cfg({"nano-banana": {"resolution": "2K"}}):
+            assert _provider()._resolve_resolution() == "2K"
+
+    def test_env_wins_over_config(self, monkeypatch):
+        monkeypatch.setenv("NANO_BANANA_IMAGE_RESOLUTION", "1K")
+        with _patch_cfg({"nano-banana": {"resolution": "4K"}}):
+            assert _provider()._resolve_resolution() == "1K"
+
+    def test_lowercase_is_normalized_to_uppercase(self):
+        # The proxy rejects lowercase 'k'; normalize before sending.
+        with _patch_cfg({"nano-banana": {"resolution": "2k"}}):
+            assert _provider()._resolve_resolution() == "2K"
+
+    def test_surrounding_whitespace_trimmed(self):
+        with _patch_cfg({"nano-banana": {"resolution": "  4K  "}}):
+            assert _provider()._resolve_resolution() == "4K"
+
+    def test_unknown_value_falls_back_to_default(self):
+        # An out-of-ladder value must not be sent verbatim (would 400 the proxy);
+        # fall back to the default rather than fail.
+        with _patch_cfg({"nano-banana": {"resolution": "8K"}}):
+            assert _provider()._resolve_resolution() == "4K"
+
+
+class TestResolutionPerModelCap:
+    def test_capped_model_clamps_down(self):
+        # Lite is documented 1K-only; a 4K request degrades gracefully to 1K.
+        with _patch_cfg({"nano-banana": {"resolution": "4K"}}):
+            assert (
+                _provider()._resolve_resolution(model="gemini-3.1-flash-lite-image")
+                == "1K"
+            )
+
+    def test_uncapped_model_keeps_requested(self):
+        with _patch_cfg({"nano-banana": {"resolution": "4K"}}):
+            assert (
+                _provider()._resolve_resolution(model="gemini-3-pro-image") == "4K"
+            )
+
+    def test_capped_model_below_cap_unchanged(self):
+        with _patch_cfg({"nano-banana": {"resolution": "1K"}}):
+            assert (
+                _provider()._resolve_resolution(model="gemini-3.1-flash-lite-image")
+                == "1K"
+            )
+
+
+class TestResolutionPayload:
+    def test_image_size_sent_on_text_to_image(self):
+        with _patch_cfg({"nano-banana": {"resolution": "4K"}}), _patch_runtime(), \
+             patch("requests.post", return_value=_mock_chat_response([_PNG_DATA_URI])) as mock_post, \
+             _patch_save("/tmp/x.png"):
+            _provider().generate(prompt="a banana", aspect_ratio="landscape")
+        ic = mock_post.call_args.kwargs["json"]["image_config"]
+        assert ic["image_size"] == "4K"
+        assert ic["aspect_ratio"] == "16:9"
+
+    def test_default_4k_sent_when_config_absent(self):
+        with _patch_cfg({}), _patch_runtime(), \
+             patch("requests.post", return_value=_mock_chat_response([_PNG_DATA_URI])) as mock_post, \
+             _patch_save("/tmp/x.png"):
+            _provider().generate(prompt="a banana")
+        assert mock_post.call_args.kwargs["json"]["image_config"]["image_size"] == "4K"
+
+    def test_config_override_2k_sent(self):
+        with _patch_cfg({"nano-banana": {"resolution": "2K"}}), _patch_runtime(), \
+             patch("requests.post", return_value=_mock_chat_response([_PNG_DATA_URI])) as mock_post, \
+             _patch_save("/tmp/x.png"):
+            _provider().generate(prompt="a banana")
+        assert mock_post.call_args.kwargs["json"]["image_config"]["image_size"] == "2K"
+
+    def test_success_reports_resolution(self):
+        with _patch_cfg({"nano-banana": {"resolution": "2K"}}), _patch_runtime(), \
+             patch("requests.post", return_value=_mock_chat_response([_PNG_DATA_URI])), \
+             _patch_save("/tmp/x.png"):
+            result = _provider().generate(prompt="a banana")
+        assert result["resolution"] == "2K"
+
+
+class TestResolutionGracefulDegradation:
+    def test_proxy_rejects_image_size_falls_back_without_it(self):
+        """If the proxy 400s on the image_size field, retry once WITHOUT it
+        (current no-resolution behavior) rather than failing the generation."""
+        import requests as req_lib
+
+        bad = MagicMock()
+        bad.status_code = 400
+        bad.text = "Unknown name \"image_size\""
+        bad.json.return_value = {"error": {"message": "Unknown name \"image_size\""}}
+        bad.raise_for_status.side_effect = req_lib.HTTPError(response=bad)
+        good = _mock_chat_response([_PNG_DATA_URI])
+
+        with _patch_cfg({"nano-banana": {"resolution": "4K"}}), _patch_runtime(), \
+             patch("requests.post", side_effect=[bad, good]) as mock_post, \
+             _patch_save("/tmp/x.png"):
+            result = _provider().generate(prompt="a banana")
+
+        assert result["success"] is True
+        # Two calls: first with image_size, retry without it.
+        assert mock_post.call_count == 2
+        first_ic = mock_post.call_args_list[0].kwargs["json"]["image_config"]
+        second_ic = mock_post.call_args_list[1].kwargs["json"]["image_config"]
+        assert "image_size" in first_ic
+        assert "image_size" not in second_ic
+
+    def test_unrelated_400_is_not_masked_by_fallback(self):
+        """A 400 that is NOT about the resolution field must surface as an error,
+        not trigger an infinite/masking retry."""
+        import requests as req_lib
+
+        bad = MagicMock()
+        bad.status_code = 400
+        bad.text = "prompt was blocked by safety policy"
+        bad.json.return_value = {"error": {"message": "prompt was blocked by safety policy"}}
+        bad.raise_for_status.side_effect = req_lib.HTTPError(response=bad)
+
+        with _patch_cfg({"nano-banana": {"resolution": "4K"}}), _patch_runtime(), \
+             patch("requests.post", return_value=bad) as mock_post:
+            result = _provider().generate(prompt="a banana")
+
+        assert result["success"] is False
+        assert result["error_type"] == "api_error"
+        assert mock_post.call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Registration + setup schema
 # ---------------------------------------------------------------------------
 
