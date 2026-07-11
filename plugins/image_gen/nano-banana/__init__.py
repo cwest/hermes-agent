@@ -36,6 +36,18 @@ The model catalog is data, not a two-model assumption: Nano Banana 2 Lite
 (``gemini-3.1-flash-lite-image``) is listed as a documented slot that drops in
 with zero code change once the proxy serves it.
 
+Resolution is config-only (no per-call parameter on the ``image_generate`` tool
+schema): ``image_gen.nano-banana.resolution`` in config.yaml selects the output
+size sent as ``image_config.image_size`` (``1K``/``2K``/``4K``, uppercase K),
+defaulting to ``4K``. Verified against the live proxy — ``image_size`` changes
+the decoded PNG dimensions on the text-to-image path and composes with
+``aspect_ratio``. Caveat: on the EDIT path the model tends to preserve the
+source image's dimensions regardless, so resolution primarily affects
+text-to-image. A per-model cap degrades gracefully (a capped model like Lite =
+1K clamps down rather than erroring), and if the proxy ever rejects the
+``image_size`` field the request is retried once WITHOUT it (current
+no-resolution behavior) so the generation still lands.
+
 Prompt craft lives in the ``nano-banana-prompting`` skill, not in this backend.
 """
 
@@ -75,23 +87,44 @@ _MODELS: Dict[str, Dict[str, Any]] = {
         "display": "Nano Banana Pro (Gemini 3 Pro Image)",
         "speed": "~18s",
         "strengths": "Highest fidelity; strongest prompt adherence — quality default",
+        "max_resolution": "4K",
     },
     "gemini-3.1-flash-image": {
         "display": "Nano Banana 2 (Gemini 3.1 Flash Image)",
         "speed": "~2s",
         "strengths": "Fast path — sub-few-second latency for quick iteration",
+        "max_resolution": "4K",
     },
     # Documented zero-code slot. Not on the proxy yet; selecting it via
     # config.yaml (image_gen.nano-banana.model) or the model kwarg will route to
-    # it automatically once the proxy serves it.
+    # it automatically once the proxy serves it. Per Google's docs Lite tops out
+    # at 1K, so a higher configured resolution degrades gracefully to its cap.
     "gemini-3.1-flash-lite-image": {
         "display": "Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)",
         "speed": "~1s",
         "strengths": "Lightest/cheapest fast path (drops in when proxy serves it)",
+        "max_resolution": "1K",
     },
 }
 
 DEFAULT_MODEL = "gemini-3-pro-image"
+
+# Resolution ladder for the proxy's image_config.image_size field. VERIFIED
+# against the live proxy: image_config.image_size ∈ {"1K","2K","4K"} changes the
+# decoded PNG dimensions on the text-to-image path and composes with
+# aspect_ratio (e.g. 4K+16:9 → 5504×3072, 4K+1:1 → 4096×4096, 2K+16:9 →
+# 2752×1536, 1K+16:9 → 1376×768). The proxy REQUIRES an uppercase "K"
+# (lowercase "1k" is rejected) and 400s on an unknown field name (image_config.
+# resolution / response_format.image_size are NOT honoured — only
+# image_config.image_size). Ordered smallest → largest for cap clamping.
+_RESOLUTION_LADDER = ["1K", "2K", "4K"]
+_RESOLUTIONS = set(_RESOLUTION_LADDER)
+
+# Config-only, per Casey: every call uses the configured resolution; there is no
+# per-call resolution parameter on the image_generate tool schema. Default 4K.
+DEFAULT_RESOLUTION = "4K"
+
+_RESOLUTION_ENV_VAR = "NANO_BANANA_IMAGE_RESOLUTION"
 
 # Runtime (proxy) resolution: the proxy is a configured custom_providers entry.
 # Override via image_gen.nano-banana.runtime in config.yaml if the entry is
@@ -274,6 +307,62 @@ class NanoBananaImageGenProvider(ImageGenProvider):
             return top.strip()
         return DEFAULT_MODEL
 
+    def _resolve_resolution(self, model: Optional[str] = None) -> str:
+        """Pick the output resolution for ``image_config.image_size``.
+
+        Config-only (no per-call parameter): precedence, first hit wins —
+
+        1. ``NANO_BANANA_IMAGE_RESOLUTION`` env (escape hatch for scripts/tests)
+        2. ``image_gen.nano-banana.resolution`` in config.yaml
+        3. :data:`DEFAULT_RESOLUTION` — ``"4K"``
+
+        The value is normalised to an uppercase ladder token (the proxy rejects
+        lowercase ``k``); an out-of-ladder value falls back to the default
+        rather than being sent verbatim (which would 400 the proxy). Finally the
+        result is clamped to the model's documented ``max_resolution`` so a
+        capped model (e.g. Lite = 1K) degrades gracefully instead of erroring.
+        """
+        raw = os.environ.get(_RESOLUTION_ENV_VAR, "").strip()
+        if not raw:
+            cfg = _load_image_gen_config()
+            scoped = cfg.get("nano-banana") if isinstance(cfg.get("nano-banana"), dict) else {}
+            if isinstance(scoped, dict):
+                value = scoped.get("resolution")
+                if isinstance(value, str) and value.strip():
+                    raw = value.strip()
+
+        normalized = raw.upper() if raw else ""
+        if normalized not in _RESOLUTIONS:
+            if normalized:
+                logger.warning(
+                    "nano-banana: unknown resolution %r (expected one of %s); "
+                    "falling back to %s",
+                    raw,
+                    ", ".join(_RESOLUTION_LADDER),
+                    DEFAULT_RESOLUTION,
+                )
+            normalized = DEFAULT_RESOLUTION
+
+        return self._clamp_resolution(normalized, model)
+
+    @staticmethod
+    def _clamp_resolution(resolution: str, model: Optional[str]) -> str:
+        """Degrade ``resolution`` to the model's documented ceiling, if lower."""
+        meta = _MODELS.get(model or "") or {}
+        cap = meta.get("max_resolution")
+        if cap not in _RESOLUTIONS:
+            return resolution
+        if _RESOLUTION_LADDER.index(resolution) <= _RESOLUTION_LADDER.index(cap):
+            return resolution
+        logger.info(
+            "nano-banana: %s caps resolution at %s; degrading requested %s to %s",
+            model,
+            cap,
+            resolution,
+            cap,
+        )
+        return cap
+
     def generate(
         self,
         prompt: str,
@@ -289,6 +378,7 @@ class NanoBananaImageGenProvider(ImageGenProvider):
         aspect = resolve_aspect_ratio(aspect_ratio)
         proxy_aspect = _ASPECT_RATIOS.get(aspect, "1:1")
         model_id = self._resolve_model(kwargs.get("model"))
+        resolution = self._resolve_resolution(model_id)
 
         # Collect every source/reference image. The generic tool surface uses
         # image_url / reference_image_urls; some callers (e.g. the pet
@@ -349,16 +439,157 @@ class NanoBananaImageGenProvider(ImageGenProvider):
             "model": model_id,
             "modalities": ["image", "text"],
             "messages": [{"role": "user", "content": content}],
-            "image_config": {"aspect_ratio": proxy_aspect},
+            "image_config": {"aspect_ratio": proxy_aspect, "image_size": resolution},
         }
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        url = f"{base_url}/chat/completions"
+
+        result = self._post_with_resolution_fallback(
+            url=url,
+            headers=headers,
+            payload=payload,
+            model_id=model_id,
+            prompt=prompt,
+            aspect=aspect,
+            resolution=resolution,
+        )
+        # A helper failure returns an error_response dict (success is False).
+        if isinstance(result, dict) and result.get("success") is False:
+            return result
+
+        images = _extract_images(result)
+        if not images:
+            return error_response(
+                error=(
+                    f"nano-banana returned no image. Ensure the model '{model_id}' "
+                    "supports image output on the proxy."
+                ),
+                error_type="empty_response",
+                provider="nano-banana",
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        first = images[0]
+        try:
+            if first.startswith("data:"):
+                b64 = first.split(",", 1)[1] if "," in first else ""
+                saved_path = save_b64_image(b64, prefix="nano_banana")
+            else:
+                # The proxy returns inline base64 data URIs; a bare URL is
+                # unexpected but handled for robustness.
+                from agent.image_gen_provider import save_url_image
+
+                saved_path = save_url_image(first, prefix="nano_banana")
+        except Exception as exc:  # noqa: BLE001
+            return error_response(
+                error=f"Could not save generated image: {exc}",
+                error_type="io_error",
+                provider="nano-banana",
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        return success_response(
+            image=str(saved_path),
+            model=model_id,
+            prompt=prompt,
+            aspect_ratio=aspect,
+            provider="nano-banana",
+            modality=modality,
+            extra={"resolution": resolution},
+        )
+
+    def _post_with_resolution_fallback(
+        self,
+        *,
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        model_id: str,
+        prompt: str,
+        aspect: str,
+        resolution: str,
+    ) -> Dict[str, Any]:
+        """POST the generation request; on a resolution-field rejection, retry
+        once WITHOUT ``image_config.image_size`` (current no-resolution
+        behavior) rather than failing the whole generation.
+
+        Returns the parsed JSON result on success, or an ``error_response`` dict
+        (``success`` is ``False``) on a non-recoverable failure.
+        """
+        result = self._post_once(
+            url=url,
+            headers=headers,
+            payload=payload,
+            model_id=model_id,
+            prompt=prompt,
+            aspect=aspect,
+        )
+        # Graceful degradation: if the proxy rejected the resolution field
+        # specifically, drop it and retry once so the generation still lands.
+        if (
+            isinstance(result, dict)
+            and result.get("success") is False
+            and result.get("error_type") == "api_error"
+            and self._is_resolution_field_error(result.get("error", ""))
+            and "image_size" in payload.get("image_config", {})
+        ):
+            logger.warning(
+                "nano-banana: proxy rejected image_size=%s; retrying without it "
+                "(falling back to default geometry)",
+                resolution,
+            )
+            fallback = {
+                **payload,
+                "image_config": {
+                    k: v
+                    for k, v in payload.get("image_config", {}).items()
+                    if k != "image_size"
+                },
+            }
+            result = self._post_once(
+                url=url,
+                headers=headers,
+                payload=fallback,
+                model_id=model_id,
+                prompt=prompt,
+                aspect=aspect,
+            )
+        return result
+
+    @staticmethod
+    def _is_resolution_field_error(message: str) -> bool:
+        """True when an API error is about the ``image_size`` field itself.
+
+        Scopes the fallback to genuine field-contract rejections so an unrelated
+        400 (e.g. a safety block) still surfaces as an error instead of being
+        masked by a retry.
+        """
+        low = str(message or "").lower()
+        return "image_size" in low
+
+    def _post_once(
+        self,
+        *,
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        model_id: str,
+        prompt: str,
+        aspect: str,
+    ) -> Dict[str, Any]:
+        """Single POST + parse. Returns parsed JSON or an ``error_response``."""
+        import requests
 
         try:
             response = requests.post(
-                f"{base_url}/chat/completions",
+                url,
                 headers=headers,
                 json=payload,
                 timeout=_REQUEST_TIMEOUT,
@@ -403,7 +634,7 @@ class NanoBananaImageGenProvider(ImageGenProvider):
             )
 
         try:
-            result = response.json()
+            return response.json()
         except Exception as exc:  # noqa: BLE001
             return error_response(
                 error=f"nano-banana proxy returned invalid JSON: {exc}",
@@ -413,50 +644,6 @@ class NanoBananaImageGenProvider(ImageGenProvider):
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
-
-        images = _extract_images(result)
-        if not images:
-            return error_response(
-                error=(
-                    f"nano-banana returned no image. Ensure the model '{model_id}' "
-                    "supports image output on the proxy."
-                ),
-                error_type="empty_response",
-                provider="nano-banana",
-                model=model_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
-
-        first = images[0]
-        try:
-            if first.startswith("data:"):
-                b64 = first.split(",", 1)[1] if "," in first else ""
-                saved_path = save_b64_image(b64, prefix="nano_banana")
-            else:
-                # The proxy returns inline base64 data URIs; a bare URL is
-                # unexpected but handled for robustness.
-                from agent.image_gen_provider import save_url_image
-
-                saved_path = save_url_image(first, prefix="nano_banana")
-        except Exception as exc:  # noqa: BLE001
-            return error_response(
-                error=f"Could not save generated image: {exc}",
-                error_type="io_error",
-                provider="nano-banana",
-                model=model_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
-
-        return success_response(
-            image=str(saved_path),
-            model=model_id,
-            prompt=prompt,
-            aspect_ratio=aspect,
-            provider="nano-banana",
-            modality=modality,
-        )
 
 
 def register(ctx: Any) -> None:
