@@ -5897,7 +5897,7 @@ def promote_task(
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` -> ready or todo.
+    """Transition ``blocked``/``scheduled``/``triage`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -5905,11 +5905,25 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     the leaked run is closed as ``reclaimed`` inside the same txn so the
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
+
+    ``triage`` is a transitionable source status alongside ``blocked``/
+    ``scheduled``: the block-loop breaker escalates a card to ``triage`` once
+    ``block_recurrences`` reaches :data:`BLOCK_RECURRENCE_LIMIT` (see
+    :func:`block_task`), and the OUTER feedback loop (Casey-feedback -> author on
+    a card carrying an open PR) has no ``review-changes-requested`` reason, so
+    :func:`auto_route_review_bounce` never routes it. Without ``triage`` here, a
+    card churned into triage could never emit the ``unblocked`` cutoff event that
+    :func:`check_respawn_guard` honors to clear the ``active_pr`` guard — so it
+    wedged forever (live 2026-07-11 symptom). Transitioning from ``triage`` makes
+    the sanctioned unblock self-heal that class. It deliberately does NOT reset
+    ``block_recurrences`` (see the note below), so the loop breaker is preserved:
+    the counter still survives the unblock and is reset only on completion or via
+    the explicit :func:`reset_block_recurrences` recovery API.
     """
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled', 'triage')",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -5950,7 +5964,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'triage')",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
