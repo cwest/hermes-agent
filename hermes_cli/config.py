@@ -3137,6 +3137,32 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # Image generation backends (image_generate tool). The active backend is
+    # selected via image_gen.provider (e.g. "nano-banana", "openrouter", "fal",
+    # "xai", "openai", "krea", "openai-codex"); each backend reads its own
+    # image_gen.<provider>.* subsection for model/runtime overrides. The keys
+    # below are framework-level and apply regardless of the active backend.
+    "image_gen": {
+        # Shared cache GC for $HERMES_HOME/cache/images/ (used by every
+        # backend). The cache is a lifecycle cache, not an archive: durable
+        # copies live wherever the consuming workflow moves them. A small
+        # janitor prunes oldest-first, opportunistically on image save, when
+        # EITHER cap is exceeded. Emits a single INFO log line when it prunes.
+        "cache": {
+            "max_age_days": 30,     # delete cached images older than this
+            "max_total_mb": 2048,   # keep total cache size under ~2 GB
+        },
+        # Per-backend model/runtime overrides go under image_gen.<provider>, e.g.
+        #   image_gen:
+        #     provider: nano-banana
+        #     nano-banana:
+        #       model: gemini-3-pro-image        # Pro is the default
+        #       # model: gemini-3.1-flash-image  # Flash fast-path
+        #       # model: gemini-3.1-flash-lite-image  # Lite (drops in when the
+        #       #                                       proxy serves it)
+        #       # runtime: custom:vertex-llm-proxy  # proxy credentials entry
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 32,
 }
