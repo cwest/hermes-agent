@@ -59,6 +59,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
+    prepare_outbound_image,
 )
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.yuanbao_media import (
@@ -4634,7 +4635,10 @@ class MessageSender:
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
             if ext in self.IMAGE_EXTS:
-                last_result = await adapter.send_image_file(chat_id, media_path)
+                last_result = await adapter.send_image_file(
+                    chat_id,
+                    prepare_outbound_image(media_path, platform="yuanbao"),
+                )
             else:
                 last_result = await adapter.send_document(chat_id, media_path)
 

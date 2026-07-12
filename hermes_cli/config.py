@@ -2788,6 +2788,32 @@ DEFAULT_CONFIG = {
         # adapter. ``0`` disables the cap. Default 128 MiB.
         "max_inbound_media_bytes": 134217728,
 
+        # Maximum bytes for an OUTBOUND image sent as a native attachment.
+        # Size-capped platforms (Discord ~10 MB non-Nitro) SILENTLY DROP an
+        # oversized attachment: the message sends, the platform reports
+        # "Couldn't deliver the image attachment," and the file never arrives.
+        # A 4K render (Nano Banana Pro at 5504x3072) is routinely 15-20 MB, so
+        # every 4K image sent to a size-capped platform would be lost. When an
+        # outbound image exceeds this cap, the gateway sends a downscaled JPEG
+        # preview instead while leaving the full-resolution original untouched
+        # on disk. Enforced in the shared prep helper
+        # (gateway/platforms/base.py), so the behavior holds across every
+        # platform adapter. ``0`` disables the cap (never downscale). Default
+        # 10 MiB — the Discord non-Nitro limit, a safe conservative floor for
+        # any platform whose exact cap is unknown.
+        "max_outbound_image_bytes": 10485760,
+
+        # Per-platform override map for ``max_outbound_image_bytes``. A platform
+        # listed here uses its own cap; any platform absent from the map falls
+        # back to the global ``max_outbound_image_bytes`` above. Set a platform
+        # to ``0`` to disable downscaling for it (e.g. Slack, whose effective
+        # image limit is high). Example:
+        #   max_outbound_image_bytes_by_platform:
+        #     discord: 10485760   # ~10 MB non-Nitro
+        #     telegram: 10485760  # sendPhoto ~10 MB
+        #     slack: 0            # effectively unbounded → never downscale
+        "max_outbound_image_bytes_by_platform": {},
+
         # When false (default), any file path the agent emits is delivered
         # as a native attachment as long as it isn't under the credential /
         # system-path denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env,

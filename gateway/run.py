@@ -12613,7 +12613,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if image_paths:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    # Downscale any over-cap image to a deliverable preview
+                    # before building the file:// batch, so size-capped
+                    # platforms (Discord ~10 MB) don't silently drop a 4K
+                    # render. The full-res original stays on disk; only the
+                    # bytes sent change. Fail-open: prep returns the original
+                    # path on any error.
+                    prepped_image_paths = BasePlatformAdapter.prepare_outbound_image_paths(
+                        image_paths, platform=event.source.platform
+                    )
+                    images = [(f"file://{_quote(p)}", "") for p in prepped_image_paths]
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
@@ -12820,6 +12829,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # a generic document. Mirrors the streaming + kanban paths.
                 from gateway.platforms.base import (
                     should_send_media_as_audio as _should_send_media_as_audio,
+                    prepare_outbound_image as _prepare_outbound_image,
                 )
                 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
                 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
@@ -12841,7 +12851,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         elif _ext in _IMAGE_EXTS:
                             await adapter.send_image_file(
                                 chat_id=source.chat_id,
-                                image_path=media_path,
+                                image_path=_prepare_outbound_image(
+                                    media_path, platform=source.platform
+                                ),
                                 metadata=_thread_metadata,
                             )
                         else:
@@ -12955,9 +12967,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not image_path.exists():
             return
         try:
+            from gateway.platforms.base import prepare_outbound_image as _prepare_outbound_image
             await adapter.send_image_file(
                 chat_id=source.chat_id,
-                image_path=str(image_path),
+                image_path=_prepare_outbound_image(
+                    str(image_path), platform=source.platform
+                ),
                 caption="BotFather → Bot Settings → Threads Settings",
                 metadata={"thread_id": str(source.thread_id)} if source.thread_id else None,
             )
