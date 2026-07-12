@@ -1182,6 +1182,14 @@ class GatewayKanbanWatchersMixin:
 
         if image_paths:
             try:
+                # Downscale any over-cap local image to a preview that fits the
+                # delivery target's outbound attachment cap before building the
+                # file:// batch — otherwise size-capped platforms (Discord's
+                # ~10MB non-Nitro cap) silently drop the oversized attachment.
+                # Mirrors the wired dispatch sites; fail-open on any error.
+                image_paths = BasePlatformAdapter.prepare_outbound_image_paths(
+                    image_paths, getattr(adapter, "platform", "")
+                )
                 batch = [(f"file://{_quote(p)}", "") for p in image_paths]
                 await adapter.send_multiple_images(
                     chat_id=chat_id, images=batch, metadata=metadata,

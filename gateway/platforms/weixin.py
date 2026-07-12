@@ -65,6 +65,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    prepare_outbound_image,
 )
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -1866,7 +1867,11 @@ class WeixinAdapter(BasePlatformAdapter):
             elif ext in _VIDEO_EXTS:
                 await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
             elif ext in _IMAGE_EXTS:
-                await self.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata)
+                await self.send_image_file(
+                    chat_id=chat_id,
+                    image_path=prepare_outbound_image(path, platform=self.platform),
+                    metadata=metadata,
+                )
             else:
                 await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
 
@@ -2319,7 +2324,10 @@ async def send_weixin_direct(
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
             if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                last_result = await live_adapter.send_image_file(chat_id, media_path)
+                last_result = await live_adapter.send_image_file(
+                    chat_id,
+                    prepare_outbound_image(media_path, platform="weixin"),
+                )
             else:
                 last_result = await live_adapter.send_document(chat_id, media_path)
             if not last_result.success:
@@ -2364,7 +2372,10 @@ async def send_weixin_direct(
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
             if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                last_result = await adapter.send_image_file(chat_id, media_path)
+                last_result = await adapter.send_image_file(
+                    chat_id,
+                    prepare_outbound_image(media_path, platform="weixin"),
+                )
             else:
                 last_result = await adapter.send_document(chat_id, media_path)
             if not last_result.success:

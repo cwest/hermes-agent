@@ -375,3 +375,143 @@ class TestConfigDefaults:
         assert base.get_outbound_image_max_bytes("discord") == DEFAULT_OUTBOUND_IMAGE_MAX_BYTES
 
 
+class TestKanbanArtifactDeliveryIsWired:
+    """Regression for the review-caught gap: kanban artifact delivery
+    (``_deliver_kanban_artifacts`` -> ``send_multiple_images``) shipped a
+    raw ``file://`` batch with NO downscale prep, so a 4K image handed to
+    ``kanban_complete(artifacts=[...])`` still silently dropped on Discord.
+
+    Behavioral contract: when an artifact image is over the delivery
+    target's cap, the path inside the ``file://`` batch handed to the
+    adapter's ``send_multiple_images`` is the downscaled preview, not the
+    oversized original.
+    """
+
+    def test_over_cap_artifact_hands_preview_to_send(self, tmp_path, monkeypatch):
+        import asyncio
+        from urllib.parse import unquote as _unquote
+
+        import gateway.platforms.base as base
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+        from gateway.platforms.base import SendResult
+
+        big = str(tmp_path / "artifact_render.png")
+        big_bytes = _write_big_png(big, size=(1600, 1200))
+        monkeypatch.setattr(
+            base, "load_config_for_outbound",
+            lambda: {"gateway": {"max_outbound_image_bytes": big_bytes // 4}},
+        )
+
+        sent_batches: list = []
+
+        class _StubAdapter:
+            # Same platform key the wired dispatch sites resolve the cap by.
+            platform = "discord"
+
+            async def send_multiple_images(self, chat_id, images, metadata=None):
+                sent_batches.append(images)
+                return SendResult(success=True, message_id="1")
+
+        adapter = _StubAdapter()
+
+        # Unbound call: the method body never touches `self`, so a bare
+        # object stands in for the gateway mixin host.
+        asyncio.run(
+            GatewayKanbanWatchersMixin._deliver_kanban_artifacts(
+                object(),
+                adapter=adapter,
+                chat_id="c",
+                metadata={},
+                event_payload={"artifacts": [big]},
+                task=None,
+            )
+        )
+
+        assert len(sent_batches) == 1
+        batch = sent_batches[0]
+        assert len(batch) == 1
+        # The batch carries a file:// URL; decode it back to a local path.
+        url = batch[0][0]
+        assert url.startswith("file://")
+        delivered = _unquote(url[len("file://"):])
+        # The batch carries the downscaled preview, NOT the oversized original.
+        assert delivered != big
+        assert os.path.getsize(delivered) <= big_bytes // 4
+
+    def test_under_cap_artifact_passes_through_unchanged(self, tmp_path, monkeypatch):
+        import asyncio
+        from urllib.parse import unquote as _unquote
+
+        import gateway.platforms.base as base
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+        from gateway.platforms.base import SendResult
+
+        small = str(tmp_path / "small_artifact.png")
+        _write_png(small, size=(32, 32))
+        monkeypatch.setattr(
+            base, "load_config_for_outbound",
+            lambda: {"gateway": {"max_outbound_image_bytes": 10 * 1024 * 1024}},
+        )
+
+        sent_batches: list = []
+
+        class _StubAdapter:
+            platform = "discord"
+
+            async def send_multiple_images(self, chat_id, images, metadata=None):
+                sent_batches.append(images)
+                return SendResult(success=True, message_id="1")
+
+        asyncio.run(
+            GatewayKanbanWatchersMixin._deliver_kanban_artifacts(
+                object(),
+                adapter=_StubAdapter(),
+                chat_id="c",
+                metadata={},
+                event_payload={"artifacts": [small]},
+                task=None,
+            )
+        )
+
+        assert len(sent_batches) == 1
+        delivered = _unquote(sent_batches[0][0][0][len("file://"):])
+        # Under cap: the original path rides the batch untouched.
+        assert delivered == small
+
+
+class TestDirectSendToolPathsAreWired:
+    """The platform ``send_message``-tool direct-send paths (Weixin, Yuanbao)
+    dispatch a local image via ``send_image_file`` outside the base handle
+    flow. Each must funnel that local path through the outbound prep, or an
+    over-cap image silently drops on that platform too. Light source guards
+    (these paths need a live WS/session to exercise end-to-end)."""
+
+    def _src(self, module):
+        with open(module.__file__, "r") as fh:
+            return fh.read()
+
+    def test_weixin_references_outbound_prep(self):
+        import gateway.platforms.weixin as weixin
+
+        assert "prepare_outbound_image" in self._src(weixin), (
+            "gateway/platforms/weixin.py never calls the outbound image prep "
+            "— a local image send there can silently drop on size-capped peers"
+        )
+
+    def test_yuanbao_references_outbound_prep(self):
+        import gateway.platforms.yuanbao as yuanbao
+
+        assert "prepare_outbound_image" in self._src(yuanbao), (
+            "gateway/platforms/yuanbao.py never calls the outbound image prep "
+            "— a local image send there can silently drop on size-capped peers"
+        )
+
+    def test_kanban_watchers_references_outbound_prep(self):
+        import gateway.kanban_watchers as kw
+
+        assert "prepare_outbound_image" in self._src(kw), (
+            "gateway/kanban_watchers.py never calls the outbound image prep "
+            "— kanban artifact images can silently drop on size-capped peers"
+        )
+
+
