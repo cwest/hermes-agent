@@ -676,6 +676,181 @@ def get_image_cache_dir() -> Path:
     return d
 
 
+# ---------------------------------------------------------------------------
+# Outbound image size cap + downscale-preview
+#
+# Size-capped platforms SILENTLY DROP an oversized native attachment: the
+# message sends, the platform reports "Couldn't deliver the image attachment,"
+# and the file never arrives. A 4K render (Nano Banana Pro at 5504x3072) is
+# routinely 15-20 MB, well past Discord's ~10 MB non-Nitro cap, so every 4K
+# image sent to Discord would be lost.
+#
+# The delivery-side companion to the inbound media cap above: before an image
+# is sent as a native attachment, if it exceeds the target platform's outbound
+# cap, send a downscaled preview instead — leaving the full-resolution
+# original untouched on disk. Generic across platforms, config-driven, and
+# fail-open (any downscale error returns the original path rather than
+# blocking delivery that would otherwise work).
+#
+# Configurable via ``gateway.max_outbound_image_bytes`` (global default) and
+# ``gateway.max_outbound_image_bytes_by_platform`` (per-platform override map)
+# in config.yaml. ``0`` disables the cap. Behavioral config, so it lives in
+# config.yaml — never a HERMES_* env var (secrets only).
+# ---------------------------------------------------------------------------
+DEFAULT_OUTBOUND_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB (Discord non-Nitro)
+
+# Downscale ladder: successively smaller long-edge / JPEG-quality pairs tried
+# in order until the preview fits under the cap. The last rung is the
+# best-effort floor — if even that overshoots, we still return it rather than
+# hard-failing delivery.
+_OUTBOUND_DOWNSCALE_LADDER = (
+    (2048, 88),
+    (1568, 82),
+    (1024, 76),
+    (768, 72),
+)
+
+
+def _lanczos_filter():
+    """Return the LANCZOS resampling filter across Pillow versions.
+
+    Pillow 9.1 moved the filter enum to ``Image.Resampling``; the top-level
+    ``Image.LANCZOS`` alias still works on current releases but is typed as
+    removed. Resolve defensively so both old and new Pillow work.
+    """
+    from PIL import Image
+    resampling = getattr(Image, "Resampling", None)
+    if resampling is not None and hasattr(resampling, "LANCZOS"):
+        return resampling.LANCZOS
+    return Image.LANCZOS
+
+
+def load_config_for_outbound() -> dict:
+    """Load config.yaml for outbound-cap resolution.
+
+    Thin indirection over ``hermes_cli.config.load_config`` so the resolver
+    below can be exercised without a real config file. Non-fatal: callers
+    treat any exception as "config unreadable" and fall back to defaults.
+    """
+    from hermes_cli.config import load_config as _load_config
+    return _load_config()
+
+
+def get_outbound_image_max_bytes(platform) -> int:
+    """Return the max outbound image byte size for *platform*.
+
+    Resolution order:
+      1. ``gateway.max_outbound_image_bytes_by_platform[<platform>]`` if set.
+      2. ``gateway.max_outbound_image_bytes`` (global) if set.
+      3. ``DEFAULT_OUTBOUND_IMAGE_MAX_BYTES`` (10 MiB) otherwise.
+
+    ``0`` (or a negative / unparseable value) disables the cap. Mirrors the
+    inbound resolver's tolerance: any read failure falls back to the default.
+    """
+    name = _platform_name(platform)
+    try:
+        cfg = load_config_for_outbound()
+    except Exception:
+        return DEFAULT_OUTBOUND_IMAGE_MAX_BYTES
+    gw = cfg.get("gateway", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(gw, dict):
+        return DEFAULT_OUTBOUND_IMAGE_MAX_BYTES
+
+    per_platform = gw.get("max_outbound_image_bytes_by_platform")
+    if isinstance(per_platform, dict) and name in per_platform:
+        try:
+            return int(per_platform[name])
+        except (TypeError, ValueError):
+            pass  # fall through to the global default
+
+    if "max_outbound_image_bytes" in gw:
+        try:
+            return int(gw["max_outbound_image_bytes"])
+        except (TypeError, ValueError):
+            return DEFAULT_OUTBOUND_IMAGE_MAX_BYTES
+
+    return DEFAULT_OUTBOUND_IMAGE_MAX_BYTES
+
+
+def prepare_outbound_image(
+    path: str,
+    *,
+    platform,
+    max_bytes: Optional[int] = None,
+) -> str:
+    """Return a deliverable image path that fits under the platform cap.
+
+    If *path* is not a readable image, is already at/under the cap, or the cap
+    is ``0``/disabled, the ORIGINAL path is returned unchanged. Otherwise a
+    downscaled JPEG preview is written into the image cache and its path
+    returned; the source file is never mutated and never upscaled.
+
+    Fail-open: on ANY error (missing file, PIL failure, unwritable cache) the
+    original path is returned so a downscale bug can never block a delivery
+    that would otherwise succeed.
+    """
+    cap = get_outbound_image_max_bytes(platform) if max_bytes is None else max_bytes
+    if not cap or cap <= 0:
+        return path
+
+    try:
+        if not os.path.isfile(path):
+            return path
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return path
+        if size <= cap:
+            return path
+
+        # Sniff magic bytes before handing the file to PIL so non-image
+        # payloads (e.g. a mislabeled document) pass straight through.
+        try:
+            with open(path, "rb") as fh:
+                header = fh.read(12)
+        except OSError:
+            return path
+        if not _looks_like_image(header):
+            return path
+
+        from PIL import Image  # local import: PIL is optional at import time
+
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            orig_w, orig_h = img.width, img.height
+            long_edge = max(orig_w, orig_h)
+
+            cache_dir = get_image_cache_dir()
+            preview_path = str(cache_dir / f"preview_{uuid.uuid4().hex[:12]}.jpg")
+
+            best_path: Optional[str] = None
+            for target_long, quality in _OUTBOUND_DOWNSCALE_LADDER:
+                # Never upscale: clamp the target long edge to the original.
+                effective_long = min(target_long, long_edge)
+                if effective_long <= 0:
+                    continue
+                scale = effective_long / long_edge
+                new_w = max(1, int(round(orig_w * scale)))
+                new_h = max(1, int(round(orig_h * scale)))
+                resized = img.resize((new_w, new_h), _lanczos_filter())
+                resized.save(preview_path, format="JPEG", quality=quality, optimize=True)
+                best_path = preview_path
+                if os.path.getsize(preview_path) <= cap:
+                    return preview_path
+
+            # Ladder exhausted: return the smallest best-effort preview we
+            # produced rather than hard-failing delivery. If we somehow never
+            # wrote one, fall back to the original.
+            return best_path if best_path else path
+    except Exception:
+        logger.debug(
+            "prepare_outbound_image: downscale failed for %s; delivering original",
+            _log_safe_path(path) if "_log_safe_path" in globals() else path,
+            exc_info=True,
+        )
+        return path
+
+
 def _looks_like_image(data: bytes) -> bool:
     """Return True if *data* starts with a known image magic-byte sequence."""
     if len(data) < 4:
@@ -3540,6 +3715,20 @@ class BasePlatformAdapter(ABC):
         return validate_media_delivery_path(path)
 
     @staticmethod
+    def prepare_outbound_image_paths(paths, platform) -> List[str]:
+        """Map local image paths through the outbound size cap for *platform*.
+
+        The single shared prep call the dispatch blocks funnel their local
+        image paths through (rather than pasting the downscale logic at each
+        send site). Each path is passed to :func:`prepare_outbound_image`,
+        which returns a downscaled preview when the file exceeds the platform's
+        cap and the original path otherwise. Order is preserved.
+        """
+        if not paths:
+            return []
+        return [prepare_outbound_image(str(p), platform=platform) for p in paths]
+
+    @staticmethod
     def filter_media_delivery_paths(media_files) -> List[Tuple[str, bool]]:
         """Drop unsafe MEDIA paths and normalize accepted paths."""
         safe_media: List[Tuple[str, bool]] = []
@@ -5169,6 +5358,13 @@ class BasePlatformAdapter(ABC):
 
                 if _image_paths:
                     try:
+                        # Downscale any over-cap local image to a preview that
+                        # fits the platform's outbound attachment cap before
+                        # building the file:// batch — otherwise size-capped
+                        # platforms silently drop the oversized attachment.
+                        _image_paths = self.prepare_outbound_image_paths(
+                            _image_paths, self.platform
+                        )
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
                         await self.send_multiple_images(
                             chat_id=event.source.chat_id,
