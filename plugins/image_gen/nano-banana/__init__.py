@@ -6,22 +6,44 @@ to the upstream image service server-side. The client sends only
 ``Authorization: Bearer <proxy token>`` — no Google credential is ever handled
 client-side.
 
-Protocol (OpenAI ``/chat/completions`` image output — the same shape the
-``openrouter`` backend speaks):
+Two request protocols, split by whether the call has an input image — because
+the proxy honors output resolution on only ONE of them:
 
-- ``POST {base_url}/chat/completions`` with ``modalities: ["image", "text"]``,
-  the prompt (and any source/reference images) as ``messages[0].content`` parts,
-  and an optional ``image_config.aspect_ratio``.
-- The generated image comes back at
-  ``choices[0].message.images[0].image_url.url`` as a ``data:image/...;base64``
-  URI (``message.content`` is ``null`` on this protocol). It is decoded and
-  saved under ``$HERMES_HOME/cache/images/`` via the framework's
-  ``save_b64_image``; the tool returns the path, delivered as ``MEDIA:/path``.
+TEXT-TO-IMAGE → ``POST {base_url}/v1/images/generations`` (OpenAI images API):
 
-Unified generate + edit + reference: when ``image_url`` (primary source to edit)
-or ``reference_image_urls`` (style/subject references, e.g. a likeness for
-character consistency) are present, they are inlined as ``image_url`` content
-parts and the call routes to image-to-image / editing; otherwise text-to-image.
+- Body: ``{"model": id, "prompt": ..., "imageConfig": {"imageSize": res,
+  "aspectRatio": ratio}}`` — a NESTED ``imageConfig``. This is the path where
+  LiteLLM (>=1.92.0) maps ``imageConfig`` → Vertex
+  ``generationConfig.imageConfig`` for pro/flash/lite (model-agnostic, no
+  capability flag), so ``gemini-3-pro-image`` actually honors 4K here.
+- The chat/completions path has NO ``imageConfig``→``generationConfig`` mapping
+  (verified against LiteLLM 1.91.2 AND 1.92.0 source), so ``image_size`` on chat
+  is INERT for Pro — it silently returns ~1K regardless. That is the bug this
+  split fixes. FLAT ``imageSize``/``image_size`` at the top level are DROPPED by
+  the proxy; only the nested ``imageConfig`` is honored.
+- Response is the images-API shape: ``data[0].b64_json`` (base64 PNG) and/or
+  ``data[0].url``. ``b64_json`` is decoded via ``save_b64_image``; a bare ``url``
+  is fetched via ``save_url_image``. The tool returns the saved path
+  (``MEDIA:/path``).
+- Requires the proxy on LiteLLM >=1.92.0. If an older proxy rejects the nested
+  ``imageConfig``, the request is retried once WITHOUT it so generation still
+  lands (falls back to default geometry rather than hard-failing).
+
+EDIT / reference → ``POST {base_url}/chat/completions`` (unchanged):
+
+- When ``image_url`` (primary source to edit) or ``reference_image_urls``
+  (style/subject references, e.g. a likeness for character consistency) are
+  present, they are inlined as ``image_url`` content parts and the call routes
+  to image-to-image / editing on the chat path with ``modalities: ["image",
+  "text"]``. The image comes back at
+  ``choices[0].message.images[0].image_url.url`` (``message.content`` is
+  ``null`` on this protocol).
+- Why keep edits on chat: the images-API endpoint has no clean input-image
+  contract at 1.92.0 (image input lives on the multipart ``/v1/images/edits``
+  route, unverified against this proxy). The chat edit path works today, and
+  resolution matters less for edits because the model preserves the source
+  image's dimensions regardless. So text-to-image — where 4K actually matters —
+  moves to the images path, and edit/reference stays on chat.
 
 Model routing is Pro-default and fully config-driven (precedence, first hit
 wins):
@@ -38,15 +60,14 @@ with zero code change once the proxy serves it.
 
 Resolution is config-only (no per-call parameter on the ``image_generate`` tool
 schema): ``image_gen.nano-banana.resolution`` in config.yaml selects the output
-size sent as ``image_config.image_size`` (``1K``/``2K``/``4K``, uppercase K),
-defaulting to ``4K``. Verified against the live proxy — ``image_size`` changes
-the decoded PNG dimensions on the text-to-image path and composes with
-``aspect_ratio``. Caveat: on the EDIT path the model tends to preserve the
-source image's dimensions regardless, so resolution primarily affects
-text-to-image. A per-model cap degrades gracefully (a capped model like Lite =
-1K clamps down rather than erroring), and if the proxy ever rejects the
-``image_size`` field the request is retried once WITHOUT it (current
-no-resolution behavior) so the generation still lands.
+size (``1K``/``2K``/``4K``, uppercase K), defaulting to ``4K``. On the
+text-to-image path it is sent as ``imageConfig.imageSize`` on
+``/v1/images/generations`` — the only place the proxy actually honors it (see
+above). A per-model cap degrades gracefully (a capped model like Lite = 1K
+clamps down rather than erroring), and if the proxy rejects the nested
+``imageConfig`` (older LiteLLM) the request is retried once WITHOUT it so the
+generation still lands. On the EDIT path resolution is not sent — the model
+preserves the source image's dimensions regardless.
 
 Prompt craft lives in the ``nano-banana-prompting`` skill, not in this backend.
 """
@@ -67,6 +88,7 @@ from agent.image_gen_provider import (
     normalize_reference_images,
     resolve_aspect_ratio,
     save_b64_image,
+    save_url_image,
     success_response,
 )
 from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -210,6 +232,23 @@ def _extract_images(payload: Dict[str, Any]) -> List[str]:
             url = image_url.get("url") if isinstance(image_url, dict) else None
             if isinstance(url, str) and url.strip():
                 out.append(url.strip())
+    return out
+
+
+def _extract_images_api(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Pull image items from an OpenAI images-API (/v1/images/generations) response.
+
+    Shape: ``{"data": [{"b64_json": "..."} | {"url": "https://..."}]}``. Returns
+    the raw ``data`` item dicts (each carrying ``b64_json`` and/or ``url``) so the
+    caller can prefer inline base64 over a bare URL.
+    """
+    out: List[Dict[str, Any]] = []
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return out
+    for item in data:
+        if isinstance(item, dict) and (item.get("b64_json") or item.get("url")):
+            out.append(item)
     return out
 
 
@@ -372,8 +411,6 @@ class NanoBananaImageGenProvider(ImageGenProvider):
         reference_image_urls: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        import requests
-
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
         proxy_aspect = _ASPECT_RATIOS.get(aspect, "1:1")
@@ -391,7 +428,6 @@ class NanoBananaImageGenProvider(ImageGenProvider):
         for ref in normalize_reference_images(reference_image_urls) or []:
             references.append(str(ref))
         has_source = bool(references)
-        modality = "image" if has_source else "text"
 
         if not prompt and not has_source:
             return error_response(
@@ -429,6 +465,140 @@ class NanoBananaImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # Split by whether we have an input image. Text-to-image goes to the
+        # images API (/v1/images/generations) where the proxy honors 4K via a
+        # nested imageConfig; edit/reference stays on chat/completions (the
+        # images path has no clean input-image contract at LiteLLM 1.92.0). See
+        # the module docstring for the full rationale.
+        if has_source:
+            return self._generate_edit(
+                base_url=base_url,
+                headers=headers,
+                prompt=prompt,
+                references=references,
+                model_id=model_id,
+                proxy_aspect=proxy_aspect,
+                resolution=resolution,
+                aspect=aspect,
+            )
+        return self._generate_text_to_image(
+            base_url=base_url,
+            headers=headers,
+            prompt=prompt,
+            model_id=model_id,
+            proxy_aspect=proxy_aspect,
+            resolution=resolution,
+            aspect=aspect,
+        )
+
+    def _generate_text_to_image(
+        self,
+        *,
+        base_url: str,
+        headers: Dict[str, str],
+        prompt: str,
+        model_id: str,
+        proxy_aspect: str,
+        resolution: str,
+        aspect: str,
+    ) -> Dict[str, Any]:
+        """Text-to-image via the OpenAI images API (/v1/images/generations).
+
+        This is the ONLY path where LiteLLM maps the nested ``imageConfig`` to
+        Vertex ``generationConfig.imageConfig``, so Pro honors the configured
+        resolution (4K) here. The chat path silently returns ~1K for Pro.
+        """
+        payload: Dict[str, Any] = {
+            "model": model_id,
+            "prompt": prompt,
+            # NESTED imageConfig — flat imageSize/image_size at the top level are
+            # dropped by the proxy and would leave Pro stuck at ~1K.
+            "imageConfig": {"imageSize": resolution, "aspectRatio": proxy_aspect},
+        }
+        # base_url already ends in /v1 (the proxy's OpenAI-compatible root), so
+        # this resolves to {host}/v1/images/generations — the images-API path.
+        url = f"{base_url}/images/generations"
+
+        result = self._post_with_image_config_fallback(
+            url=url,
+            headers=headers,
+            payload=payload,
+            model_id=model_id,
+            prompt=prompt,
+            aspect=aspect,
+            resolution=resolution,
+        )
+        if isinstance(result, dict) and result.get("success") is False:
+            return result
+
+        items = _extract_images_api(result)
+        if not items:
+            return error_response(
+                error=(
+                    f"nano-banana returned no image. Ensure the model '{model_id}' "
+                    "supports image output on the proxy."
+                ),
+                error_type="empty_response",
+                provider="nano-banana",
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        first = items[0]
+        b64 = first.get("b64_json")
+        item_url = first.get("url")
+        try:
+            # Prefer inline base64 (the proxy's default) over a bare URL.
+            if isinstance(b64, str) and b64.strip():
+                saved_path = save_b64_image(b64, prefix="nano_banana")
+            else:
+                saved_path = save_url_image(str(item_url), prefix="nano_banana")
+        except Exception as exc:  # noqa: BLE001
+            return error_response(
+                error=f"Could not save generated image: {exc}",
+                error_type="io_error",
+                provider="nano-banana",
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        return success_response(
+            image=str(saved_path),
+            model=model_id,
+            prompt=prompt,
+            aspect_ratio=aspect,
+            provider="nano-banana",
+            modality="text",
+            extra={"resolution": resolution},
+        )
+
+    def _generate_edit(
+        self,
+        *,
+        base_url: str,
+        headers: Dict[str, str],
+        prompt: str,
+        references: List[str],
+        model_id: str,
+        proxy_aspect: str,
+        resolution: str,
+        aspect: str,
+    ) -> Dict[str, Any]:
+        """Edit / reference via chat/completions (unchanged behavior).
+
+        Kept on the chat path because the images API has no clean input-image
+        contract at LiteLLM 1.92.0. Resolution matters less here — the model
+        preserves the source image's dimensions regardless — so the existing
+        chat ``image_config`` (with its resolution-field fallback) is retained
+        to avoid any regression in the currently-working edit flow.
+        """
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         for ref in references[:_MAX_REFERENCE_IMAGES]:
             part = _to_image_url_part(ref)
@@ -440,10 +610,6 @@ class NanoBananaImageGenProvider(ImageGenProvider):
             "modalities": ["image", "text"],
             "messages": [{"role": "user", "content": content}],
             "image_config": {"aspect_ratio": proxy_aspect, "image_size": resolution},
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
         }
         url = f"{base_url}/chat/completions"
 
@@ -482,8 +648,6 @@ class NanoBananaImageGenProvider(ImageGenProvider):
             else:
                 # The proxy returns inline base64 data URIs; a bare URL is
                 # unexpected but handled for robustness.
-                from agent.image_gen_provider import save_url_image
-
                 saved_path = save_url_image(first, prefix="nano_banana")
         except Exception as exc:  # noqa: BLE001
             return error_response(
@@ -501,9 +665,60 @@ class NanoBananaImageGenProvider(ImageGenProvider):
             prompt=prompt,
             aspect_ratio=aspect,
             provider="nano-banana",
-            modality=modality,
+            modality="image",
             extra={"resolution": resolution},
         )
+
+    def _post_with_image_config_fallback(
+        self,
+        *,
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        model_id: str,
+        prompt: str,
+        aspect: str,
+        resolution: str,
+    ) -> Dict[str, Any]:
+        """POST the text-to-image request to the images API; on an
+        ``imageConfig`` rejection (an older proxy that predates the nested
+        imageConfig mapping), retry once WITHOUT it so the generation still
+        lands rather than hard-failing on an un-upgraded proxy.
+
+        Returns the parsed JSON result on success, or an ``error_response`` dict
+        (``success`` is ``False``) on a non-recoverable failure.
+        """
+        result = self._post_once(
+            url=url,
+            headers=headers,
+            payload=payload,
+            model_id=model_id,
+            prompt=prompt,
+            aspect=aspect,
+        )
+        if (
+            isinstance(result, dict)
+            and result.get("success") is False
+            and result.get("error_type") == "api_error"
+            and self._is_resolution_field_error(result.get("error", ""))
+            and "imageConfig" in payload
+        ):
+            logger.warning(
+                "nano-banana: proxy rejected imageConfig (imageSize=%s); retrying "
+                "without it (falling back to default geometry on an un-upgraded "
+                "proxy)",
+                resolution,
+            )
+            fallback = {k: v for k, v in payload.items() if k != "imageConfig"}
+            result = self._post_once(
+                url=url,
+                headers=headers,
+                payload=fallback,
+                model_id=model_id,
+                prompt=prompt,
+                aspect=aspect,
+            )
+        return result
 
     def _post_with_resolution_fallback(
         self,
@@ -565,14 +780,17 @@ class NanoBananaImageGenProvider(ImageGenProvider):
 
     @staticmethod
     def _is_resolution_field_error(message: str) -> bool:
-        """True when an API error is about the ``image_size`` field itself.
+        """True when an API error is about the resolution field itself.
 
-        Scopes the fallback to genuine field-contract rejections so an unrelated
-        400 (e.g. a safety block) still surfaces as an error instead of being
-        masked by a retry.
+        Matches the field names used across both request protocols and proxy
+        versions — the chat path's ``image_size`` and the images path's nested
+        ``imageConfig`` / ``imageSize`` (LiteLLM error text is not always
+        snake_case). Scopes the fallback to genuine field-contract rejections so
+        an unrelated 400 (e.g. a safety block) still surfaces as an error
+        instead of being masked by a retry.
         """
         low = str(message or "").lower()
-        return "image_size" in low
+        return "image_size" in low or "imagesize" in low or "imageconfig" in low
 
     def _post_once(
         self,
