@@ -366,19 +366,48 @@ def _prune_image_cache(keep: Optional[Path] = None) -> None:
         logger.debug("image cache GC skipped: %s", exc)
 
 
+def _sniff_image_extension(raw: bytes) -> Optional[str]:
+    """Infer an image file extension from a payload's magic bytes.
+
+    Returns ``"png"`` / ``"jpg"`` / ``"webp"`` / ``"gif"`` for a recognised
+    signature, or ``None`` when the bytes don't match a known image format so
+    the caller can apply its own fallback. Shared by :func:`save_b64_image` and
+    :func:`save_url_image` so both helpers agree on the same detection.
+    """
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if raw[:2] == b"\xff\xd8":
+        return "jpg"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "webp"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    return None
+
+
 def save_b64_image(
     b64_data: str,
     *,
     prefix: str = "image",
-    extension: str = "png",
+    extension: Optional[str] = None,
 ) -> Path:
     """Decode base64 image data and write it under ``$HERMES_HOME/cache/images/``.
 
     Returns the absolute :class:`Path` to the saved file.
 
     Filename format: ``<prefix>_<YYYYMMDD_HHMMSS>_<short-uuid>.<ext>``.
+
+    The extension is inferred from the decoded bytes' magic number (PNG, JPEG,
+    WEBP, GIF; defaulting to ``png`` when unrecognised) so a backend returning,
+    e.g., JPEG (Nano Banana Lite) is saved with a truthful ``.jpg`` rather than
+    a mislabelled ``.png``. Pass an explicit ``extension`` to override the sniff
+    verbatim — back-compat for callers that already know their format.
     """
     raw = base64.b64decode(b64_data)
+    if extension is None:
+        extension = _sniff_image_extension(raw) or "png"
+    else:
+        extension = extension.lstrip(".") or "png"
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
     path = _images_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
@@ -429,7 +458,8 @@ def save_url_image(
 
     # Infer extension from the response content-type, falling back to the
     # URL suffix when xAI / OpenAI omit a precise type (some CDNs return
-    # ``application/octet-stream``).  Defaults to ``png``.
+    # ``application/octet-stream``).  Magic-byte sniffing of the first bytes is
+    # the final fallback (shared with :func:`save_b64_image`) before ``png``.
     content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
     extension = _URL_IMAGE_CONTENT_TYPES.get(content_type)
     if extension is None:
@@ -438,18 +468,23 @@ def save_url_image(
             if url_path.endswith(f".{ext}"):
                 extension = "jpg" if ext == "jpeg" else ext
                 break
-    if extension is None:
-        extension = "png"
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
-    path = _images_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
+    # The format may still be unknown here; write to a provisional path, capture
+    # the leading bytes, then resolve the extension and rename so the final name
+    # always carries a truthful extension.
+    provisional_ext = extension or "tmp"
+    path = _images_cache_dir() / f"{prefix}_{ts}_{short}.{provisional_ext}"
 
     bytes_written = 0
+    header_bytes = b""
     with path.open("wb") as fh:
         for chunk in response.iter_content(chunk_size=64 * 1024):
             if not chunk:
                 continue
+            if len(header_bytes) < 12:
+                header_bytes += chunk[: 12 - len(header_bytes)]
             bytes_written += len(chunk)
             if bytes_written > max_bytes:
                 fh.close()
@@ -468,6 +503,18 @@ def save_url_image(
         except OSError:
             pass
         raise ValueError(f"Image at {url} returned 0 bytes; refusing to cache.")
+
+    # Content-type and URL suffix both failed to name the format: sniff the
+    # magic bytes, else default to png.  Rename the already-written file to
+    # carry the resolved extension.
+    if extension is None:
+        extension = _sniff_image_extension(header_bytes) or "png"
+        final_path = _images_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
+        try:
+            path.rename(final_path)
+            path = final_path
+        except OSError:
+            pass
 
     try:
         _prune_image_cache(keep=path)
