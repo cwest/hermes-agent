@@ -3892,6 +3892,39 @@ def auto_route_review_bounce(
 _ACCEPTANCE_SIGNOFF_REASON_PREFIX = "awaiting-casey-signoff"
 
 
+# The reviewed-head SHA a PASS gist MAY pin with an ``at head <sha>`` token
+# (e.g. ``reviewed PASS at head bc3e527 — <PR url>``). This is a belt-and-
+# suspenders extra: the primary stale-PASS guard is the gist-freshness check
+# (gist written at/after the live head's commit time), which needs no producer
+# to write a SHA. When the token IS present the reconcile still requires it to
+# prefix-match the live head (card t_5c5718f4). Matches ``head`` (optionally
+# ``at head``) followed by a 7-40 char hex SHA.
+_PASS_GIST_HEAD_SHA_RE = re.compile(
+    r"\bhead[\s:@]+([0-9a-f]{7,40})\b",
+    re.IGNORECASE,
+)
+
+# Freshness tolerance (seconds) when comparing a PASS gist's ``created_at`` to
+# the live head's commit time. A PASS posted slightly BEFORE the head's own
+# committer timestamp — clock skew between GitHub and the board, or an amend that
+# keeps the author date — should not be read as "stale". Only a head pushed
+# meaningfully AFTER the PASS (a genuine new round) trips the guard.
+_PASS_FRESHNESS_SKEW_SECONDS = 300
+
+
+def _pass_gist_reviewed_sha(gist: str) -> Optional[str]:
+    """Extract the reviewed-head SHA a PASS gist pins, or None if unresolvable.
+
+    Returns the lowercased hex SHA from the gist's ``at head <sha>`` token, or
+    None when the gist carries no resolvable pinned SHA. A gist with no pinned
+    SHA must NOT be reconciled (never promote on an unverifiable gist).
+    """
+    if not gist:
+        return None
+    m = _PASS_GIST_HEAD_SHA_RE.search(gist)
+    return m.group(1).lower() if m else None
+
+
 # The card's per-lane owner map lives in its ``submit``-stage §9.1 audit comment
 # (there is no ``state_owners`` column — the map is stamped in the audit trail by
 # design, the same signal ``stage-pr-review`` / ``bounce-review-to-author`` read).
@@ -4053,23 +4086,35 @@ def _resolve_review_reviewer(
     return reviewer
 
 
-def _has_pass_signal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Return the PASS acceptance signoff gist for a card, or None if absent.
+def _has_pass_signal(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[tuple[str, int]]:
+    """Return the LATEST PASS signoff gist ``(body, created_at)``, or None.
 
     A stray ``review``/owner card has NO ``blocked`` event yet (that is the bug),
     so the PASS signal lives in the reviewer's ``awaiting-casey-signoff`` audit
-    comment. Returns the first such comment body (the gist to carry onto the
-    synthesized ``blocked`` event), or None when the card shows no PASS signal
-    (so a merely-misassigned review card is never swept into acceptance).
+    comment. Returns the most recent such comment's ``(body, created_at)`` — the
+    gist to carry onto the synthesized ``blocked`` event, and the timestamp the
+    reconcile uses to tell a current PASS from a superseded one — or None when the
+    card shows no PASS signal (so a merely-misassigned review card is never swept
+    into acceptance).
+
+    Prefers the FRESHEST PASS gist (``ORDER BY created_at DESC``): a reworked card
+    can accumulate a superseded round-1 gist and a current round-N gist, and the
+    reconcile must key on the current one (card t_5c5718f4). The load-bearing
+    guard is still the freshness + non-draft check in
+    :func:`reconcile_pass_acceptance` — a stale gist that slips through here is
+    refused there because its timestamp predates the live head's commit time.
     """
     rows = conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? ORDER BY created_at DESC",
         (task_id,),
     ).fetchall()
     for row in rows:
         body = row["body"] or ""
         if _ACCEPTANCE_SIGNOFF_REASON_PREFIX in body:
-            return body.strip()
+            return (body.strip(), int(row["created_at"]))
     return None
 
 
@@ -4101,6 +4146,20 @@ def reconcile_pass_acceptance(
     the PASS signal from the reviewer's audit comment. A genuine in-flight review
     card (assignee == its reviewer, or no PASS signal) is left untouched.
 
+    STALE-PASS GUARD (card t_5c5718f4): the reconcile is a safety net for a
+    DROPPED block half, not a bypass of the review itself. It promotes ONLY when
+    the (freshest) PASS is CURRENT for the live PR — the PR is undrafted AND the
+    PASS gist was written at or after the live head's commit time (so the review
+    covered this head, not a superseded one). A reworked/re-drafted card whose
+    PR is back in draft for a fresh round, or whose only PASS predates a newer
+    pushed head, is left in ``review`` for its round-N reviewer, never
+    force-promoted on the stale verdict. If the gist ALSO pins an explicit
+    ``at head <sha>`` token it must prefix-match the live head. An unresolvable
+    PR URL, live head, or head commit time is skipped (fail closed on the
+    acceptance side). The freshness check needs NO producer change — it keys on
+    data already on the board (the gist's own ``created_at``) versus the live
+    head's commit time.
+
     Idempotency (load-bearing): the transition flips the card off ``review`` to
     ``blocked``, so the detector naturally won't re-fire for the same card on a
     later tick — two consecutive ticks produce exactly one reconcile and one
@@ -4123,13 +4182,62 @@ def reconcile_pass_acceptance(
         current_owner = row["assignee"]
         # Must carry a PASS signal — otherwise this is a merely-misassigned or
         # in-flight review card, not a PASS that dropped its block half.
-        pass_gist = _has_pass_signal(conn, task_id)
-        if not pass_gist:
+        signal = _has_pass_signal(conn, task_id)
+        if not signal:
             continue
+        pass_gist, pass_gist_at = signal
         owner = _resolve_stray_acceptance_owner(conn, task_id)
         if not owner or owner != current_owner:
             # Unresolvable, or the resolved owner disagrees with the current
             # assignee (ambiguous history) — leave it for a human.
+            continue
+        # STALE-PASS GUARD (card t_5c5718f4). The reconcile is a SAFETY NET, not a
+        # bypass of the review it stands in for: it may only promote a card whose
+        # PASS is CURRENT for the live PR. Without this, a reworked/re-drafted card
+        # is force-promoted on a prior-round PASS pinning a superseded head,
+        # wedging it in a review->blocked loop that never lets the round-N reviewer
+        # run (the t_6d8c9da6 loop).
+        #
+        # (a) The PASS gist must carry a resolvable PR URL. No URL -> the gist is
+        #     unverifiable; never promote on it (leave for a human).
+        pr_match = _RESPAWN_GUARD_PR_URL_RE.search(pass_gist)
+        if not pr_match:
+            continue
+        # (b) Resolve the card's live PR head, draft state, and head commit time.
+        #     Any unresolvable field (gh missing / network / unparseable / no
+        #     commits) fails CLOSED — skip rather than accept on an unverifiable
+        #     comparison.
+        live_head, is_draft, head_committed_at = _resolve_pr_head_and_draft(
+            pr_match.group(0)
+        )
+        if not live_head or is_draft is None or head_committed_at is None:
+            continue
+        # (c) A draft PR is mid re-review and has NOT passed its current round ->
+        #     never force-promote it. This alone kills the reported loop: a
+        #     reworked card that re-drafted for a fresh round stays in review.
+        if is_draft:
+            continue
+        # (d) Freshness: the PASS gist must have been written AT OR AFTER the live
+        #     head was pushed. If the head's commit time is newer than the gist,
+        #     the head was pushed AFTER the reviewer PASSed — the PASS is for a
+        #     superseded head, not this one, so it must not promote. This is the
+        #     load-bearing stale-PASS guard and needs no producer change: it keys
+        #     on data already on the board (the gist's own timestamp) vs. the live
+        #     head's commit time. A small negative skew is tolerated so a PASS
+        #     posted seconds before the head's own commit timestamp (clock skew /
+        #     amend) is not spuriously rejected.
+        if pass_gist_at < head_committed_at - _PASS_FRESHNESS_SKEW_SECONDS:
+            continue
+        # (e) Belt-and-suspenders: if the gist ALSO pins an explicit reviewed SHA
+        #     (the ``at head <sha>`` token), it must prefix-match the live head. A
+        #     reviewer may pin a short SHA while ``gh`` returns the full 40-char
+        #     OID, so compare by prefix in whichever direction is shorter. Absence
+        #     of the token is fine — the freshness check above is the primary gate.
+        reviewed_sha = _pass_gist_reviewed_sha(pass_gist)
+        if reviewed_sha and not (
+            live_head.startswith(reviewed_sha)
+            or reviewed_sha.startswith(live_head)
+        ):
             continue
         # Derive the sticky block reason from the PASS gist. Strip a leading
         # ``[audit] status=PASS `` decoration if present so the reason starts at
@@ -6990,6 +7098,65 @@ def _resolve_pr_state(pr_url: str) -> str:
     if normalized in ("open", "closed", "merged"):
         return normalized
     return "unknown"
+
+
+def _resolve_pr_head_and_draft(
+    pr_url: str,
+) -> tuple[Optional[str], Optional[bool], Optional[int]]:
+    """Return ``(head_sha, is_draft, head_committed_epoch)``, or all-None on failure.
+
+    Backed by ``gh pr view <url> --json headRefOid,isDraft,commits``. ``head_sha``
+    is the lowercased 40-char head commit; ``is_draft`` the PR's draft flag;
+    ``head_committed_epoch`` the commit time (unix seconds) of the PR's tip commit
+    — the "when was this head pushed" signal the reconcile compares against the
+    PASS gist's own timestamp to tell a current PASS from a superseded one.
+
+    Fail-closed for the acceptance gate: any subprocess failure — ``gh`` missing,
+    not authenticated, network error, timeout, unparseable output, or a missing
+    field — resolves to ``(None, None, None)`` so
+    :func:`reconcile_pass_acceptance` SKIPS the promotion rather than
+    force-accepting on an unverifiable comparison.
+
+    Isolated as a module-level function (not inlined) so the reconcile can be
+    tested without a live network call by monkeypatching this hook, and so the
+    ``gh`` dependency lives in one auditable place (mirrors :func:`_resolve_pr_state`).
+    """
+    fail: tuple[Optional[str], Optional[bool], Optional[int]] = (None, None, None)
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_url, "--json", "headRefOid,isDraft,commits"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception:
+        return fail
+    if result.returncode != 0:
+        return fail
+    try:
+        data = json.loads(result.stdout or "{}")
+    except ValueError:
+        return fail
+    if not isinstance(data, dict):
+        return fail
+    head = data.get("headRefOid")
+    draft = data.get("isDraft")
+    if not isinstance(head, str) or not head.strip():
+        return fail
+    if not isinstance(draft, bool):
+        return fail
+    # The tip commit's committedDate == the head's push time. ``commits`` is
+    # ordered oldest→newest, so the last entry is the tip. A missing/empty
+    # commits list leaves the epoch None (the reconcile then fails closed).
+    # ``_to_epoch`` parses the ISO-8601 ``...Z`` committedDate to unix seconds.
+    head_epoch: Optional[int] = None
+    commits = data.get("commits")
+    if isinstance(commits, list) and commits:
+        tip = commits[-1]
+        if isinstance(tip, dict):
+            head_epoch = _to_epoch(tip.get("committedDate"))
+    return (head.strip().lower(), draft, head_epoch)
 
 
 @dataclass
