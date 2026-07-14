@@ -127,20 +127,38 @@ def test_complete_allows_dir_workspace_card_without_pr(kanban_home: Path) -> Non
 
 def test_complete_allows_worktree_card_with_pr_comment(kanban_home: Path) -> None:
     """When the card carries a resolvable ``pull/<n>`` URL in a comment (the
-    implementer's ready-for-review handoff), completion proceeds normally."""
+    implementer's ready-for-review handoff), completion proceeds past the
+    missing-PR guard.
+
+    The card is stamped with an owner map so the author-lane redirect can hand
+    it off to the reviewer: an author-completed code card with an open PR belongs
+    in ``review`` (past the missing-PR guard, then MOVED to review), never
+    straight to ``done`` — ``done`` means Casey merged. This proves PR presence —
+    not the merge override — is what unlocks the missing-PR guard.
+    """
     with kb.connect() as conn:
         tid = _stage_running_worktree_card(conn)
+        kb.add_comment(
+            conn, tid, author="hollis",
+            body=(
+                "[audit] actor=hollis stage=submit ts=2026-07-14T18:00:00Z\n"
+                "notes: state_owners={ready: eckert, review: lamport, "
+                "blocked-acceptance: casey} triager=hollis team=engineering"
+            ),
+        )
         kb.add_comment(
             conn, tid, author="eckert",
             body=f"Draft PR opened: {_PR_URL} @ head abc1234. 240 tests green.",
         )
 
-        ok = kb.complete_task(conn, tid, summary="merged", allow_acceptance_complete=False)
+        ok = kb.complete_task(conn, tid, summary="ready for review", allow_acceptance_complete=False)
 
-        # NOTE: allow_acceptance_complete=False here proves the PR presence — not
-        # the override — is what unlocks completion.
-        assert ok is True, "a worktree card WITH a PR artifact must complete"
-        assert kb.get_task(conn, tid).status == "done"
+        # allow_acceptance_complete=False proves the PR presence — not the
+        # override — is what unlocks the missing-PR guard; the author-lane
+        # redirect then MOVES the card to the reviewer.
+        assert ok is True, "a worktree card WITH a PR artifact must pass the guard"
+        assert kb.get_task(conn, tid).status == "review", "moves to review, not done"
+
 
 
 # ---------------------------------------------------------------------------
