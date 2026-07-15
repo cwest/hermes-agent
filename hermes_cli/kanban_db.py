@@ -3892,47 +3892,13 @@ def auto_route_review_bounce(
 _ACCEPTANCE_SIGNOFF_REASON_PREFIX = "awaiting-casey-signoff"
 
 
-# The card's per-lane owner map lives in its ``submit``-stage §9.1 audit comment
-# (there is no ``state_owners`` column — the map is stamped in the audit trail by
-# design, the same signal ``stage-pr-review`` / ``bounce-review-to-author`` read).
-# A ``submit`` comment records it in the free-text ``notes:`` line as e.g.
-# ``state_owners={ready: eckert, review: lamport, blocked-acceptance: casey}``.
-_OWNER_MAP_RE = re.compile(r"state_owners=\{([^}]*)\}")
-
-
-def _review_owner_from_owner_map(
-    conn: sqlite3.Connection, task_id: str,
-) -> Optional[str]:
-    """Return a card's ``state_owners["review"]`` owner, or None if unstamped.
-
-    Reads the card's materialized owner map from its ``submit``-stage audit
-    comment (the map lives in the audit trail, not a column — same reader shape
-    the one-card lane resolvers use). Returns the ``review``-lane owner when the
-    card carries a stamped map with that lane, else None.
-
-    Deliberately has NO kind-default fallback: a card with no stamped review lane
-    (a legacy / un-stamped card, or a plain non-pipeline task) must NOT be shunted
-    into review by :func:`complete_task` — None keeps its completion on the
-    ``-> done`` path unchanged. Only a card that explicitly declared a review lane
-    is redirected.
-    """
-    for comment in list_comments(conn, task_id):
-        body = comment.body or ""
-        if not body.lstrip().startswith("[audit]"):
-            continue
-        # Only the submit-stage audit comment carries the materialized map.
-        if "stage=submit" not in body:
-            continue
-        m = _OWNER_MAP_RE.search(body)
-        if not m:
-            continue
-        for pair in m.group(1).split(","):
-            if ":" not in pair:
-                continue
-            lane, owner = pair.split(":", 1)
-            if lane.strip() == "review" and owner.strip():
-                return owner.strip()
-    return None
+# NOTE: the card's per-lane owner map lives in its ``submit``-stage §9.1 audit
+# comment (there is no ``state_owners`` column — the map is stamped in the audit
+# trail by design). The authoritative reader is
+# :func:`_review_owner_from_owner_map` defined once above (paired with
+# ``_OWNER_MAP_RE`` / ``_SUBMIT_AUDIT_RE``). A second copy of the reader used to
+# live here; it was collapsed into the single definition to remove a latent
+# divergence bug (two readers that could drift apart).
 
 
 def _resolve_stray_acceptance_owner(
@@ -5017,6 +4983,16 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    Finally, an author-lane completion that CANNOT resolve a review owner but
+    is on a review-eligible pipeline card (a git-worktree card owing a PR,
+    ``_card_requires_pr``) is REFUSED rather than allowed to fall through to
+    ``done`` — a silent ``done`` past the reviewer is the failure mode. The
+    refusal is a clean no-op (returns ``False``, no state mutation) with an
+    auditable ``completion_redirect_unresolved`` event, the same shape as the
+    acceptance and missing-PR guards. Non-pipeline cards (scratch / dir /
+    ``~/.hermes`` edit-in-place) with no review owner complete to ``done``
+    unchanged.
     """
     now = int(time.time())
 
@@ -5150,7 +5126,8 @@ def complete_task(
     # review for re-review.
     if not allow_acceptance_complete:
         _row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if _row is not None and _row["status"] in ("running", "ready"):
             _review_owner = _review_owner_from_owner_map(conn, task_id)
@@ -5220,6 +5197,46 @@ def complete_task(
                         run_id=run_id,
                     )
                 return True
+            # No review owner resolved from the card's owner map. For a card that
+            # is unambiguously a review-eligible PIPELINE card — one that builds in
+            # an isolated git worktree cut for a branch/PR (``_card_requires_pr``,
+            # the same signal the missing-PR guard above uses) — the author lane
+            # MUST hand off to a reviewer. Falling through to the ``-> done``
+            # UPDATE below would land the card in ``done`` past the reviewer and
+            # past Casey's acceptance — the exact false-``done`` this redirect
+            # exists to prevent, silently, whenever the owner map was never
+            # stamped (a card filed off the ``submit_card`` path). So instead of a
+            # silent fall-through we REFUSE: a clean no-op (returns False, no state
+            # mutation) with an auditable ``completion_redirect_unresolved`` event,
+            # the same shape as the acceptance and missing-PR guards above.
+            #
+            # This is deliberately scoped to the population core can identify
+            # WITHOUT a card ``kind`` column (there is none — the owner map lives
+            # in the audit trail by design). A non-PR-requiring card (plain
+            # ``scratch`` task, a ``dir`` build, a ``~/.hermes`` edit-in-place
+            # card) has no core-visible review lane, so it is NOT refused and
+            # completes to ``done`` exactly as before — the redirect never shunted
+            # those, and this refusal must not either. Board-driven review cards
+            # (writing) whose only pipeline marker is the owner map are addressed
+            # at the filing layer (stamping the map at creation), not here.
+            elif _card_requires_pr(
+                _row["workspace_kind"], _row["workspace_path"]
+            ):
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_redirect_unresolved",
+                        {
+                            "status": _row["status"],
+                            "workspace_kind": _row["workspace_kind"],
+                            "workspace_path": _row["workspace_path"],
+                            "summary_preview": (
+                                (summary or result or "").strip().splitlines()[0][:200]
+                                if (summary or result)
+                                else None
+                            ),
+                        },
+                    )
+                return False
 
     with write_txn(conn):
         if expected_run_id is None:
