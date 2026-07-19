@@ -3909,6 +3909,58 @@ def auto_route_review_bounce(
 _ACCEPTANCE_SIGNOFF_REASON_PREFIX = "awaiting-casey-signoff"
 
 
+def _acceptance_owner_from_owner_map(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return a card's ``state_owners["blocked-acceptance"]`` owner, or None.
+
+    Reads the card's materialized owner map from its ``submit``-stage audit
+    comment (the map lives in the audit trail, not a column - the same reader
+    shape :func:`_review_owner_from_owner_map` and the one-card lane resolvers
+    use). Returns the ``blocked-acceptance``-lane owner when the card carries a
+    stamped map with that lane, else None.
+
+    Profile-agnostic by design: the acceptance owner (the principal who signs
+    off / merges) is read from the card's own declared owner map, never a literal
+    name baked into core. Returns None for an un-stamped / legacy card so the
+    caller can fall back to an explicit owner or leave the transition to a human.
+    """
+    for comment in list_comments(conn, task_id):
+        body = comment.body or ""
+        if not body.lstrip().startswith("[audit]"):
+            continue
+        # Only the submit-stage audit comment carries the materialized map.
+        if "stage=submit" not in body:
+            continue
+        m = _OWNER_MAP_RE.search(body)
+        if not m:
+            continue
+        for pair in m.group(1).split(","):
+            if ":" not in pair:
+                continue
+            lane, owner = pair.split(":", 1)
+            if lane.strip() == "blocked-acceptance" and owner.strip():
+                return owner.strip()
+    return None
+
+
+def _normalize_signoff_reason(reason: Optional[str]) -> str:
+    """Normalize a caller reason so it starts with the acceptance signoff prefix.
+
+    The ``blocked`` event's reason MUST begin with
+    ``_ACCEPTANCE_SIGNOFF_REASON_PREFIX`` - that token is what the acceptance
+    notifier, the sticky-block detectors, and the review-bounce auto-router all
+    key on. A reason already carrying the prefix is passed through; a bare reason
+    is prefixed; an empty reason gets a sensible default.
+    """
+    detail = (reason or "").strip()
+    if detail.lower().startswith(_ACCEPTANCE_SIGNOFF_REASON_PREFIX):
+        return detail
+    if detail:
+        return f"{_ACCEPTANCE_SIGNOFF_REASON_PREFIX}: {detail}"
+    return f"{_ACCEPTANCE_SIGNOFF_REASON_PREFIX}: PR PASS'd; awaiting sign-off."
+
+
 # NOTE: the card's per-lane owner map lives in its ``submit``-stage §9.1 audit
 # comment (there is no ``state_owners`` column — the map is stamped in the audit
 # trail by design). The authoritative reader is
@@ -6002,6 +6054,116 @@ def block_task(
     )
     return True
 
+
+
+def accept_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    acceptance_owner: str,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Atomically route a reviewer PASS'd card into the acceptance lane.
+
+    The PASS->acceptance transition MUST be atomic. This single primitive, in
+    ONE ``write_txn``:
+
+    * flips ``status`` -> ``blocked`` (the acceptance lane),
+    * sets ``assignee`` = ``acceptance_owner`` (the principal who signs off /
+      merges - resolved by the caller, never a literal name in core),
+    * ends the reviewer's run and releases the claim, and
+    * emits the ``blocked`` event whose reason begins with
+      ``_ACCEPTANCE_SIGNOFF_REASON_PREFIX``.
+
+    That single ``blocked`` event is load-bearing three times over: it is what
+    fires the acceptance notification (``gateway/kanban_watchers.py`` pings on
+    ``kind == "blocked"``), what makes the acceptance state STICK (a raw status
+    write auto-recovers to ready), and what the sticky-block detectors /
+    review-bounce auto-router read so a PASS'd card is NOT bounced back to an
+    author. Splitting the transition (assign-then-block, or block-then-assign as
+    two calls) is exactly the bug this closes: a half-applied transition strands
+    the card in ``review``/owner - the reviewer's lane with the acceptance
+    owner's name on it - with no ``blocked`` event, so the ping never fires.
+
+    Accepts a card that is under review: ``running`` (a reviewer that claimed the
+    review card, ``review -> running``) OR ``review`` (an unclaimed review-lane
+    card being parked for acceptance). Returns True on success, False when the
+    card is in neither state (so a plain ``ready``/``todo`` card is never swept
+    into acceptance).
+    """
+    if not acceptance_owner or not str(acceptance_owner).strip():
+        raise ValueError("acceptance_owner is required")
+    acceptance_owner = str(acceptance_owner).strip()
+    block_reason = _normalize_signoff_reason(reason)
+    with write_txn(conn):
+        # The transition is valid only from a card under review - a reviewer's
+        # claimed ``running`` or an unclaimed ``review`` lane card. Guarding the
+        # UPDATE on those two statuses (plus the optional run fence) makes the
+        # whole thing atomic: either every field moves together or nothing does.
+        if expected_run_id is None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'blocked',
+                       assignee      = ?,
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'review')
+                """,
+                (acceptance_owner, task_id),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'blocked',
+                       assignee      = ?,
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'review')
+                   AND current_run_id = ?
+                """,
+                (acceptance_owner, task_id, int(expected_run_id)),
+            )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="blocked", status="blocked",
+            summary=block_reason,
+        )
+        # Synthesize a run when accepting a never-claimed review-lane card so the
+        # reason is preserved in attempt history (mirrors block_task).
+        if run_id is None:
+            run_id = _synthesize_ended_run(
+                conn, task_id, outcome="blocked", summary=block_reason,
+            )
+        _append_event(
+            conn, task_id, "assigned",
+            {"to": acceptance_owner, "by": "reviewer:accept"},
+            run_id=run_id,
+        )
+        # The single sticky ``blocked`` event carrying the acceptance signoff
+        # reason - the one the notifier and the sticky-reason detectors key on.
+        _append_event(
+            conn, task_id, "blocked",
+            {"reason": block_reason, "by": "reviewer:accept"},
+            run_id=run_id,
+        )
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_blocked",
+        task_id,
+        board=get_current_board(),
+        assignee=acceptance_owner,
+        run_id=run_id,
+        reason=block_reason,
+    )
+    return True
 
 
 def promote_task(
