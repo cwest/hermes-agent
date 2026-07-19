@@ -5427,30 +5427,39 @@ def complete_task(
                     )
                 return True
             # No review owner resolved from the card's owner map. For a card that
-            # is unambiguously a review-eligible PIPELINE card — one that builds in
-            # an isolated git worktree cut for a branch/PR (``_card_requires_pr``,
-            # the same signal the missing-PR guard above uses) — the author lane
-            # MUST hand off to a reviewer. Falling through to the ``-> done``
-            # UPDATE below would land the card in ``done`` past the reviewer and
-            # past Casey's acceptance — the exact false-``done`` this redirect
-            # exists to prevent, silently, whenever the owner map was never
-            # stamped (a card filed off the ``submit_card`` path). So instead of a
-            # silent fall-through we REFUSE: a clean no-op (returns False, no state
+            # is unambiguously a review-eligible PIPELINE card the author lane MUST
+            # hand off to a reviewer. Falling through to the ``-> done`` UPDATE
+            # below would land the card in ``done`` past the reviewer and past
+            # Casey's acceptance — the exact false-``done`` this redirect exists to
+            # prevent, silently, whenever the owner map was never stamped (a card
+            # filed off the ``submit_card`` path). So instead of a silent
+            # fall-through we REFUSE: a clean no-op (returns False, no state
             # mutation) with an auditable ``completion_redirect_unresolved`` event,
             # the same shape as the acceptance and missing-PR guards above.
             #
+            # A card is review-eligible when EITHER signal holds:
+            #   * ``_card_requires_pr`` — it builds in an isolated git worktree cut
+            #     for a branch/PR (the same signal the missing-PR guard uses); OR
+            #   * ``_card_has_pr_artifact`` — it already OWNS a resolvable
+            #     ``pull/<n>`` PR (the same active_pr linkage the respawn guard
+            #     trusts). A card that owns a PR is a code-review pipeline card no
+            #     matter its ``workspace_kind`` — a ``dir:`` build (every
+            #     caseywest.com writing card builds in ``~/src/cwest.github.io`` as
+            #     ``workspace_kind='dir'``, not a worktree) is invisible to
+            #     ``_card_requires_pr`` yet must NEVER fall through to ``done`` while
+            #     its PR is open. This is the production false-``done`` (a dir card
+            #     with an open PR flipped straight to ``done`` past the reviewer).
+            #
             # This is deliberately scoped to the population core can identify
             # WITHOUT a card ``kind`` column (there is none — the owner map lives
-            # in the audit trail by design). A non-PR-requiring card (plain
-            # ``scratch`` task, a ``dir`` build, a ``~/.hermes`` edit-in-place
-            # card) has no core-visible review lane, so it is NOT refused and
-            # completes to ``done`` exactly as before — the redirect never shunted
-            # those, and this refusal must not either. Board-driven review cards
-            # (writing) whose only pipeline marker is the owner map are addressed
-            # at the filing layer (stamping the map at creation), not here.
+            # in the audit trail by design). A non-PR card that is not PR-requiring
+            # (a plain ``scratch`` task, a ``dir`` build with no PR, a ``~/.hermes``
+            # edit-in-place card) has no core-visible review lane, so it is NOT
+            # refused and completes to ``done`` exactly as before — the redirect
+            # never shunted those, and this refusal must not either.
             elif _card_requires_pr(
                 _row["workspace_kind"], _row["workspace_path"]
-            ):
+            ) or _card_has_pr_artifact(conn, task_id):
                 with write_txn(conn):
                     _append_event(
                         conn, task_id, "completion_redirect_unresolved",

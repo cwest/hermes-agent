@@ -49,21 +49,28 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 _PR_URL = "https://github.com/cwest/hermes-agent/pull/71"
 
 
-def _worktree_card_with_pr(conn, *, stamped: bool) -> str:
-    """A claimed (``running``) worktree-backed card that HAS a PR artifact.
+def _card_with_pr(
+    conn, *, stamped: bool, workspace_kind: str = "worktree",
+    workspace_path: str = "/Users/x/src/repo",
+) -> str:
+    """A claimed (``running``) card that HAS a PR artifact.
 
     A worktree outside ``~/.hermes`` is PR-requiring (``_card_requires_pr``), and
     the PR comment satisfies the missing-PR guard — so completion reaches the
     author-lane redirect. ``stamped=False`` withholds the owner map, reproducing
     the false-``done`` hole; ``stamped=True`` proves the normal redirect still
     fires when the map IS present.
+
+    ``workspace_kind`` defaults to ``worktree`` but can be ``dir`` to exercise a
+    card that owns a PR yet is NOT ``_card_requires_pr`` — the population the
+    engine-side guard must catch via the PR artifact alone.
     """
     tid = kb.create_task(
         conn,
         title="feature work",
         assignee="eckert",
-        workspace_kind="worktree",
-        workspace_path="/Users/x/src/repo",
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
     )
     if stamped:
         kb.add_comment(
@@ -81,6 +88,11 @@ def _worktree_card_with_pr(conn, *, stamped: bool) -> str:
     kb.claim_task(conn, tid)
     assert kb.get_task(conn, tid).status == "running"
     return tid
+
+
+def _worktree_card_with_pr(conn, *, stamped: bool) -> str:
+    """Back-compat alias: a worktree-backed card that HAS a PR artifact."""
+    return _card_with_pr(conn, stamped=stamped, workspace_kind="worktree")
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +136,90 @@ def test_unstamped_pr_requiring_refusal_emits_audit_event(kanban_home: Path) -> 
             e for e in events
             if e.kind == "status_changed" and (e.payload or {}).get("to") == "done"
         ], "a refused completion must not land a status_changed -> done"
+
+
+# ---------------------------------------------------------------------------
+# RED 1b — a card that OWNS a PR but is NOT _card_requires_pr (a ``dir:``
+#          workspace, e.g. a caseywest.com writing card) must ALSO be refused
+# ---------------------------------------------------------------------------
+
+
+def test_dir_card_with_pr_but_no_owner_map_is_refused_not_done(
+    kanban_home: Path,
+) -> None:
+    """The production false-``done`` (card t_3cef33a1, PR #131): a ``dir:``
+    workspace card that owns an OPEN PR is NOT ``_card_requires_pr`` (only
+    ``worktree`` is), so the worktree-only refusal branch never fired and the
+    completion fell through to ``done`` — skipping the reviewer and Casey.
+
+    A card that carries a resolvable PR artifact is unambiguously review-eligible
+    regardless of ``workspace_kind``. With no resolvable review owner it must
+    REFUSE (clean no-op), NOT land ``done``.
+    """
+    with kb.connect() as conn:
+        tid = _card_with_pr(conn, stamped=False, workspace_kind="dir")
+
+        ok = kb.complete_task(conn, tid, summary="wrote post, PR open, map unstamped")
+
+        assert ok is False, "a dir card owning a PR must not fall through to done"
+        task = kb.get_task(conn, tid)
+        assert task.status == "running", "card must not move to done"
+        assert task.completed_at is None, "no completion timestamp on a refusal"
+
+
+def test_dir_card_with_pr_refusal_emits_audit_event(kanban_home: Path) -> None:
+    """The dir+PR refusal is auditable with the same event shape as the
+    worktree refusal, and no ``completed``/``-> done`` event lands."""
+    with kb.connect() as conn:
+        tid = _card_with_pr(conn, stamped=False, workspace_kind="dir")
+        kb.complete_task(conn, tid, summary="wrote post, PR open, map unstamped")
+
+        events = kb.list_events(conn, tid)
+        refusals = [
+            e for e in events if e.kind == "completion_redirect_unresolved"
+        ]
+        assert refusals, "a completion_redirect_unresolved event must be recorded"
+        assert refusals[0].payload.get("summary_preview") == (
+            "wrote post, PR open, map unstamped"
+        )
+        assert not [e for e in events if e.kind == "completed"], \
+            "a refused completion must not emit a 'completed' event"
+        assert not [
+            e for e in events
+            if e.kind == "status_changed" and (e.payload or {}).get("to") == "done"
+        ], "a refused completion must not land a status_changed -> done"
+
+
+def test_dir_card_with_pr_and_owner_map_still_redirects_to_review(
+    kanban_home: Path,
+) -> None:
+    """A ``dir:`` card owning a PR WITH a stamped owner map redirects to review
+    exactly as a worktree card does — the artifact-based refusal only guards the
+    UNRESOLVABLE case, it never intercepts a normal stamped redirect."""
+    with kb.connect() as conn:
+        tid = _card_with_pr(conn, stamped=True, workspace_kind="dir")
+
+        ok = kb.complete_task(conn, tid, summary="post done, map stamped")
+
+        assert ok is True, "a stamped review-eligible card redirects (a move)"
+        task = kb.get_task(conn, tid)
+        assert task.status == "review", "stamped completion MOVES to review"
+        assert task.assignee == "lamport", "assignee is the card's review owner"
+
+
+def test_dir_card_with_pr_merge_override_still_done(kanban_home: Path) -> None:
+    """Casey's merge (``allow_acceptance_complete=True``) completes a dir+PR
+    card to ``done`` even with no resolvable review owner — the override that
+    bypasses the other guards bypasses the artifact-based refusal too."""
+    with kb.connect() as conn:
+        tid = _card_with_pr(conn, stamped=False, workspace_kind="dir")
+
+        ok = kb.complete_task(
+            conn, tid, summary="merged by Casey", allow_acceptance_complete=True,
+        )
+
+        assert ok is True, "the merge override must complete the card"
+        assert kb.get_task(conn, tid).status == "done"
 
 
 # ---------------------------------------------------------------------------
