@@ -3198,19 +3198,20 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     ]
 
 
-def _review_owner_from_owner_map(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Return the ``review``-lane owner from a card's stamped owner map, if any.
+def _owner_from_owner_map(
+    conn: sqlite3.Connection, task_id: str, lane: str
+) -> Optional[str]:
+    """Return the ``lane``-lane owner from a card's stamped owner map, if any.
 
     Reads the ``state_owners={ready: …, review: …, …}`` fragment recorded in the
     card's ``submit``-stage audit comment (the owner map lives in the audit trail,
     not a column). Only the ``submit``-stage audit comment is authoritative: this
     keys off the SAME comment ``stage-pr-review``'s ``resolve_reviewer`` reads
-    (which filters ``parse_audit(...)["stage"] == "submit"`` before parsing the
-    map), so the two readers resolve the same owner regardless of comment order.
+    (which filters ``parse_audit(...)`` for the submit stage before parsing the
+    map), so every reader resolves the same owner regardless of comment order.
     A later comment that merely echoes a ``state_owners={…}`` fragment (a
-    different stage's note, quoted prose) is ignored. Returns the ``review`` owner
-    when stamped, else ``None`` so the caller can fall back to the card's assignee
-    / the code-review default.
+    different stage's note, quoted prose) is ignored. Returns the ``lane`` owner
+    when stamped, else ``None`` so the caller can fall back.
     """
     for c in list_comments(conn, task_id):
         body = c.body or ""
@@ -3222,10 +3223,35 @@ def _review_owner_from_owner_map(conn: sqlite3.Connection, task_id: str) -> Opti
         for pair in m.group(1).split(","):
             if ":" not in pair:
                 continue
-            lane, owner = pair.split(":", 1)
-            if lane.strip() == "review" and owner.strip():
+            candidate, owner = pair.split(":", 1)
+            if candidate.strip() == lane and owner.strip():
                 return owner.strip()
     return None
+
+
+def _review_owner_from_owner_map(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the ``review``-lane owner from a card's stamped owner map, if any.
+
+    Thin wrapper over :func:`_owner_from_owner_map` for the ``review`` lane — see
+    that function for the authoritative-comment / fallback semantics. Kept as a
+    named helper because ``review_skills_for_card`` and ``complete_task`` read the
+    reviewer via this name.
+    """
+    return _owner_from_owner_map(conn, task_id, "review")
+
+
+def _ready_owner_from_owner_map(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the ``ready``-lane owner (the author) from a card's owner map, if any.
+
+    The ``ready`` lane's owner IS the card's implementing author — the identity a
+    review bounce must route back to. Reading it from the stamped map is
+    authoritative and shape-independent, unlike the event-history author
+    resolution in :func:`_resolve_review_author` (which fails when the review MOVE
+    recorded the ``assigned {assignee: X}`` event shape instead of ``{from, to}``).
+    Returns ``None`` when no map is stamped so the caller can fall back to event
+    history.
+    """
+    return _owner_from_owner_map(conn, task_id, "ready")
 
 
 def review_skills_for_card(conn: sqlite3.Connection, task: "Task") -> list[str]:
@@ -3839,7 +3865,18 @@ def auto_route_review_bounce(
         reason = _latest_sticky_block_reason(conn, task_id)
         if not _is_review_bounce_reason(reason):
             continue
-        author = _resolve_review_author(conn, task_id, reviewer=row["assignee"])
+        # Resolve the author to route back to. The card's stamped
+        # ``state_owners[ready]`` owner map is authoritative and independent of
+        # the ``assigned`` event SHAPE, so prefer it: the event-history resolver
+        # only matches the ``assigned {from, to}`` shape and returns None when
+        # the review MOVE recorded the ``assigned {assignee: X}`` shape instead
+        # (the live t_b1055359 / t_faf0bb66 failure — a needs_input bounce that
+        # sat blocked forever because the author never resolved). Fall back to
+        # event history for legacy / un-stamped cards.
+        author = (
+            _ready_owner_from_owner_map(conn, task_id)
+            or _resolve_review_author(conn, task_id, reviewer=row["assignee"])
+        )
         if not author or author == row["assignee"]:
             # Unresolvable author, or the card is already assigned to the author
             # (nothing to route) — leave it for a human rather than guessing.
