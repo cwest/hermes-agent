@@ -713,6 +713,41 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
+            # Reviewer PASS -> acceptance is a single ATOMIC transition. A block
+            # whose reason is the acceptance signoff (``awaiting-casey-signoff``)
+            # is not a "stuck" block - it is the reviewer routing a PASS'd card
+            # into the acceptance lane. Route it to ``accept_task``, which flips
+            # status -> blocked, hands the card to the acceptance owner (resolved
+            # from the card's own owner map - profile-agnostic, never a literal
+            # name in core), and emits the sticky ``blocked`` event in ONE txn.
+            # This is what closes the review/owner stranding: the assign and the
+            # block can never land half-applied. A card with no stamped
+            # acceptance owner falls through to the normal block path unchanged.
+            signoff_owner = None
+            if str(reason).strip().lower().startswith(
+                kb._ACCEPTANCE_SIGNOFF_REASON_PREFIX
+            ):
+                signoff_owner = kb._acceptance_owner_from_owner_map(conn, tid)
+            if signoff_owner:
+                ok = kb.accept_task(
+                    conn, tid,
+                    acceptance_owner=signoff_owner,
+                    reason=reason,
+                    expected_run_id=_worker_run_id(tid),
+                )
+                if not ok:
+                    return tool_error(
+                        f"could not accept {tid} (unknown id or not in "
+                        f"review/running)"
+                    )
+                run = kb.latest_run(conn, tid)
+                landed = kb.get_task(conn, tid)
+                return _ok(
+                    task_id=tid,
+                    run_id=run.id if run else None,
+                    status=landed.status if landed else "blocked",
+                    assignee=landed.assignee if landed else signoff_owner,
+                )
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
