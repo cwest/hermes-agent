@@ -167,6 +167,117 @@ def test_merge_override_bypasses_unresolved_refusal(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# RED 1b — a ``dir``-workspace card that OWNS a PR but has no owner map must
+#          NOT reach done (the caseywest.com writing-card false-``done`` class)
+# ---------------------------------------------------------------------------
+
+
+def _dir_card_with_pr(conn, *, stamped: bool) -> str:
+    """A claimed (``running``) ``dir``-workspace card that HAS a PR artifact.
+
+    A ``dir`` card is NOT ``_card_requires_pr`` (only ``worktree`` is), so the
+    missing-PR guard never fires and the pre-fix author-lane refusal branch
+    (which keyed on ``_card_requires_pr`` alone) was blind to it — control fell
+    through to the ``-> done`` UPDATE. This is EVERY caseywest.com writing card:
+    they build in ``~/src/cwest.github.io`` as ``workspace_kind='dir'`` and own
+    an open PR. ``stamped=False`` withholds the owner map, reproducing the
+    production false-``done`` (card ``t_3cef33a1`` / PR #131).
+    """
+    tid = kb.create_task(
+        conn,
+        title="writing card",
+        assignee="orwell",
+        workspace_kind="dir",
+        workspace_path="/Users/x/src/cwest.github.io",
+    )
+    if stamped:
+        kb.add_comment(
+            conn, tid, author="hollis",
+            body=(
+                "[audit] actor=hollis stage=submit ts=2026-07-14T18:00:00Z\n"
+                "notes: state_owners={ready: orwell, review: lamport, "
+                "blocked-acceptance: casey} triager=hollis team=writing"
+            ),
+        )
+    kb.add_comment(
+        conn, tid, author="orwell",
+        body=f"Draft PR opened: {_PR_URL} @ head abc1234.",
+    )
+    kb.claim_task(conn, tid)
+    assert kb.get_task(conn, tid).status == "running"
+    return tid
+
+
+def test_unstamped_dir_card_with_pr_is_refused_not_done(kanban_home: Path) -> None:
+    """The production false-``done``: a ``dir`` card WITH an open PR but no
+    ``stage=submit`` owner map. ``_card_requires_pr`` is False for a ``dir``
+    card, so the pre-fix refusal branch was blind and control fell through to
+    ``done`` past the reviewer. With the PR-artifact signal OR'd in, it must
+    REFUSE (clean no-op), NOT land ``done``."""
+    with kb.connect() as conn:
+        tid = _dir_card_with_pr(conn, stamped=False)
+
+        ok = kb.complete_task(conn, tid, summary="wrote the post, forgot to stamp map")
+
+        assert ok is False, "a dir card owning a PR with no review owner must not complete"
+        task = kb.get_task(conn, tid)
+        assert task.status == "running", "card must not move to done"
+        assert task.completed_at is None, "no completion timestamp on a refusal"
+
+
+def test_unstamped_dir_card_with_pr_refusal_emits_audit_event(kanban_home: Path) -> None:
+    """The rejected ``dir``-card-with-PR attempt is auditable and no
+    ``completed`` / ``-> done`` event lands."""
+    with kb.connect() as conn:
+        tid = _dir_card_with_pr(conn, stamped=False)
+        kb.complete_task(conn, tid, summary="wrote the post, forgot to stamp map")
+
+        events = kb.list_events(conn, tid)
+        refusals = [
+            e for e in events if e.kind == "completion_redirect_unresolved"
+        ]
+        assert refusals, "a completion_redirect_unresolved event must be recorded"
+        assert refusals[0].payload.get("summary_preview") == (
+            "wrote the post, forgot to stamp map"
+        )
+        assert not [e for e in events if e.kind == "completed"], \
+            "a refused completion must not emit a 'completed' event"
+        assert not [
+            e for e in events
+            if e.kind == "status_changed" and (e.payload or {}).get("to") == "done"
+        ], "a refused completion must not land a status_changed -> done"
+
+
+def test_stamped_dir_card_with_pr_still_redirects_to_review(kanban_home: Path) -> None:
+    """A ``dir`` card that OWNS a PR and HAS a stamped review owner still
+    MOVES to review (the PR-artifact broadening must not intercept the normal
+    stamped redirect)."""
+    with kb.connect() as conn:
+        tid = _dir_card_with_pr(conn, stamped=True)
+
+        ok = kb.complete_task(conn, tid, summary="post done, map stamped")
+
+        assert ok is True, "a stamped dir card owning a PR redirects (a move)"
+        task = kb.get_task(conn, tid)
+        assert task.status == "review", "stamped completion MOVES to review"
+        assert task.assignee == "lamport", "assignee is the card's review owner"
+
+
+def test_merge_override_bypasses_dir_pr_refusal(kanban_home: Path) -> None:
+    """Casey's merge override completes a ``dir``-card-with-PR to ``done`` even
+    with no resolvable review owner — the broadened refusal is bypassed too."""
+    with kb.connect() as conn:
+        tid = _dir_card_with_pr(conn, stamped=False)
+
+        ok = kb.complete_task(
+            conn, tid, summary="merged by Casey", allow_acceptance_complete=True,
+        )
+
+        assert ok is True, "the merge override must complete the card"
+        assert kb.get_task(conn, tid).status == "done"
+
+
+# ---------------------------------------------------------------------------
 # RED 4 — non-pipeline cards with no review owner still complete to done
 # ---------------------------------------------------------------------------
 
