@@ -54,6 +54,32 @@ class TestToolsetIntersection:
         assert "memory" not in child
         assert "terminal" in child
 
+    def test_strip_blocked_removes_kanban(self):
+        """The kanban toolset must never pass through to a delegated child.
+
+        A child inherits the parent's ``HERMES_KANBAN_TASK`` env, so a child
+        that also held ``kanban_complete`` / ``kanban_block`` would resolve
+        the *parent's* card and could falsely flip it to done with the
+        child's summary (control-surface-bleed / false-done). Children get no
+        card-terminal authority.
+        """
+        child = _strip_blocked_tools(["terminal", "file", "kanban"])
+        assert "kanban" not in child
+        assert "terminal" in child
+        assert "file" in child
+
+    def test_kanban_stripped_even_when_inherited_from_parent(self):
+        """No-toolsets-requested inheritance path must also drop kanban.
+
+        When ``toolsets`` is None the child inherits the parent's full set
+        through ``_strip_blocked_tools`` — the kanban strip has to hold on
+        that path too, not just when the LLM explicitly requests it.
+        """
+        parent_toolsets = ["terminal", "file", "kanban", "web"]
+        child = _strip_blocked_tools(parent_toolsets)
+        assert "kanban" not in child
+        assert sorted(child) == ["file", "terminal", "web"]
+
     def test_empty_intersection_yields_empty_toolsets(self):
         """If parent has no overlap with requested, child gets nothing extra."""
         parent = SimpleNamespace(enabled_toolsets=["terminal"])
