@@ -3939,6 +3939,129 @@ def auto_route_review_bounce(
     return routed
 
 
+def route_feedback_to_author(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    author: str,
+    reason: Optional[str] = None,
+    actor: str = "orchestrator:outer-feedback",
+) -> bool:
+    """Route an accepted / parked open-PR card back to its author on OUTER feedback.
+
+    The OUTER feedback loop is a human's (the principal's) feedback on an *already
+    accepted* card, sent back to the author for a revision. Unlike the INNER
+    review-bounce loop (:func:`auto_route_review_bounce`, which scans for the
+    reviewer's ``review-changes-requested`` reason on the housekeeping tick), this
+    is an EXPLICIT, caller-driven transition of a single named card back to a named
+    author. It is the sanctioned primitive the orchestrator's outer-loop bounce
+    calls instead of a raw :func:`move_card` + hand-rolled guard-clearing dance.
+
+    The wedge it closes (verified live 2026-07-11 on a WRITING card, but generic to
+    any card carrying an open PR): a raw ``move_card`` blocked/acceptance -> ready
+    does NOT emit an ``unblocked`` event, so :func:`check_respawn_guard` stays
+    ``active_pr`` (the PR is genuinely open) and the dispatcher refuses to spawn the
+    author on every tick. Repeated respawn churn inflates ``block_recurrences`` past
+    :data:`BLOCK_RECURRENCE_LIMIT` and the loop breaker escalates the card to
+    ``triage``, where a naive block->unblock cutoff silently no-ops.
+
+    This primitive performs the whole bounce atomically, composed from the existing
+    sanctioned building blocks so the INNER loop, the reviewer-PASS -> acceptance
+    (:func:`accept_task`), and the Casey-merge -> done paths are all left unchanged:
+
+    1. reset an inflated ``block_recurrences`` via :func:`reset_block_recurrences`
+       (the ONLY thing that frees a ``triage`` card and stops it re-escalating on
+       the next same-cause block);
+    2. reassign the card to ``author`` (emits the ``assigned`` event);
+    3. call :func:`unblock_task` (which accepts ``blocked`` / ``scheduled`` /
+       ``triage`` and emits the ``unblocked`` cutoff event). Because that event is
+       written NOW -- causally AFTER the PR-URL handoff comment -- it becomes the
+       ``pr_cutoff`` :func:`check_respawn_guard` honors, so the ``active_pr`` (and
+       ``recent_success``) guard clears and the next ``dispatch`` spawns the author.
+    4. :func:`recompute_ready` (a no-op for a parent-free card; correct gating for
+       one with open parents), and an ``[audit]`` comment naming the PR + feedback.
+
+    Idempotency: step 2's UPDATE and :func:`unblock_task` both fence on the card
+    still being in a transitionable lane (``blocked`` / ``scheduled`` / ``triage``).
+    Once routed off that lane the card is in the author's hands, so a second call
+    matches zero rows and returns ``False`` with no duplicate audit comment.
+
+    ``author`` is required -- a blank author is a caller error (:class:`ValueError`),
+    never a guess. Returns ``True`` on a successful route, ``False`` when the card is
+    missing or not in a transitionable lane (a clean no-op, mirroring the other
+    recovery primitives).
+    """
+    if not author or not str(author).strip():
+        raise ValueError("author is required")
+    canonical = _canonical_assignee(author)
+    if not canonical:
+        raise ValueError("author is required")
+    author = canonical
+
+    row = conn.execute(
+        "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    if row["status"] not in ("blocked", "scheduled", "triage"):
+        # Already off the parked lane (e.g. a prior route already ran, or the card
+        # is mid-flight). Nothing to route -- clean no-op, not an error.
+        return False
+    prior_assignee = row["assignee"]
+
+    # 1. Reset any inflated loop counter FIRST. This is the only thing that frees a
+    #    ``triage`` card and prevents an immediate re-escalation to triage on the
+    #    next same-cause block. It emits its own ``block_recurrences_reset`` audit
+    #    event and is a benign audited no-op when the counter is already 0.
+    reset_block_recurrences(
+        conn, task_id, actor=actor,
+        reason="outer-loop feedback route — fresh revision cycle",
+    )
+
+    # 2. Reassign to the author, fenced on the card still being in a transitionable
+    #    lane (so a concurrent status change between the SELECT and here is a clean
+    #    no-op rather than a mis-assignment).
+    with write_txn(conn):
+        upd = conn.execute(
+            "UPDATE tasks SET assignee = ? "
+            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'triage')",
+            (author, task_id),
+        )
+        if upd.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "assigned",
+            {"from": prior_assignee, "to": author, "by": actor},
+        )
+
+    # 3. Clean unblock -- emits the ``unblocked`` cutoff event NOW (after the PR-URL
+    #    comment ts), which is what clears the ``active_pr`` guard. Accepts blocked/
+    #    scheduled/triage. A False here means the lane changed underneath us; the
+    #    reassignment above already fenced on the same lanes, so treat it as no-op.
+    if not unblock_task(conn, task_id):
+        return False
+
+    # 4. Re-gate readiness (correct for a card with open parents; a no-op otherwise)
+    #    and record an audit comment naming the PR + feedback gist so the board
+    #    trail is fully traceable.
+    recompute_ready(conn)
+    gist = (reason or "").strip()
+    pr_match = _RESPAWN_GUARD_PR_URL_RE.search(gist)
+    pr = pr_match.group(0) if pr_match else None
+    body_lines = ["[audit] actor=orchestrator stage=outer-feedback"]
+    if pr:
+        body_lines.append(f"pr={pr}")
+    body_lines.append(
+        f"notes: routed accepted card back to author {author} on outer-loop "
+        f"feedback; {gist}"
+    )
+    try:
+        add_comment(conn, task_id, author="orchestrator", body="\n".join(body_lines))
+    except ValueError:
+        pass
+    return True
+
+
 # The acceptance/PASS block reason prefix. A reviewer's PASS parks the card for
 # the principal's sign-off with this reason; the ``blocked`` event carrying it is
 # what fires the acceptance notification (``gateway/kanban_watchers.py`` pings on
