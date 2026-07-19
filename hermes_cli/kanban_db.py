@@ -5427,30 +5427,40 @@ def complete_task(
                     )
                 return True
             # No review owner resolved from the card's owner map. For a card that
-            # is unambiguously a review-eligible PIPELINE card — one that builds in
-            # an isolated git worktree cut for a branch/PR (``_card_requires_pr``,
-            # the same signal the missing-PR guard above uses) — the author lane
-            # MUST hand off to a reviewer. Falling through to the ``-> done``
-            # UPDATE below would land the card in ``done`` past the reviewer and
-            # past Casey's acceptance — the exact false-``done`` this redirect
-            # exists to prevent, silently, whenever the owner map was never
-            # stamped (a card filed off the ``submit_card`` path). So instead of a
-            # silent fall-through we REFUSE: a clean no-op (returns False, no state
-            # mutation) with an auditable ``completion_redirect_unresolved`` event,
-            # the same shape as the acceptance and missing-PR guards above.
+            # is unambiguously a review-eligible PIPELINE card — one that either
+            # builds in an isolated git worktree cut for a branch/PR
+            # (``_card_requires_pr``, the same signal the missing-PR guard above
+            # uses) OR already OWNS an open PR artifact (``_card_has_pr_artifact``,
+            # a resolvable ``pull/<n>`` URL in a comment — the same idiom the
+            # active_pr respawn guard trusts) — the author lane MUST hand off to a
+            # reviewer. Falling through to the ``-> done`` UPDATE below would land
+            # the card in ``done`` past the reviewer and past Casey's acceptance —
+            # the exact false-``done`` this redirect exists to prevent, silently,
+            # whenever the owner map was never stamped (a card filed off the
+            # ``submit_card`` path). So instead of a silent fall-through we REFUSE:
+            # a clean no-op (returns False, no state mutation) with an auditable
+            # ``completion_redirect_unresolved`` event, the same shape as the
+            # acceptance and missing-PR guards above.
             #
-            # This is deliberately scoped to the population core can identify
-            # WITHOUT a card ``kind`` column (there is none — the owner map lives
-            # in the audit trail by design). A non-PR-requiring card (plain
-            # ``scratch`` task, a ``dir`` build, a ``~/.hermes`` edit-in-place
-            # card) has no core-visible review lane, so it is NOT refused and
-            # completes to ``done`` exactly as before — the redirect never shunted
-            # those, and this refusal must not either. Board-driven review cards
-            # (writing) whose only pipeline marker is the owner map are addressed
-            # at the filing layer (stamping the map at creation), not here.
+            # The PR-artifact arm closes the ``dir``-workspace blind spot:
+            # ``_card_requires_pr`` is True ONLY for ``worktree`` cards, so a
+            # ``dir``-workspace card that owns an open PR — EVERY caseywest.com
+            # writing card builds in ``~/src/cwest.github.io`` as ``dir``, not an
+            # isolated worktree — was invisible to the worktree-only arm and fell
+            # through to ``done`` (the live PR #131 false-``done``). A card that
+            # carries a resolvable open PR is review-eligible regardless of its
+            # ``workspace_kind``, so PR-exists ⇒ never a generic ``-> done``.
+            #
+            # Still scoped to the population core can identify WITHOUT a card
+            # ``kind`` column (there is none — the owner map lives in the audit
+            # trail by design). A card that is neither PR-requiring NOR owns a PR
+            # (plain ``scratch`` task, a ``dir`` build with no PR, a ``~/.hermes``
+            # edit-in-place card) has no core-visible review signal, so it is NOT
+            # refused and completes to ``done`` exactly as before — research /
+            # plain / config-edit cards are untouched.
             elif _card_requires_pr(
                 _row["workspace_kind"], _row["workspace_path"]
-            ):
+            ) or _card_has_pr_artifact(conn, task_id):
                 with write_txn(conn):
                     _append_event(
                         conn, task_id, "completion_redirect_unresolved",
