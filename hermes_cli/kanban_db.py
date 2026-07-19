@@ -7332,6 +7332,23 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Pattern matching a durable self-verification / lane-done HANDOFF comment on a
+# no-PR edit-in-place card. Such a card has no PR to open and (because a
+# verb-less clean exit is exactly why no ``outcome='completed'`` run row was
+# written) satisfies neither of the two PR/completed-run proofs — so a landed
+# lane is proven ONLY by a deliberate handoff comment the worker posts before
+# exiting. Matched conservatively: only an explicit handoff / self-verified /
+# completion signpost counts, so a chatty progress comment ("looking into it")
+# is NOT mistaken for proof and the carve-out stays proof-gated (an incomplete
+# quiet exit still trips the protocol violation). Anchored to the start of any
+# line so the token is a deliberate signpost, not an incidental mention.
+_LANE_DONE_HANDOFF_RE = re.compile(
+    r"^\s*(?:review-required\b|self-verified\b|lane[ -]?done\b|"
+    r"lane work (?:provably )?done\b|handoff\b|verified(?: green| on disk)\b|"
+    r"completed(?: the)? lane\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def _resolve_pr_state(pr_url: str) -> str:
     """Return the live GitHub state of ``pr_url`` for the active_pr respawn guard.
@@ -8725,7 +8742,20 @@ def _lane_work_provably_done(conn: sqlite3.Connection, task_id: str) -> bool:
 
     * a completed run within ``_RESPAWN_GUARD_SUCCESS_WINDOW`` (recent_success), or
     * a GitHub PR URL in a comment within ``_RESPAWN_GUARD_PR_WINDOW`` (active_pr) —
-      the ready-for-review handoff the implementer lane posts on PR open.
+      the ready-for-review handoff the implementer lane posts on PR open, or
+    * for a **no-PR edit-in-place card** (``scratch`` / ``dir`` / a ``~/.hermes``
+      workdir — the shape :func:`_card_requires_pr` classifies as NOT
+      PR-requiring): a durable self-verification / lane-done HANDOFF comment
+      within ``_RESPAWN_GUARD_SUCCESS_WINDOW`` (matched by
+      :data:`_LANE_DONE_HANDOFF_RE`). Such a card completes its lane by exiting
+      rc=0 with no terminal verb — by design, since ``done ≡ merged`` only
+      applies to PR-backed cards and there is no PR to open — so it satisfies
+      NEITHER of the first two proofs (it opens no PR, and the verb-less exit is
+      exactly why no ``outcome='completed'`` run row exists). Its landed lane is
+      provable only from a deliberate handoff comment. This proof is scoped to
+      the no-PR shape so it can never leak into a PR-requiring worktree card
+      (which is still held to a real PR/completed-run artifact — PR-backed
+      behavior is unchanged).
 
     Only proof is a carve-out; absence of proof keeps the strict
     protocol-violation behavior (a genuinely-incomplete quiet exit STILL
@@ -8750,6 +8780,29 @@ def _lane_work_provably_done(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
             return True
+
+    # Proof 3: a no-PR edit-in-place card with a durable lane-done HANDOFF
+    # comment in the success window. Gated on the shared no-PR shape predicate
+    # so it applies ONLY to cards that legitimately exit verb-less (no PR to
+    # open); a PR-requiring worktree card falls through to the strict
+    # protocol-violation path unchanged. The handoff-comment match is
+    # deliberately conservative (an explicit signpost, not any comment) so an
+    # incomplete quiet exit that never posted a landed-work handoff still counts.
+    trow = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if trow is not None and not _card_requires_pr(
+        trow["workspace_kind"], trow["workspace_path"]
+    ):
+        handoff_cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
+        for c in conn.execute(
+            "SELECT body FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ?",
+            (task_id, handoff_cutoff),
+        ).fetchall():
+            if c["body"] and _LANE_DONE_HANDOFF_RE.search(c["body"]):
+                return True
 
     return False
 
