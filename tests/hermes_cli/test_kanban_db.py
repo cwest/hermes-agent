@@ -1728,6 +1728,145 @@ def test_unknown_exit_without_proof_still_crashes(kanban_home, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Third proof: a no-PR edit-in-place card (scratch / dir / ~/.hermes workdir)
+# completes its lane by exiting rc=0 WITHOUT a terminal kanban verb — by
+# design, since ``done ≡ merged`` and there is no PR to open. Such a card
+# satisfies NEITHER of the existing two proofs (it opens no PR, and the
+# verb-less exit is precisely why no ``outcome='completed'`` run row exists),
+# so the ``clean_exit_after_done`` carve-out never fired for it and it always
+# false-``gave_up``'d. The third proof recognizes the no-PR edit-in-place shape
+# (via the shared ``_card_requires_pr`` predicate) and treats a durable
+# self-verification handoff comment within the success window as landed-work
+# proof. Absence of proof STILL trips the protocol violation (proof-gated).
+# ---------------------------------------------------------------------------
+
+
+def test_no_pr_edit_in_place_done_handoff_not_counted_as_failure(
+    kanban_home, monkeypatch,
+):
+    """A no-PR edit-in-place card (scratch workspace) that finished its lane
+    and posted a durable ``review-required:`` handoff comment, then exited
+    rc=0 without a terminal verb → benign no-op, not a protocol violation.
+    This is the reported code-enforcement-batch incident shape.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        # Default workspace_kind is 'scratch' → a no-PR edit-in-place card.
+        tid = kb.create_task(conn, title="edit-in-place-done", assignee="a")
+        kb.add_comment(
+            conn, tid, "worker",
+            "review-required: applied the config edit; validator green on disk",
+        )
+
+        _stage_clean_exit(conn, _kb, tid, 68001)
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid not in crashed, (
+            "no-PR edit-in-place clean exit after a landed-work handoff must "
+            "not be treated as a crash"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            f"provably-done no-PR clean exit should release ready, "
+            f"got {task.status}"
+        )
+        assert task.consecutive_failures == 0, (
+            "provably-done no-PR clean exit must not increment the failure "
+            f"counter, got {task.consecutive_failures}"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "protocol_violation" not in kinds, kinds
+        assert "gave_up" not in kinds, kinds
+        cead = getattr(
+            _kb.detect_crashed_workers, "_last_clean_exit_after_done", []
+        )
+        assert tid in cead, (
+            "provably-done no-PR clean exit should be surfaced via the "
+            "clean_exit_after_done side-channel"
+        )
+
+
+def test_no_pr_edit_in_place_without_proof_still_protocol_violation(
+    kanban_home, monkeypatch,
+):
+    """A no-PR edit-in-place card that exits rc=0 without a terminal verb AND
+    without any landed-work handoff comment is STILL a protocol violation.
+    The third proof is proof-gated: absence of proof cannot mask a genuinely
+    incomplete quiet exit on a no-PR card.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="edit-in-place-quiet", assignee="a")
+        # A chatty comment that is NOT a landed-work handoff must not count.
+        kb.add_comment(conn, tid, "worker", "looking into this now")
+
+        _stage_clean_exit(conn, _kb, tid, 68002)
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid in crashed, (
+            "a no-PR quiet exit with no landed-work proof should be detected"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"protocol violation without proof should auto-block, "
+            f"got {task.status}"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "protocol_violation" in kinds, kinds
+        assert "gave_up" in kinds, kinds
+
+
+def test_pr_requiring_card_handoff_comment_is_not_third_proof(
+    kanban_home, monkeypatch,
+):
+    """The third proof is scoped to the no-PR edit-in-place shape ONLY. A
+    PR-requiring worktree card that exits rc=0 with a ``review-required:``
+    handoff comment but NO PR URL and NO completed run must STILL trip the
+    protocol violation — a worktree card is held to a PR artifact, so the
+    handoff-comment carve-out must not leak into it (PR-backed behavior
+    unchanged).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="worktree-no-pr", assignee="a",
+            workspace_kind="worktree",
+            workspace_path="/Users/caseywest/src/hermes-agent",
+        )
+        # A handoff comment but NO PR URL — a PR-requiring card is not proven
+        # done by a comment alone.
+        kb.add_comment(
+            conn, tid, "worker",
+            "review-required: implemented, tests green",
+        )
+
+        _stage_clean_exit(conn, _kb, tid, 68003)
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid in crashed, (
+            "a PR-requiring card without a PR artifact must still be detected"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"PR-requiring card w/o PR should auto-block, got {task.status}"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "protocol_violation" in kinds, kinds
+
+
+# ---------------------------------------------------------------------------
 # Sibling path (#47 missed): transient API / connection failures.
 #
 # A worker whose run dies because the model endpoint was transiently
