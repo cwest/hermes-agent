@@ -3708,6 +3708,23 @@ def _is_review_bounce_reason(reason: Optional[str]) -> bool:
     return bool(reason) and reason.lstrip().startswith(_REVIEW_BOUNCE_REASON_PREFIX)
 
 
+def _is_acceptance_signoff_reason(reason: Optional[str]) -> bool:
+    """True iff ``reason`` is the PASS acceptance sign-off park.
+
+    Matched on the ``awaiting-casey-signoff`` prefix (leading whitespace
+    tolerated). An acceptance park is a clean human sign-off gate, NOT a failure
+    repeating, so :func:`block_task` must never count it toward the unblock-loop
+    breaker (a bounce -> rework -> PASS -> acceptance cycle re-blocks with the
+    same ``kind`` and would otherwise escalate a cleanly-accepted card to
+    phantom ``triage``). ``_ACCEPTANCE_SIGNOFF_REASON_PREFIX`` is defined further
+    down alongside its counterpart ``_REVIEW_BOUNCE_REASON_PREFIX``; it resolves
+    as a module global at call time, so the ordering is not a problem.
+    """
+    if not reason:
+        return False
+    return reason.lstrip().startswith(_ACCEPTANCE_SIGNOFF_REASON_PREFIX)
+
+
 def _review_bounce_finding(reason: Optional[str]) -> str:
     """Return the normalized finding text of a review-changes-requested reason.
 
@@ -5849,6 +5866,19 @@ def block_task(
                 != _review_bounce_finding(prior_reason)
             ):
                 same_cause = False
+
+        # Acceptance exception: an ``awaiting-casey-signoff`` block is a clean
+        # human sign-off park (a reviewer PASS routing the card to Casey's
+        # acceptance lane), NOT a failure repeating. A clean bounce -> rework ->
+        # PASS -> acceptance cycle re-blocks with the SAME ``kind`` as the earlier
+        # review bounce, so the ``prev_kind == kind`` classifier would count the
+        # acceptance park as "the same failure again" and escalate a cleanly
+        # accepted card to phantom ``triage`` at the limit. Acceptance parks never
+        # participate in the loop breaker: force a fresh cause so the counter
+        # resets to 1 and the card always lands in ``blocked`` for Casey. Genuine
+        # failure/rework blocks are unaffected and still escalate.
+        if _is_acceptance_signoff_reason(reason):
+            same_cause = False
 
         recurrences = prev_recurrences + 1 if same_cause else 1
 
