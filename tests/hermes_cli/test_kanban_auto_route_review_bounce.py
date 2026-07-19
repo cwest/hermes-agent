@@ -245,6 +245,113 @@ def test_circuit_breaker_block_does_not_route(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# RED 6b — a needs_input-kinded bounce whose author is NOT resolvable from event
+#          history still routes, via the card's stamped state_owners[ready].
+# ---------------------------------------------------------------------------
+
+
+def _stamp_owner_map(conn, tid: str, *, ready: str = "eckert",
+                     review: str = "lamport", acceptance: str = "casey") -> None:
+    """Stamp the card's submit-stage owner map, mirroring the live hollis audit.
+
+    The per-lane owner map lives in the ``stage=submit`` §9.1 audit comment
+    (there is no ``state_owners`` column). The one-card lane resolvers read
+    ``state_owners[<lane>]`` from here.
+    """
+    body = (
+        "[audit] actor=hollis stage=submit ts=2026-07-19T18:31:21Z\n"
+        f"notes: state_owners={{ready: {ready}, review: {review}, "
+        f"blocked-acceptance: {acceptance}}} triager=hollis team=engineering"
+    )
+    kb.add_comment(conn, tid, author="hollis", body=body)
+
+
+def _stage_needs_input_bounce_unresolvable_author(
+    conn, *, author: str = "eckert", reviewer: str = "lamport",
+    reason: str = _BOUNCE_REASON,
+) -> str:
+    """A needs_input review bounce whose event history CANNOT resolve the author.
+
+    Reproduces the live failure (t_b1055359 / t_faf0bb66, 2026-07-19): the card's
+    most-recent ``assigned`` event carries the ``{"assignee": X}`` shape (emitted
+    by ``assign_task`` / a non-``move_card`` reassignment), NOT the
+    ``{"from": author, "to": reviewer}`` shape ``_resolve_review_author`` keys on.
+    Event-history author resolution therefore returns None -- so the ONLY way to
+    route this card is the card's stamped ``state_owners[ready]`` owner map. The
+    reviewer's terminal block is ``kind='needs_input'`` (the live shape).
+    """
+    tid = kb.create_task(conn, title="feature work", assignee=author)
+    _stamp_owner_map(conn, tid, ready=author, review=reviewer)
+    kb.claim_task(conn, tid)
+    kb.complete_task(
+        conn, tid,
+        result="PR opened: https://github.com/cwest/hermes-agent/pull/71",
+    )
+    # Review MOVE emitted the {"assignee": reviewer} event shape (not from/to),
+    # so _resolve_review_author can find no author from event history.
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='review', assignee=? WHERE id=?",
+                     (reviewer, tid))
+        kb._append_event(conn, tid, "assigned", {"assignee": reviewer})
+    kb.claim_review_task(conn, tid)
+    assert kb.block_task(conn, tid, reason=reason, kind="needs_input",
+                         expected_run_id=kb.get_task(conn, tid).current_run_id)
+    assert kb.get_task(conn, tid).status == "blocked"
+    assert kb.get_task(conn, tid).block_kind == "needs_input"
+    past = int(time.time()) - 300
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_comments SET created_at=? WHERE task_id=?",
+                     (past, tid))
+        conn.execute(
+            "UPDATE task_runs SET ended_at=? WHERE task_id=? AND ended_at IS NOT NULL",
+            (past, tid))
+    return tid
+
+
+def test_needs_input_bounce_routes_via_owner_map(kanban_home: Path) -> None:
+    """A ``kind='needs_input'`` review-changes-requested bounce whose author is
+    UNRESOLVABLE from event history must still auto-route ``blocked -> ready`` +
+    the author read from the card's stamped ``state_owners[ready]``. Fails today:
+    the card sits ``blocked`` forever (the live t_b1055359 / t_faf0bb66 symptom)."""
+    with kb.connect() as conn:
+        tid = _stage_needs_input_bounce_unresolvable_author(conn)
+        # Ground-truth the premise: event-history resolution genuinely fails here,
+        # so the fix MUST come from the owner map.
+        assert kb._resolve_review_author(conn, tid, reviewer="lamport") is None
+
+        routed = kb.auto_route_review_bounce(conn)
+
+        assert routed == 1, "the needs_input bounce must auto-route via the owner map"
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", "card must be routed back to ready"
+        assert task.assignee == "eckert", \
+            "author must be resolved from state_owners[ready]"
+        assert any("pull/71" in (c.body or "") for c in kb.list_comments(conn, tid)), \
+            "the audit comment must name the PR"
+
+
+def test_needs_input_non_bounce_block_stays_parked(kanban_home: Path) -> None:
+    """A ``kind='needs_input'`` block whose reason is NOT the review bounce prefix
+    is a genuine human-input block and must STAY ``blocked`` -- even when the card
+    carries a stamped owner map (routing keys on the reason prefix, not the kind)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs a human call", assignee="lamport")
+        _stamp_owner_map(conn, tid, ready="eckert", review="lamport")
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid, reason="needs_input: which ACL model should this use?",
+            kind="needs_input",
+            expected_run_id=kb.get_task(conn, tid).current_run_id)
+
+        routed = kb.auto_route_review_bounce(conn)
+
+        assert routed == 0, "a genuine needs_input block must not auto-route"
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", "genuine needs_input block must stay parked"
+        assert task.assignee == "lamport"
+
+
+# ---------------------------------------------------------------------------
 # RED 6 — config toggle off disables the auto-route
 # ---------------------------------------------------------------------------
 
