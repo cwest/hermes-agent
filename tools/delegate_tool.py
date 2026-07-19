@@ -769,13 +769,23 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     """Remove toolsets that contain only blocked tools.
 
     The strip set is derived from DELEGATE_BLOCKED_TOOLS plus the explicit
-    composite/scenario toolsets (delegation, code_execution) that have no
-    one-to-one tool. This keeps the blocklist and the strip set in lockstep
+    composite/scenario toolsets (delegation, code_execution, kanban) that have
+    no one-to-one tool. This keeps the blocklist and the strip set in lockstep
     so new blocked tools can't silently leak through as toolset names.
+
+    ``kanban`` is stripped unconditionally — even for orchestrator children.
+    A delegated child inherits the parent's ``HERMES_KANBAN_TASK`` env, so a
+    child holding the kanban terminal verbs (``kanban_complete`` /
+    ``kanban_block``) would resolve the *parent's* card and could retire it
+    with the child's summary while the real deliverable was never produced
+    (false-done, control-surface-bleed). Children get no card-terminal
+    authority.
     """
     # Composite toolsets that should never pass through to children, even
     # though their individual tools aren't all in DELEGATE_BLOCKED_TOOLS.
-    _COMPOSITE_BLOCKED_TOOLSETS = frozenset({"delegation", "code_execution"})
+    _COMPOSITE_BLOCKED_TOOLSETS = frozenset(
+        {"delegation", "code_execution", "kanban"}
+    )
     blocked_toolset_names = {
         name
         for name, defn in TOOLSETS.items()
