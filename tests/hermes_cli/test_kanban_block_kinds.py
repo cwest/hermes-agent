@@ -275,6 +275,117 @@ def test_non_review_same_reason_loop_still_escalates(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Acceptance (awaiting-casey-signoff) parks must NOT count toward the loop
+# ---------------------------------------------------------------------------
+#
+# A clean bounce -> rework -> PASS -> acceptance cycle re-blocks the card with
+# the SAME ``kind`` as the earlier review bounce, but the acceptance block is a
+# human sign-off park (``awaiting-casey-signoff: …``), NOT a failure repeating.
+# The pure ``prev_kind == kind`` classifier counted the acceptance park as
+# "the same failure again" and escalated a cleanly-accepted card to phantom
+# ``triage`` at the limit. The fix: an ``awaiting-casey-signoff`` block never
+# increments the loop counter (it resets to 1 and always lands in ``blocked``),
+# while genuine failure/rework blocks still escalate.
+
+
+def test_acceptance_after_bounce_does_not_route_to_triage(
+    kanban_home: Path,
+) -> None:
+    """bounce -> rework -> PASS -> acceptance must stay blocked, never triage."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        # Round 1: a genuine review bounce (counter -> 1).
+        kb.block_task(
+            conn, tid,
+            reason="review-changes-requested: fix the null deref in foo()",
+            kind="needs_input",
+        )
+        assert kb.get_task(conn, tid).block_recurrences == 1
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # PASS: park for Casey's sign-off with the SAME kind as the bounce.
+        kb.block_task(
+            conn, tid,
+            reason="awaiting-casey-signoff: PR #12 PASS'd; awaiting Casey merge.",
+            kind="needs_input",
+        )
+        t = kb.get_task(conn, tid)
+        assert t.status == "blocked", (
+            "a clean acceptance park must never escalate to triage"
+        )
+        assert t.block_recurrences == 1, (
+            "an acceptance sign-off block must not count toward the loop"
+        )
+
+
+def test_repeated_acceptance_parks_never_escalate(kanban_home: Path) -> None:
+    """Multiple acceptance parks in a row (outer feedback laps) never triage."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        for i in range(3):
+            if i > 0:
+                _make_running_again(conn, tid)
+            kb.block_task(
+                conn, tid,
+                reason=f"awaiting-casey-signoff: PR PASS'd, lap {i}.",
+                kind="needs_input",
+            )
+            t = kb.get_task(conn, tid)
+            assert t.status == "blocked", f"acceptance lap {i} must stay blocked"
+            assert t.block_recurrences == 1, (
+                f"acceptance lap {i} must not accumulate loop count"
+            )
+            kb.unblock_task(conn, tid)
+
+
+def test_acceptance_park_does_not_reset_a_prior_failure_loop_to_escalation(
+    kanban_home: Path,
+) -> None:
+    """An acceptance park between failure blocks does not itself cause triage,
+    and a genuine failure re-block AFTER it still escalates on its own merits."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        # Genuine failure block (counter -> 1).
+        kb.block_task(conn, tid, reason="need creds", kind="needs_input")
+        assert kb.get_task(conn, tid).block_recurrences == 1
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # Acceptance park in between must NOT trip the breaker.
+        kb.block_task(
+            conn, tid,
+            reason="awaiting-casey-signoff: PR PASS'd.",
+            kind="needs_input",
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).block_recurrences == 1
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # A real same-cause failure re-block escalates on its own (counter -> 2).
+        kb.block_task(conn, tid, reason="still need creds", kind="needs_input")
+        t = kb.get_task(conn, tid)
+        assert t.status == "triage", (
+            "a genuine same-cause failure loop must still escalate"
+        )
+        assert t.block_recurrences == 2
+
+
+def test_genuine_failure_loop_still_escalates_regression(
+    kanban_home: Path,
+) -> None:
+    """Regression guard: the acceptance carve-out must not weaken the breaker
+    for genuine repeated failure blocks."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="need the API key", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="still no API key", kind="capability")
+        t = kb.get_task(conn, tid)
+        assert t.status == "triage"
+        assert t.block_recurrences == 2
+
+
+# ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
 
