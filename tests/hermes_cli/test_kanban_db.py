@@ -1867,6 +1867,151 @@ def test_pr_requiring_card_handoff_comment_is_not_third_proof(
 
 
 # ---------------------------------------------------------------------------
+# Auto-advance a PR-open code card to review on clean-exit-after-done.
+#
+# When a code-author card's worker opens a PR, pushes, and exits rc=0 WITHOUT a
+# terminal verb, ``_lane_work_provably_done`` is True (Proof 2: a PR URL in a
+# recent comment) so the reap does not count a failure — but the OLD behavior
+# merely RELEASED the card to ``ready``. For a PR-open code card that release is
+# a dead end: the ``active_pr`` respawn guard HOLDS it out of respawn (an open
+# PR ⇒ dup-PR risk) WITHOUT advancing it, so the card wedges in ``running`` →
+# ``ready`` until an orchestrator hand-stages it to review. The reap must
+# instead MOVE the card ``running -> review`` + the owner-map reviewer atomically
+# (mirroring ``complete_task``'s canonical author-lane handoff), emitting
+# ``status_changed running->review`` + an assignee. The distinguisher from the
+# no-PR edit-in-place shape (which must stay a benign release) is the pair of
+# durable signals the rest of the subsystem already trusts: a PR artifact
+# (``_card_has_pr_artifact``) AND a resolvable ``review`` owner in the card's
+# submit-stage owner map.
+# ---------------------------------------------------------------------------
+
+
+def _stamp_submit_owner_map(conn, task_id, *, ready, review):
+    """Record the submit-stage owner-map audit comment core reads for routing.
+
+    Mirrors ``submit_card``'s §9.1 audit comment shape (the ONE comment
+    ``_owner_from_owner_map`` treats as authoritative).
+    """
+    kb.add_comment(
+        conn, task_id, "hollis",
+        "[audit] actor=hollis stage=submit ts=2026-07-21T22:06:57Z\n"
+        f"notes: state_owners={{ready: {ready}, review: {review}, "
+        "blocked-acceptance: casey}} triager=hollis team=engineering",
+    )
+
+
+def test_clean_exit_after_done_pr_open_code_card_advances_to_review(
+    kanban_home, monkeypatch,
+):
+    """A code-author card whose worker opened a PR and exited rc=0 without a
+    terminal verb must AUTO-ADVANCE to ``review`` + the owner-map reviewer —
+    not merely release to ``ready`` (where the active_pr guard would wedge it).
+
+    This is the reported okfctl PR #1 incident shape: the author finished,
+    pushed, and exited ``clean_exit_after_done``, but the card sat
+    ``running``/eckert and had to be hand-staged.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="fix: a bug", assignee="eckert",
+            workspace_kind="worktree",
+            workspace_path="/Users/caseywest/src/hermes-agent",
+        )
+        _stamp_submit_owner_map(conn, tid, ready="eckert", review="lamport")
+        # The ready-for-review handoff the implementer lane posts on PR open.
+        kb.add_comment(
+            conn, tid, "eckert",
+            "PR opened (draft): https://github.com/cwest/hermes-agent/pull/501 "
+            "head=c05e13a",
+        )
+
+        _stage_clean_exit(conn, _kb, tid, 69001)
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid not in crashed, (
+            "a PR-open code card that exited clean_exit_after_done must not be "
+            "treated as a crash"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "review", (
+            f"a PR-open code card must auto-advance to review, got {task.status}"
+        )
+        assert task.assignee == "lamport", (
+            f"the card must be assigned to the owner-map reviewer, "
+            f"got {task.assignee}"
+        )
+        # The claim/pid must be cleared so the reviewer can spawn.
+        assert task.worker_pid is None
+        assert task.claim_lock is None
+        assert task.consecutive_failures == 0, (
+            "auto-advance must not count a failure"
+        )
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "crashed" not in kinds, kinds
+        assert "gave_up" not in kinds, kinds
+        # The lifecycle transition events the orchestrator/dashboard read.
+        sc = [
+            e for e in events
+            if e.kind == "status_changed"
+            and (e.payload or {}).get("to") == "review"
+        ]
+        assert sc, (
+            f"expected a status_changed ->review event, got {kinds}"
+        )
+        moved = sc[-1].payload or {}
+        assert moved.get("from") == "running", moved
+        assert moved.get("assignee") == "lamport", moved
+
+
+def test_clean_exit_after_done_pr_card_without_owner_map_still_releases_ready(
+    kanban_home, monkeypatch,
+):
+    """A card with an open PR URL but NO owner-map reviewer cannot resolve a
+    review destination, so it must fall back to the benign release-to-``ready``
+    (the pre-existing #47 draft-PR carve-out), NOT wedge or crash. The
+    auto-advance is gated on a resolvable owner-map reviewer.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="draft-pr-no-map", assignee="a")
+        kb.add_comment(
+            conn, tid, "worker",
+            "PR opened (draft): https://github.com/cwest/hermes-agent/pull/502",
+        )
+
+        _stage_clean_exit(conn, _kb, tid, 69002)
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid not in crashed
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            f"a PR card with no owner-map reviewer must release ready, "
+            f"got {task.status}"
+        )
+        assert task.consecutive_failures == 0
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "crashed" not in kinds, kinds
+        assert "gave_up" not in kinds, kinds
+        cead = getattr(
+            _kb.detect_crashed_workers, "_last_clean_exit_after_done", []
+        )
+        assert tid in cead, (
+            "a PR card with no owner-map reviewer should still be surfaced via "
+            "the clean_exit_after_done side-channel"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Sibling path (#47 missed): transient API / connection failures.
 #
 # A worker whose run dies because the model endpoint was transiently

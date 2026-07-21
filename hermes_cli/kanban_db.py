@@ -8136,10 +8136,24 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     protocol violation. It is the completed-but-un-signposted exit: the
     worker finished the lane correctly but exited without the terminal verb.
     Counting it would trip a FALSE ``gave_up`` and strand a finished card in
-    ``blocked``. It is released as a benign no-op WITHOUT counting a failure
-    (mirroring the rate-limit carve-out); the respawn guard's
-    recent_success / active_pr check then defers a duplicate spawn. The ids
-    are surfaced via the ``_last_clean_exit_after_done`` function attribute.
+    ``blocked``. It is handled WITHOUT counting a failure (mirroring the
+    rate-limit carve-out), and the ids are surfaced via the
+    ``_last_clean_exit_after_done`` function attribute. There are two release
+    shapes:
+
+    * **PR-open code card** — the provably-done signal is a PR handoff (a
+      ``pull/<n>`` URL in a comment, via :func:`_card_has_pr_artifact`) AND the
+      card's own submit-stage owner map declares a ``review`` owner. Such a card
+      is MOVED ``running -> review`` + that reviewer atomically with the reap —
+      the exact author-lane handoff the worker's clean exit skipped, mirroring
+      :func:`complete_task`. Merely releasing it to ``ready`` would wedge it: the
+      ``active_pr`` respawn guard holds an open-PR card out of respawn WITHOUT
+      advancing it, so it would sit in ``running``/``ready`` until an
+      orchestrator hand-staged it.
+    * **Everything else** (a completed-run proof with no PR, a no-PR
+      edit-in-place card, or a PR card with no resolvable owner-map reviewer) is
+      released as a benign no-op back to ``ready``/``review``; the respawn
+      guard's recent_success / active_pr check then defers a duplicate spawn.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -8250,6 +8264,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             rate_limited_exit = False
             transient_exit = False
             clean_exit_after_done = False
+            # For a PR-open code card exiting clean_exit_after_done, the
+            # owner-map reviewer to auto-advance the card to (``review``); stays
+            # None for every other shape (which release to ``ready`` as before).
+            advance_review_owner: Optional[str] = None
             if kind in ("clean_exit", "unknown") and _lane_work_provably_done(
                 conn, row["id"]
             ):
@@ -8288,6 +8306,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "exit_code": code,
                     "exit_kind": kind,
                 }
+                # PR-open code card: the provably-done signal is a PR handoff
+                # (a ``pull/<n>`` URL in a comment) AND the card's own owner map
+                # declares a ``review`` owner. Merely releasing this card to
+                # ``ready`` is a dead end — the ``active_pr`` respawn guard HOLDS
+                # an open-PR card out of respawn WITHOUT advancing it, so it
+                # wedges in ``running`` until an orchestrator hand-stages it. So
+                # MOVE it ``running -> review`` + the owner-map reviewer atomically
+                # with the reap (below), mirroring ``complete_task``'s canonical
+                # author-lane handoff. The no-PR edit-in-place shape (Proof 3) and
+                # a PR card with no resolvable reviewer are NOT auto-advanced:
+                # they fall through to the benign release-to-``ready`` unchanged,
+                # so this narrows to exactly the code-author-opened-a-PR case.
+                if _card_has_pr_artifact(conn, row["id"]):
+                    advance_review_owner = _review_owner_from_owner_map(
+                        conn, row["id"]
+                    )
             elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -8385,13 +8419,29 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 conn, row["id"], current_run_id
             )
             restore_status = "review" if was_review_run else "ready"
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (restore_status, row["id"], pid, row["claim_lock"]),
-            )
+            # A PR-open code card auto-advances to ``review`` + the owner-map
+            # reviewer instead of releasing to ``ready`` — the transition the
+            # worker's clean exit skipped. This is the same MOVE ``complete_task``
+            # performs on the author-lane handoff (status=review, assignee set,
+            # claim/pid cleared, block state reset), applied here for the card
+            # whose worker exited without the terminal verb.
+            if advance_review_owner:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'review', assignee = ?, "
+                    "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                    "block_kind = NULL, block_recurrences = 0 "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (advance_review_owner, row["id"], pid, row["claim_lock"]),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (restore_status, row["id"], pid, row["claim_lock"]),
+                )
             if cur.rowcount == 1:
                 # Rate-limited / transient requeues and provably-done clean
                 # exits are a clean release, not a crash — record the run
@@ -8402,6 +8452,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     _run_outcome = "rate_limited"
                 elif transient_exit:
                     _run_outcome = "transient"
+                elif advance_review_owner:
+                    # The author DID finish their lane (an open PR is the
+                    # artifact); the card advancing to review is the handoff —
+                    # record the run as completed, matching ``complete_task``.
+                    _run_outcome = "completed"
                 elif clean_exit_after_done:
                     _run_outcome = "clean_exit_after_done"
                 else:
@@ -8412,6 +8467,25 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error=error_text,
                     metadata=dict(event_payload),
                 )
+                if advance_review_owner:
+                    # Emit the lifecycle transition the orchestrator / dashboard
+                    # read to recognize the card reached the review lane — the
+                    # same ``status_changed`` shape ``complete_task``'s handoff
+                    # emits, so both paths look identical on the board. No
+                    # ``crashed`` event, no failure counted: the reap already
+                    # classified this as a benign completed handoff.
+                    _append_event(
+                        conn, row["id"], "status_changed",
+                        {
+                            "from": "running",
+                            "to": "review",
+                            "assignee": advance_review_owner,
+                            "by": "dispatcher:clean-exit-after-done-advance",
+                        },
+                        run_id=run_id,
+                    )
+                    clean_exit_after_done_ids.append(row["id"])
+                    continue
                 _append_event(
                     conn, row["id"], event_kind,
                     event_payload,
