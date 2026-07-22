@@ -7332,6 +7332,27 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Comment authors that are ORCHESTRATOR / RECOVERY actors — they never open a PR.
+# The ``active_pr`` guard's PR-URL scan must exclude these when checking for a
+# "fresh duplicate PR", because the sanctioned recovery (route_feedback_to_author
+# / the outer-loop reopen recipe) emits the ``unblocked`` cutoff event AND writes
+# its OWN audit/steer comment that NAMES the existing PR URL, in the SAME second.
+# Kanban timestamps are second-granular, so that recovery comment lands at
+# ``created_at == pr_cutoff`` and the ``>=`` window scan would otherwise re-count
+# it as a fresh active PR — the recovery's own cutoff-marking comment re-arming
+# the guard it is trying to clear (live 2026-07-22, gemini companion-post card
+# t_11132357). ``dispatcher`` was already excluded (its auto-route audit is the
+# same class); ``hollis`` (the homestead orchestrator), ``onecard`` (the
+# one-card recovery helper), and ``orchestrator`` (the author
+# ``route_feedback_to_author`` stamps on its outer-loop reopen audit) are its
+# siblings. Prefix-matched (``LIKE '<name>%'``)
+# so profile-suffixed variants (``dispatcher-default``, ``hollis-…``) are covered.
+# A genuine builder/author PR-URL comment (e.g. ``eckert``) at/after the cutoff is
+# NOT in this set, so the real duplicate-PR protection is preserved.
+_RESPAWN_GUARD_RECOVERY_AUTHOR_PREFIXES = (
+    "dispatcher", "hollis", "onecard", "orchestrator",
+)
+
 # Pattern matching a durable self-verification / lane-done HANDOFF comment on a
 # no-PR edit-in-place card. Such a card has no PR to open and (because a
 # verb-less clean exit is exactly why no ``outcome='completed'`` run row was
@@ -9038,13 +9059,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    addressing review feedback) and only guard on PR URLs added at or after
     #    that unblock. Timestamps are second-granular, so a same-second PR URL is
     #    still guarded conservatively. (Carried from upstream PR #46204.)
-    #    The dispatcher's OWN auto-route audit comment (authored ``dispatcher``)
-    #    records the EXISTING PR being reworked — it is posted in the same second
-    #    as the routing unblock, so the same-second-conservative rule above would
-    #    otherwise re-trip the guard on the dispatcher's own audit. The dispatcher
-    #    never opens a PR, so its audit is excluded from the dup-PR scan (analogous
-    #    to the review-status carve-out): a real builder/worker PR comment still
-    #    guards normally.
+    #    The dispatcher's / orchestrator's OWN audit comments (authored
+    #    ``dispatcher`` / ``hollis`` / ``onecard`` / ``orchestrator`` — the
+    #    recovery-actor class in
+    #    ``_RESPAWN_GUARD_RECOVERY_AUTHOR_PREFIXES``) record the EXISTING PR being
+    #    reworked. They are posted in the same second as the routing/reopen unblock,
+    #    so the same-second-conservative rule above would otherwise re-trip the guard
+    #    on the recovery's own cutoff-marking audit. None of these actors ever opens
+    #    a PR, so their audit is excluded from the dup-PR scan (analogous to the
+    #    review-status carve-out): a real builder/worker PR comment still guards
+    #    normally.
     if not is_review:
         pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
         latest_unblock = conn.execute(
@@ -9061,10 +9085,19 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # closed on GitHub but the comment was never cleared), which used to
         # strand the card forever.
         pr_state_cache: dict[str, str] = {}
+        # Exclude recovery/orchestrator authors (prefix match) — they never
+        # open a PR, so their same-second reopen audit must not re-arm the guard.
+        recovery_filter = " AND ".join(
+            "author NOT LIKE ?"
+            for _ in _RESPAWN_GUARD_RECOVERY_AUTHOR_PREFIXES
+        )
+        recovery_params = tuple(
+            f"{p}%" for p in _RESPAWN_GUARD_RECOVERY_AUTHOR_PREFIXES
+        )
         for c in conn.execute(
             "SELECT body FROM task_comments "
-            "WHERE task_id = ? AND created_at >= ? AND author != 'dispatcher'",
-            (task_id, pr_cutoff),
+            f"WHERE task_id = ? AND created_at >= ? AND {recovery_filter}",
+            (task_id, pr_cutoff, *recovery_params),
         ).fetchall():
             if not c["body"]:
                 continue
