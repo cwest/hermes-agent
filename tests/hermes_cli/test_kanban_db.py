@@ -1837,13 +1837,16 @@ def test_no_pr_edit_in_place_without_proof_still_protocol_violation(
             "a no-PR quiet exit with no landed-work proof should be detected"
         )
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked", (
-            f"protocol violation without proof should auto-block, "
+        # Bounded retry (upstream c3656e9f0): the violation is recorded and the
+        # card is requeued, NOT blocked on the first hit. The load-bearing
+        # assertion is that the absent proof did NOT make this a benign no-op.
+        assert task.status == "ready", (
+            f"first protocol violation should requeue for retry, "
             f"got {task.status}"
         )
         kinds = [e.kind for e in kb.list_events(conn, tid)]
         assert "protocol_violation" in kinds, kinds
-        assert "gave_up" in kinds, kinds
+        assert "clean_exit_after_done" not in kinds, kinds
 
 
 def test_pr_requiring_card_handoff_comment_is_not_third_proof(
@@ -1881,11 +1884,15 @@ def test_pr_requiring_card_handoff_comment_is_not_third_proof(
             "a PR-requiring card without a PR artifact must still be detected"
         )
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked", (
-            f"PR-requiring card w/o PR should auto-block, got {task.status}"
+        # Bounded retry (upstream c3656e9f0): requeued rather than blocked on
+        # the first violation. The point of this test is that the handoff
+        # comment did NOT count as the third proof on a PR-requiring card.
+        assert task.status == "ready", (
+            f"first protocol violation should requeue for retry, got {task.status}"
         )
         kinds = [e.kind for e in kb.list_events(conn, tid)]
         assert "protocol_violation" in kinds, kinds
+        assert "clean_exit_after_done" not in kinds, kinds
 
 
 # ---------------------------------------------------------------------------
@@ -3355,6 +3362,151 @@ def test_respawn_guard_keeps_same_second_pr_comment_after_unblock(kanban_home, m
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, 'worker', "
             "'PR opened: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, now),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+# ---------------------------------------------------------------------------
+# The OUTER feedback loop: a ready card legitimately REUSES an open PR for a
+# revision round. The sanctioned recovery (route_feedback_to_author / the
+# outer-loop reopen recipe) emits an ``unblocked`` cutoff event AND writes its
+# OWN audit/steer comment that NAMES the PR URL, in the SAME second. Because
+# kanban timestamps are second-granular, that recovery comment lands at
+# ``created_at == pr_cutoff`` and the ``>=`` window scan re-counts it as a fresh
+# active PR — the recovery's own cutoff-marking comment re-arms the guard it is
+# trying to clear (live 2026-07-22, gemini companion-post card t_11132357).
+# The dispatcher's own audit was already carved out (it never opens a PR); the
+# orchestrator/recovery actors (hollis / dispatcher / onecard...) are the same
+# class — they never open a PR, so their at/after-cutoff PR-URL audit must not
+# re-arm the guard either. A genuine builder/author PR-URL comment after the
+# cutoff MUST still guard (the real duplicate-PR risk is preserved below).
+# ---------------------------------------------------------------------------
+
+def test_respawn_guard_recovery_audit_comment_does_not_rearm_active_pr(
+    kanban_home, monkeypatch
+):
+    """A recovery-actor PR-URL audit at the unblock cutoff must NOT re-arm.
+
+    The outer-loop recovery unblocks the card (emitting the ``unblocked``
+    cutoff) and writes its own PR-URL audit comment in the same second,
+    authored by an orchestrator/recovery actor (``hollis``). That comment
+    references the EXISTING PR being reworked, not a new duplicate, so it must
+    not re-trip ``active_pr`` — the guard must clear on the next tick.
+    """
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="outer-loop-recovery", assignee="eckert")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, now),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'hollis', "
+            "'reason=route_feedback_to_author reopen; reworking "
+            "https://github.com/cwest/hermes-agent/pull/143', ?)",
+            (t, now),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_recovery_audit_prefixed_actor_does_not_rearm(
+    kanban_home, monkeypatch
+):
+    """Prefixed orchestrator/recovery actors are treated as recovery too.
+
+    The card body names ``hollis*`` / ``dispatcher*`` / ``onecard*`` as the
+    recovery/orchestrator actor class. A profile-suffixed actor name (e.g.
+    ``dispatcher-default``) is still a recovery actor and its at-cutoff PR-URL
+    audit must not re-arm the guard.
+    """
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="outer-loop-prefixed", assignee="eckert")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, now),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'onecard-orchestrator', "
+            "'reopen for rework: https://github.com/cwest/hermes-agent/pull/143', ?)",
+            (t, now),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_route_feedback_to_author_does_not_rearm(
+    kanban_home, monkeypatch
+):
+    """The REAL recovery emitter must not re-arm the guard (end-to-end).
+
+    The two hand-inserted tests above use ``hollis`` / ``onecard-orchestrator``
+    as the recovery author, but the actual outer-loop primitive
+    (:func:`route_feedback_to_author`) writes its PR-URL audit comment as
+    ``author="orchestrator"`` in the same second as the ``unblocked`` cutoff it
+    emits. This drives the primitive itself so the test can't drift from the
+    real emitter: after a sanctioned bounce of a blocked, PR-owning card back to
+    its author, ``check_respawn_guard`` must clear (``None``) on the next tick.
+    """
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
+    pr_url = "https://github.com/cwest/hermes-agent/pull/143"
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="outer-loop-real-emitter", assignee="eckert")
+        # The card owns an open PR and is parked in a transitionable lane, the
+        # exact shape route_feedback_to_author expects (blocked/acceptance). The
+        # author's original PR-open comment predates the bounce (as it does in
+        # real life — the PR was opened, reviewed, and accepted before the
+        # outer-loop feedback arrives), so it sits before the unblock cutoff.
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'eckert', ?, ?)",
+            (t, f"PR opened: {pr_url}", int(time.time()) - 300),
+        )
+        kb.block_task(conn, t, reason="awaiting-casey-signoff: ready for merge")
+        routed = kb.route_feedback_to_author(
+            conn, t, author="eckert",
+            reason=f"needs a tweak; reworking {pr_url}",
+        )
+        assert routed is True
+        # The recovery just wrote its own orchestrator-authored PR-URL audit at
+        # the unblock cutoff. It must not be counted as a fresh active PR.
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_author_dup_pr_after_unblock_still_guards(
+    kanban_home, monkeypatch
+):
+    """A NON-recovery author PR-URL comment after the cutoff STILL guards.
+
+    The recovery-actor carve-out must not weaken the genuine duplicate-PR
+    protection: if a real builder/author (not an orchestrator/recovery actor)
+    posts a PR URL at or after the unblock cutoff, that is a fresh duplicate-PR
+    risk and must keep re-arming ``active_pr`` (mirrors the same-second
+    conservative rule).
+    """
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="author-dup-after-unblock", assignee="eckert")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, now),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'eckert', "
+            "'PR opened: https://github.com/cwest/hermes-agent/pull/144', ?)",
             (t, now),
         )
         reason = kb.check_respawn_guard(conn, t)

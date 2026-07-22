@@ -40,14 +40,42 @@ def home(tmp_path, monkeypatch):
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
     # Clean origin + session slate.
+    #
+    # These tests drive the REAL session-context writers. Two leak vectors have
+    # to be undone, and monkeypatch only covers one of them:
+    #
+    #  1. ContextVars — a ContextVar set inside a test does NOT unwind at test
+    #     exit the way monkeypatch's env changes do.
+    #  2. os.environ written DIRECTLY — ``set_kanban_origin`` (reached via the
+    #     real ``kanban_reassign_origin`` tool) does
+    #     ``os.environ[HERMES_KANBAN_ORIGIN] = ...`` itself, so monkeypatch
+    #     never recorded it and never restores it.
+    #
+    # Left unrestored, the leaked origin seed made every LATER card-creating
+    # test in the same process inherit this module's synthetic discord origin,
+    # turning the kanban_tools auto-subscribe tests red in a combined run while
+    # they passed file-alone. Snapshot and restore both surfaces.
     saved_ctx = sc._KANBAN_ORIGIN.get()
+    saved_session_ctx = {name: var.get() for name, var in _VAR_MAP.items()}
+    saved_env = {
+        v: os.environ.get(v) for v in SESSION_VARS + [_ORIGIN_ENV]
+    }
     sc._KANBAN_ORIGIN.set(sc._UNSET)
+    for var in _VAR_MAP.values():
+        var.set(sc._UNSET)
     for v in SESSION_VARS + [_ORIGIN_ENV]:
         monkeypatch.delenv(v, raising=False)
     try:
         yield h
     finally:
         sc._KANBAN_ORIGIN.set(saved_ctx)
+        for name, value in saved_session_ctx.items():
+            _VAR_MAP[name].set(value)
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _subs(task_id):
