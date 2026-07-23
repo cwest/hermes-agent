@@ -7371,15 +7371,44 @@ _LANE_DONE_HANDOFF_RE = re.compile(
 )
 
 
+# gh's stderr signature for a PR URL that GitHub definitively does NOT have —
+# never created, or already deleted. The GraphQL resolver emits "Could not
+# resolve to a PullRequest with the number of N.". Matched case-insensitively
+# and tolerant of the exact phrasing so a definitive not-found is separated from
+# a transient gh failure (network / auth / gh-missing), which must stay
+# fail-open. See :func:`_resolve_pr_state`.
+_PR_NOT_FOUND_STDERR_RE = re.compile(
+    r"could not resolve to a pullrequest",
+    re.IGNORECASE,
+)
+
+# PR states that are NOT active work, so an active_pr respawn guard must NOT
+# fire on them. ``closed`` / ``merged`` are self-explanatory; ``not_found`` is a
+# phantom or deleted PR (:data:`_PR_NOT_FOUND_STDERR_RE`) which — before this
+# carve-out — fell through the fail-open path and wedged the card forever.
+# ``open`` and ``unknown`` (unresolvable, fail-open) are deliberately absent:
+# both still guard.
+_RESPAWN_GUARD_INACTIVE_PR_STATES = frozenset({"closed", "merged", "not_found"})
+
+
 def _resolve_pr_state(pr_url: str) -> str:
     """Return the live GitHub state of ``pr_url`` for the active_pr respawn guard.
 
-    One of ``"open"``, ``"closed"``, ``"merged"``, or ``"unknown"``. Backed by
-    ``gh pr view <url> --json state`` (``gh``'s uppercase ``OPEN``/``CLOSED``/
-    ``MERGED`` are lowercased). Fail-open: any subprocess failure -- ``gh`` not
-    installed, not authenticated, network error, timeout, unparseable output --
-    resolves to ``"unknown"`` so the caller keeps guarding conservatively rather
-    than dropping the guard on a transient hiccup.
+    One of ``"open"``, ``"closed"``, ``"merged"``, ``"not_found"``, or
+    ``"unknown"``. Backed by ``gh pr view <url> --json state`` (``gh``'s
+    uppercase ``OPEN``/``CLOSED``/``MERGED`` are lowercased).
+
+    ``"not_found"`` is returned when ``gh`` exits nonzero AND its stderr carries
+    GitHub's definitive "does not exist" signature (``Could not resolve to a
+    PullRequest``). A PR URL that was never created, or was deleted, is NOT a
+    transient hiccup: it can never be active work, so the caller treats
+    ``not_found`` like ``closed``/``merged`` and does not guard. This is what
+    keeps a phantom/stale PR URL in a comment from wedging a card forever.
+
+    Fail-open otherwise: any *other* subprocess failure -- ``gh`` not installed,
+    not authenticated, network error, timeout, unparseable output -- resolves to
+    ``"unknown"`` so the caller keeps guarding conservatively rather than
+    dropping the guard on a transient hiccup.
 
     Isolated as a module-level function (not inlined) so ``check_respawn_guard``
     can be tested without a live network call by monkeypatching this hook, and
@@ -7396,6 +7425,12 @@ def _resolve_pr_state(pr_url: str) -> str:
     except Exception:
         return "unknown"
     if result.returncode != 0:
+        # A definitive "this PR does not exist" is terminal, not transient:
+        # never created or already deleted -> never active work. Distinguish it
+        # from a transient gh failure (which stays fail-open as "unknown") by the
+        # GraphQL not-found signature on stderr.
+        if _PR_NOT_FOUND_STDERR_RE.search(result.stderr or ""):
+            return "not_found"
         return "unknown"
     try:
         state = json.loads(result.stdout or "{}").get("state")
@@ -9108,8 +9143,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
                     state = _resolve_pr_state(pr_url)
                     pr_state_cache[pr_url] = state
                 # open or unknown (unresolvable -> fail-open) still guards;
-                # a confirmed closed/merged PR does not.
-                if state not in ("closed", "merged"):
+                # a confirmed closed / merged / not_found PR does not: those
+                # three are terminal states that can never be active work
+                # (not_found = a phantom or deleted PR that would otherwise wedge
+                # the card forever via the fail-open path).
+                if state not in _RESPAWN_GUARD_INACTIVE_PR_STATES:
                     return "active_pr"
 
     return None
