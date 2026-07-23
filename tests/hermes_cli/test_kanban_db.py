@@ -3853,6 +3853,64 @@ def test_resolve_pr_state_unknown_on_unparseable_output(monkeypatch):
     assert kb._resolve_pr_state("https://github.com/o/r/pull/7") == "unknown"
 
 
+# ---------------------------------------------------------------------------
+# not_found: a PR URL that GitHub definitively reports does not exist (never
+# created, or deleted) is NOT a transient hiccup and must NOT fail open. gh
+# returns a nonzero exit whose stderr carries the GraphQL signature "Could not
+# resolve to a PullRequest". Conflating that DEFINITIVE not-found with a
+# transient error (network / auth / gh-missing) is what let a phantom PR URL in
+# a task comment wedge a card forever on the active_pr respawn guard. A
+# not_found PR is terminal like closed/merged: it can never be active work.
+# ---------------------------------------------------------------------------
+
+def test_resolve_pr_state_not_found_on_graphql_no_pr(monkeypatch):
+    """A definitive 'Could not resolve to a PullRequest' resolves to 'not_found'."""
+    def _fake_run(*a, **k):
+        return types.SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr=(
+                "GraphQL: Could not resolve to a PullRequest with the number "
+                "of 143. (repository.pullRequest)"
+            ),
+        )
+    monkeypatch.setattr(kb.subprocess, "run", _fake_run)
+    assert kb._resolve_pr_state("https://github.com/o/r/pull/143") == "not_found"
+
+
+def test_resolve_pr_state_transient_error_still_unknown(monkeypatch):
+    """A generic nonzero exit (no not-found signature) still fails open to 'unknown'."""
+    def _fake_run(*a, **k):
+        return types.SimpleNamespace(
+            returncode=1, stdout="", stderr="error connecting to api.github.com",
+        )
+    monkeypatch.setattr(kb.subprocess, "run", _fake_run)
+    assert kb._resolve_pr_state("https://github.com/o/r/pull/7") == "unknown"
+
+
+def test_respawn_guard_not_found_pr_not_guarded(kanban_home, monkeypatch):
+    """A builder's PR URL whose PR does not exist on GitHub never blocks respawn.
+
+    Regression for the phantom-PR livelock: a comment carried a PR URL that was
+    never actually created (or was deleted). The old fail-open path treated the
+    gh error as 'unknown' and guarded forever, stranding the card across dozens
+    of respawn_guarded ticks. A definitively not-found PR is terminal like
+    closed/merged — the card must dispatch. The comment is authored by a real
+    builder ('eckert', NOT a recovery-actor) so it genuinely reaches the
+    live-state resolution instead of being excluded by the recovery-author
+    carve-out.
+    """
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "not_found")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="phantom-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "eckert",
+            "PR opened: https://github.com/totemx-AI/subsidysmart/pull/143",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
 # Review tasks bypass the dup-PR guards (recent_success / active_pr) but a
 # build-lane task in the same shape must still be guarded. The invariant being
 # asserted: review spawns are never wedged by the build-only dup-PR guards,
