@@ -186,6 +186,12 @@ def set_current_session_id(session_id: str) -> None:
 
 _KANBAN_ORIGIN_ENV = "HERMES_KANBAN_ORIGIN"
 _KANBAN_ORIGIN_FIELDS = ("platform", "chat_id", "thread_id", "user_id", "session_id")
+# Internal key stamped into the mirror blob (NOT one of _KANBAN_ORIGIN_FIELDS, so
+# it never leaks into a returned origin dict): the pid of the process that wrote
+# the mirror. Used by get_kanban_origin to distinguish an origin inherited across
+# a spawn boundary (foreign pid → accept) from a concurrent sibling turn's
+# leftover in this same process (own pid → reject).
+_KANBAN_ORIGIN_OWNER_PID = "_owner_pid"
 
 
 def set_kanban_origin(
@@ -216,6 +222,12 @@ def set_kanban_origin(
         "thread_id": thread_id,
         "user_id": user_id,
         "session_id": session_id,
+        # Owner-pid stamp: identifies the process that wrote this mirror. A
+        # reader accepts a mirror-sourced value (ContextVar _UNSET) only when the
+        # owner pid differs from its own — i.e. the value was inherited across a
+        # spawn boundary (a detached worker's parent), not written by a
+        # concurrent sibling turn in THIS same process. See get_kanban_origin.
+        _KANBAN_ORIGIN_OWNER_PID: os.getpid(),
     }
     encoded = json.dumps(blob)
     _KANBAN_ORIGIN.set(encoded)
@@ -225,17 +237,56 @@ def set_kanban_origin(
 def get_kanban_origin() -> dict | None:
     """Return the bound kanban origin as a dict, or ``None`` when unset.
 
-    Resolution order mirrors :func:`get_session_env`: the ContextVar wins when
-    set in this context; otherwise the ``os.environ`` mirror (the value a child
-    process inherits across the spawn boundary). ``None`` when neither is set or
-    the stored blob can't be parsed.
+    Resolution:
+
+    1. **ContextVar wins.** When this task bound its own origin (via
+       :func:`set_kanban_origin` / :func:`capture_root_origin_if_absent`), that
+       value is authoritative for this task and is returned. Concurrency-safe by
+       construction — a ContextVar is task-local.
+    2. **os.environ mirror, PID-scoped.** When the ContextVar is ``_UNSET`` the
+       value can only come from the process-global mirror. That mirror is
+       last-writer-wins across concurrent turns, so it is returned ONLY when it
+       was written by a *different* process — i.e. inherited across a spawn
+       boundary (the detached-worker case the mirror exists to serve). A mirror
+       stamped with THIS process's pid is a concurrent sibling turn's leftover
+       (the poisoning race) and is rejected → ``None``. A mirror with no owner-pid
+       stamp (a legacy/raw-env value that cannot be attributed to this process's
+       turns) is treated as inherited and returned, preserving back-compat.
+    3. ``None`` when neither source yields a usable value or the blob can't be
+       parsed.
     """
     import json
     import os
 
     raw: Any = _KANBAN_ORIGIN.get()
-    if raw is _UNSET:
-        raw = os.environ.get(_KANBAN_ORIGIN_ENV)
+    if raw is not _UNSET:
+        return _parse_origin_blob(raw)
+
+    # ContextVar unset → the value would come from the process-global mirror.
+    raw = os.environ.get(_KANBAN_ORIGIN_ENV)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    owner_pid = parsed.get(_KANBAN_ORIGIN_OWNER_PID)
+    # A mirror written by THIS process (owner_pid == our pid) with an _UNSET
+    # ContextVar is a concurrent sibling turn's leftover — reject it so a turn
+    # never resolves a sibling's origin (requirement A). A foreign pid (or no
+    # stamp at all) means the value was inherited across a spawn boundary and is
+    # legitimate (requirement B).
+    if owner_pid is not None and owner_pid == os.getpid():
+        return None
+    return {k: parsed.get(k) for k in _KANBAN_ORIGIN_FIELDS}
+
+
+def _parse_origin_blob(raw: Any) -> dict | None:
+    """Parse a stored origin blob into the public field-filtered dict, or None."""
+    import json
+
     if not raw:
         return None
     try:
@@ -323,9 +374,23 @@ def reset_kanban_origin() -> None:
     :func:`capture_root_origin_if_absent`) rather than acting on the sibling's.
 
     Only the task-local ContextVar is reset — the ``os.environ`` mirror is
-    process-global and left intact (a live turn overwrites it when it rebinds;
-    a legitimately-inherited worker origin rides the mirror across the spawn
-    boundary and must survive).
+    process-global and left intact, because a legitimately-inherited worker
+    origin rides the mirror across the spawn boundary and must survive.
+
+    🟢 The mirror is NO LONGER unconditionally trusted after this reset. Leaving
+    it intact once meant that in the window between this reset and the turn's own
+    :func:`capture_root_origin_if_absent`, a :func:`get_kanban_origin` read fell
+    through the ``_UNSET`` ContextVar to the process-global mirror — which a
+    concurrent sibling turn may have written to a DIFFERENT thread
+    (last-writer-wins). That is the cross-turn poisoning race. It is now closed at
+    the read: :func:`get_kanban_origin` stamps every mirror write with the writer's
+    pid and, on a mirror-sourced read (ContextVar ``_UNSET``), REJECTS a value
+    written by this same process (a sibling's leftover) while still ACCEPTING a
+    value written by a different process (a genuine spawn-boundary inheritance).
+    So this reset can safely leave the mirror in place: an in-process read in the
+    race window now resolves to ``None`` instead of the sibling's origin, and the
+    detached-worker inheritance the mirror exists for is preserved. See
+    tests/gateway/test_kanban_origin_cross_turn_race.py.
     """
     _KANBAN_ORIGIN.set(_UNSET)
 
