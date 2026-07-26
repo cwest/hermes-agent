@@ -1030,10 +1030,11 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                                 )
-                                sub_fail_counts.pop(sub_key, None)
+                                sub_fail_states.pop(sub_key, None)
                             except Exception as _wk_err:
-                                fails = sub_fail_counts.get(sub_key, 0) + 1
-                                sub_fail_counts[sub_key] = fails
+                                _wk_state = sub_fail_states.setdefault(sub_key, {})
+                                fails = _wk_state.get("fails", 0) + 1
+                                _wk_state["fails"] = fails
                                 logger.warning(
                                     "kanban notifier: wake self-post failed "
                                     "for %s (attempt %d/%d): %s",
@@ -1047,7 +1048,7 @@ class GatewayKanbanWatchersMixin:
                                         sub["task_id"], platform_str, fails,
                                     )
                                     await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                    sub_fail_counts.pop(sub_key, None)
+                                    sub_fail_states.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
                                     # tick retries the self-post — the event
@@ -1071,7 +1072,7 @@ class GatewayKanbanWatchersMixin:
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
-                            sub_fail_counts.pop(sub_key, None)
+                            sub_fail_states.pop(sub_key, None)
                         # Unsubscribe only when the task has reached a truly
                         # final status (done / archived). For blocked /
                         # gave_up / crashed / timed_out the subscription is

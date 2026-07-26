@@ -53,9 +53,17 @@ class ApiServerLikeAdapter:
 
 async def _run_one_notifier_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
+    # The watcher's FIRST sleep is the cold-start delay that lets the gateway
+    # finish wiring adapters; every later sleep is the inter-tick wait. Identify
+    # the cold-start sleep by POSITION, not by its literal duration: the delay
+    # is capped to the tick interval (min(5.0, interval)), so keying on `== 5`
+    # silently swallowed the whole tick whenever interval < 5 and the adapter
+    # was never called.
+    state = {"slept": 0}
 
     async def fake_sleep(delay):
-        if delay == 5:
+        state["slept"] += 1
+        if state["slept"] == 1:
             return None
         runner._running = False
         await real_sleep(0)
@@ -181,8 +189,11 @@ def test_apiserver_failed_self_post_rewinds_cursor(tmp_path, monkeypatch):
     assert [ev.kind for ev in _unseen_terminal_events(tid, "api_server", "raw-sid-999")] == [
         "completed"
     ]
-    # And the failure was counted toward the drop threshold.
-    assert list(runner._kanban_sub_fail_counts.values()) == [1]
+    # And the failure was counted toward the drop threshold. The fork tracks
+    # per-sub failure state as a dict ({fails, next_retry_at}) rather than a
+    # flat int counter, so it can apply exponential backoff before dropping the
+    # sub; assert on the fail COUNT, which is the behavior upstream pinned.
+    assert [s.get("fails") for s in runner._kanban_sub_fail_states.values()] == [1]
 
 
 def test_apiserver_self_post_succeeds_after_earlier_failure(tmp_path, monkeypatch):
