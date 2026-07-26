@@ -525,6 +525,135 @@ def test_review_requiredness_does_not_match_word_boundary(
 
 
 # ---------------------------------------------------------------------------
+# Rework-complete handoffs must NOT count toward the loop
+# ---------------------------------------------------------------------------
+#
+# A ``rework-complete`` block is the clean handoff a worker emits when it
+# finishes a SUCCESSFUL rework round (review thread resolved, ready for
+# re-review), NOT a failure repeating. A clean bounce -> rework -> rework-complete
+# cycle re-blocks with the SAME ``kind`` as the earlier review bounce, so the pure
+# ``prev_kind == kind`` classifier counted the clean rework handoff as "the same
+# failure again" and escalated a healthy card to phantom ``triage`` at the limit.
+# This is the same bug class already fixed for ``awaiting-casey-signoff`` and
+# ``review-required``: a clean lifecycle signal must never trip the loop breaker,
+# while genuine failure/rework blocks and the reviewer's ``review-changes-requested``
+# bounce still escalate.
+
+
+def test_rework_complete_after_bounce_does_not_route_to_triage(
+    kanban_home: Path,
+) -> None:
+    """bounce -> rework -> rework-complete must stay blocked, never triage.
+
+    This is the RED case: before the fix the clean rework handoff escalated.
+    """
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        # Round 1: a genuine review bounce (counter -> 1).
+        kb.block_task(
+            conn, tid,
+            reason="review-changes-requested: fix the snippet in the docs",
+            kind="needs_input",
+        )
+        assert kb.get_task(conn, tid).block_recurrences == 1
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # Clean rework handoff with the SAME kind as the bounce.
+        kb.block_task(
+            conn, tid,
+            reason="rework-complete: PR #89 review thread resolved; ready for re-review.",
+            kind="needs_input",
+        )
+        t = kb.get_task(conn, tid)
+        assert t.status == "blocked", (
+            "a clean rework-complete handoff must never escalate to triage"
+        )
+        assert t.block_recurrences == 1, (
+            "a rework-complete handoff must not count toward the loop"
+        )
+
+
+def test_repeated_rework_complete_handoffs_never_escalate(
+    kanban_home: Path,
+) -> None:
+    """Multiple rework-complete handoffs in a row (rework laps) never triage."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        for i in range(3):
+            if i > 0:
+                _make_running_again(conn, tid)
+            kb.block_task(
+                conn, tid,
+                reason=f"rework-complete: lap {i} reworked; ready for re-review.",
+                kind="needs_input",
+            )
+            t = kb.get_task(conn, tid)
+            assert t.status == "blocked", f"rework lap {i} must stay blocked"
+            assert t.block_recurrences == 1, (
+                f"rework lap {i} must not accumulate loop count"
+            )
+            kb.unblock_task(conn, tid)
+
+
+# ---------------------------------------------------------------------------
+# Clean-lifecycle prefixes are defined in a SINGLE location
+# ---------------------------------------------------------------------------
+
+
+def test_clean_lifecycle_prefixes_single_source() -> None:
+    """The exempt clean-lifecycle prefixes are defined in one place and cover,
+    at minimum, the three known clean signals. This is the class-fix contract:
+    a future clean prefix is added here once, not re-implemented as another
+    one-off ``same_cause = False`` branch."""
+    prefixes = set(kb._CLEAN_LIFECYCLE_REASON_PREFIXES)
+    assert {
+        "awaiting-casey-signoff",
+        "review-required",
+        "rework-complete",
+    } <= prefixes
+
+
+def test_is_clean_lifecycle_reason_matches_all_prefixes() -> None:
+    """The single predicate exempts every clean-lifecycle prefix (whitespace
+    tolerated, separator or end-of-string after the token) and nothing else."""
+    for prefix in ("awaiting-casey-signoff", "review-required", "rework-complete"):
+        assert kb._is_clean_lifecycle_reason(f"{prefix}: some detail")
+        assert kb._is_clean_lifecycle_reason(f"  {prefix} some detail")
+    # Failure reasons and word-boundary lookalikes are NOT clean lifecycle.
+    assert not kb._is_clean_lifecycle_reason("need creds")
+    assert not kb._is_clean_lifecycle_reason("review-changes-requested: fix x")
+    assert not kb._is_clean_lifecycle_reason("review-requiredness is made up")
+    assert not kb._is_clean_lifecycle_reason("rework-completeness matters")
+    assert not kb._is_clean_lifecycle_reason(None)
+    assert not kb._is_clean_lifecycle_reason("")
+
+
+def test_rework_completeness_does_not_match_word_boundary(
+    kanban_home: Path,
+) -> None:
+    """Word-boundary coverage: a longer token that merely STARTS with the prefix
+    (``rework-completeness``) must NOT be exempted -- it escalates like any other
+    same-cause loop."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(
+            conn, tid, reason="rework-completeness is a made-up word",
+            kind="needs_input",
+        )
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(
+            conn, tid, reason="rework-completeness is a made-up word",
+            kind="needs_input",
+        )
+        t = kb.get_task(conn, tid)
+        assert t.status == "triage", (
+            "rework-completeness must not match the rework-complete carve-out"
+        )
+        assert t.block_recurrences == 2
+
+
+# ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
 
