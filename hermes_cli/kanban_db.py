@@ -4536,6 +4536,12 @@ def auto_route_review_bounce(
             # Unresolvable author, or the card is already assigned to the author
             # (nothing to route) — leave it for a human rather than guessing.
             continue
+        # Terminal-status guard (defense in depth): a card archived between the
+        # scan and this route must not be revived to ``ready`` (t_58d0b9e5).
+        if not guard_active_lane_transition(
+            conn, task_id, to_status="ready", actor="dispatcher:auto-route",
+        ):
+            continue
         # A genuine author-rework transition — a review bounce whose finding
         # MATERIALLY DIFFERS from the prior round — is a FRESH cycle, not a
         # continuation of the loop, so its ``block_recurrences`` should reset to 0
@@ -4622,6 +4628,34 @@ def _last_spawned_pid(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(pid) if isinstance(pid, int) else None
 
 
+def _last_claim_lock(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the claim_lock string of the most recent ``claimed`` event, or None.
+
+    ``block_task`` clears ``tasks.claim_lock`` when a card lands ``blocked``, so
+    the host-locality of a still-live orphaned worker can only be recovered from
+    the audit trail. The ``claimed`` event payload carries the ``lock`` string
+    (``<host>:<gateway_pid>``); this recovers the latest one so
+    :func:`_terminate_reclaimed_worker` can gate its kill on host-locality even
+    for a blocked card whose row no longer holds the lock.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    lock = payload.get("lock")
+    return lock if isinstance(lock, str) and lock else None
+
+
 def auto_promote_no_pr_review(
     conn: sqlite3.Connection, *, enabled: bool = True,
 ) -> int:
@@ -4703,6 +4737,15 @@ def auto_promote_no_pr_review(
         # no-op (nothing to move).
         reviewer = _review_owner_from_owner_map(conn, task_id)
         if not reviewer or reviewer == row["assignee"]:
+            continue
+        # Terminal-status guard (defense in depth): never revive a card that has
+        # since been archived/done into the review lane. The scan above selects
+        # only ``blocked`` cards, but a card can be archived between the scan and
+        # this MOVE; refuse + record rather than resurrect (t_58d0b9e5).
+        if not guard_active_lane_transition(
+            conn, task_id, to_status="review",
+            actor="dispatcher:auto-promote-no-pr-review",
+        ):
             continue
         # MOVE the one card blocked -> review + reviewer, fenced on the card still
         # being blocked so a concurrent status change between the scan and here is
@@ -7889,7 +7932,104 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def _active_lane_statuses() -> frozenset:
+    """Statuses that represent a card actively in the work pipeline.
+
+    A terminal card (``done`` / ``archived``) must never be moved BACK into any
+    of these on a worker-driven path — that is the resurrection the
+    :func:`guard_active_lane_transition` guard refuses.
+    """
+    return frozenset({"triage", "todo", "scheduled", "ready", "running", "blocked", "review"})
+
+
+_TERMINAL_STATUSES = frozenset({"done", "archived"})
+
+
+def guard_active_lane_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    to_status: str,
+    actor: str,
+) -> bool:
+    """Refuse a worker-driven move of a TERMINAL card into an active lane.
+
+    ``archived`` (and ``done``) are terminal: once a card lands there, no
+    worker/dispatcher-driven path may revive it into an active lane. Only an
+    explicit human unarchive/reopen may do so — those paths do not call this
+    guard. This is the board-internal defense against the resurrection seen live
+    on 2026-07-26 (t_58d0b9e5): an archived card's orphaned worker completed and
+    the card rode ``archived -> review`` back through the full lifecycle to a
+    second acceptance gate.
+
+    Returns ``True`` when the transition is allowed (the card is NOT terminal, or
+    the target is itself terminal), ``False`` when it is refused. A refusal emits
+    a ``transition_refused`` audit event so the blocked resurrection is visible in
+    ``hermes kanban tail`` rather than silently swallowed. Callers on
+    worker-driven promotion paths should treat ``False`` as "skip this card".
+    """
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    cur_status = row["status"]
+    # Only fence a move OUT of a terminal status INTO an active lane.
+    if cur_status not in _TERMINAL_STATUSES:
+        return True
+    if to_status not in _active_lane_statuses():
+        return True
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "transition_refused",
+            {
+                "from": cur_status,
+                "to": to_status,
+                "by": actor,
+                "reason": (
+                    "archived is terminal; a worker-driven transition may not "
+                    "revive it (only an explicit human unarchive can)"
+                ),
+            },
+        )
+    return False
+
+
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    signal_fn=None,
+) -> bool:
+    # Reap the card's live author worker BEFORE clearing its claim fields.
+    # Without this, archiving a running card left the worker alive: it ran on
+    # to completion and opened a duplicate PR, then rode archived -> review back
+    # into the lifecycle (t_58d0b9e5). Capture the pid + claim_lock from the row
+    # (the UPDATE below NULLs worker_pid, so we must read it first) and, for a
+    # card already blocked (block_task cleared worker_pid), recover the pid from
+    # the last ``spawned`` event. ``_terminate_reclaimed_worker`` signals the
+    # WORKER pid only and is host-local-gated by the claim_lock prefix — it must
+    # never signal the gateway pid embedded in the claim_lock string.
+    pre = conn.execute(
+        "SELECT status, worker_pid, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if pre is None or pre["status"] == "archived":
+        return False
+    reap_pid = pre["worker_pid"]
+    reap_lock = pre["claim_lock"]
+    if reap_pid is None:
+        # A blocked card has no worker_pid on the row; recover it (and a lock to
+        # prove host-locality) from the last spawned event so a still-live
+        # orphaned worker is reaped too.
+        reap_pid = _last_spawned_pid(conn, task_id)
+        if reap_pid is not None and not reap_lock:
+            reap_lock = _last_claim_lock(conn, task_id)
+    termination = None
+    if reap_pid is not None and reap_lock:
+        termination = _terminate_reclaimed_worker(
+            reap_pid, reap_lock, signal_fn=signal_fn,
+        )
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -7907,7 +8047,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        payload = None
+        if termination is not None:
+            payload = {"reaped_worker": termination}
+        _append_event(conn, task_id, "archived", payload, run_id=run_id)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.

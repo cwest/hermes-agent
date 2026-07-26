@@ -7114,3 +7114,177 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# archive_task reaps the live author worker + archived is terminal (t_58d0b9e5)
+# ---------------------------------------------------------------------------
+
+
+def _make_running_task_with_worker(conn, *, pid, host=None):
+    """Create a ready->running task claimed host-locally with ``pid`` recorded.
+
+    Returns ``(task_id, claim_lock)``. The claim_lock is ``<host>:<gateway_pid>``
+    where the *gateway* pid deliberately differs from the *worker* pid — the two
+    must never be confused by the reap path.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    host = host or _kb._claimer_id().split(":", 1)[0]
+    gateway_pid = 999001  # the pid embedded in the claim_lock string == GATEWAY
+    lock = f"{host}:{gateway_pid}"
+    t = kb.create_task(conn, title="reap me", assignee="eckert")
+    kb.claim_task(conn, t, claimer=lock)
+    kb._set_worker_pid(conn, t, pid)
+    return t, lock
+
+
+def test_archive_reaps_live_host_local_worker(kanban_home, monkeypatch):
+    """Archiving a running card with a live host-local worker terminates it and
+    clears its claim fields. Regression for t_58d0b9e5: archive did NOT signal
+    the worker, so it ran on to completion and opened a duplicate PR."""
+    import signal as _signal
+
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        worker_pid = 424242
+        t, _lock = _make_running_task_with_worker(conn, pid=worker_pid)
+
+        killed: list[tuple[int, int]] = []
+
+        # Worker is alive until the first SIGTERM, then dead.
+        alive = {"v": True}
+
+        def _signal_fn(pid, sig):
+            killed.append((pid, sig))
+            alive["v"] = False
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: alive["v"])
+
+        assert kb.archive_task(conn, t, signal_fn=_signal_fn) is True
+
+        # The worker pid — not the gateway pid — got SIGTERM.
+        assert killed and killed[0] == (worker_pid, _signal.SIGTERM)
+
+        task = kb.get_task(conn, t)
+        assert task.status == "archived"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+
+
+def test_archive_reap_signals_worker_pid_not_claim_lock_gateway_pid(
+    kanban_home, monkeypatch,
+):
+    """The reap MUST signal ``worker_pid``, NEVER the pid embedded in the
+    ``claim_lock`` string (which points at the live gateway). Killing the
+    gateway pid would take the whole gateway down."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        worker_pid = 555111
+        t, lock = _make_running_task_with_worker(conn, pid=worker_pid)
+        gateway_pid = int(lock.split(":", 1)[1])
+        assert gateway_pid != worker_pid  # sanity: the two pids differ
+
+        signalled: list[int] = []
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+
+        kb.archive_task(
+            conn, t, signal_fn=lambda pid, _sig: signalled.append(pid),
+        )
+
+        # Every pid we signalled is the worker, never the gateway pid.
+        assert gateway_pid not in signalled
+        # (If the worker was already dead per _pid_alive, a best-effort SIGTERM
+        # may still be attempted at the worker pid — that is fine; the gateway
+        # pid must simply never appear.)
+        assert all(p == worker_pid for p in signalled)
+
+
+def test_archive_does_not_signal_off_host_worker(kanban_home, monkeypatch):
+    """A claim owned by another host is not ours to kill — archive clears the
+    claim fields but never signals a foreign-host pid."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t, _lock = _make_running_task_with_worker(
+            conn, pid=606060, host="some-other-host",
+        )
+        signalled: list[int] = []
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
+
+        assert kb.archive_task(
+            conn, t, signal_fn=lambda pid, _sig: signalled.append(pid),
+        ) is True
+        assert signalled == []  # never signalled a foreign-host worker
+        assert kb.get_task(conn, t).status == "archived"
+
+
+def test_archive_no_worker_still_archives(kanban_home):
+    """Archiving a plain ready/todo card with no worker is unaffected."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="no worker", assignee="eckert")
+        called: list = []
+        assert kb.archive_task(
+            conn, t, signal_fn=lambda *a: called.append(a),
+        ) is True
+        assert called == []
+        assert kb.get_task(conn, t).status == "archived"
+
+
+def test_worker_complete_after_archive_writes_nothing(kanban_home, monkeypatch):
+    """A worker that completes AFTER its card was archived must write nothing —
+    the archived card stays archived, no ``done``, no result."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t, _lock = _make_running_task_with_worker(conn, pid=707070)
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+        assert kb.archive_task(conn, t, signal_fn=lambda *a: None) is True
+        assert kb.get_task(conn, t).status == "archived"
+
+        # The orphaned worker's late completion is a no-op on the archived card.
+        assert kb.complete_task(conn, t, result="late result") is False
+        task = kb.get_task(conn, t)
+        assert task.status == "archived"
+        assert task.result is None
+
+
+def test_auto_promote_no_pr_review_refuses_archived_card(kanban_home):
+    """A worker-driven review-promotion must NEVER resurrect an archived card.
+    Even if an archived card somehow carries a review-required sticky reason,
+    the terminal-status guard refuses the ``archived -> review`` move and
+    records a ``transition_refused`` event."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="terminal card", assignee="eckert")
+        assert kb.archive_task(conn, t) is True
+
+        # Direct guard check: the worker-driven mover must refuse the move.
+        moved = kb.guard_active_lane_transition(
+            conn, t, to_status="review", actor="dispatcher:auto-promote-no-pr-review",
+        )
+        assert moved is False
+        task = kb.get_task(conn, t)
+        assert task.status == "archived"  # NOT review
+
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (t,),
+            ).fetchall()
+        ]
+        assert "transition_refused" in kinds
+
+
+def test_guard_allows_active_transition_for_non_terminal_card(kanban_home):
+    """The terminal guard only fences terminal cards — a normal blocked card is
+    allowed through so the review-promotion path still works."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="normal card", assignee="eckert")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="review-required: x") is True
+        assert kb.get_task(conn, t).status == "blocked"
+        assert kb.guard_active_lane_transition(
+            conn, t, to_status="review", actor="dispatcher:auto-promote-no-pr-review",
+        ) is True
