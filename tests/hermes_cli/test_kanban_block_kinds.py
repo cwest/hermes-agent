@@ -386,6 +386,145 @@ def test_genuine_failure_loop_still_escalates_regression(
 
 
 # ---------------------------------------------------------------------------
+# Review-required handoffs must NOT count toward the loop
+# ---------------------------------------------------------------------------
+#
+# A ``review-required`` block is the sanctioned no-PR / re-review HANDOFF token
+# (routed by ``auto_promote_no_pr_review`` into the review lane), NOT a failure
+# repeating. A card that legitimately hands off twice (round-1 review, then a
+# round-2 re-review after a rework) re-blocks with the SAME ``kind`` each time,
+# so the pure ``prev_kind == kind`` classifier counted the second, entirely
+# normal handoff as "the same failure again" and escalated a healthy card to
+# phantom ``triage`` at the limit -- stranding it off the promoter (which only
+# scans ``status = 'blocked'``). The fix mirrors the acceptance carve-out: a
+# ``review-required`` block never increments the loop counter (it resets to 1
+# and always lands in ``blocked``), while genuine failure/rework blocks and the
+# reviewer's ``review-changes-requested`` bounce still escalate.
+
+
+def test_review_required_second_handoff_does_not_route_to_triage(
+    kanban_home: Path,
+) -> None:
+    """round-1 review -> rework -> round-2 re-review must stay blocked, never
+    triage. This is the RED case: before the fix the second handoff escalated."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        # Round 1: a no-PR review handoff (counter -> 1).
+        kb.block_task(
+            conn, tid,
+            reason="review-required: no-PR change ready for review round 1",
+            kind="needs_input",
+        )
+        assert kb.get_task(conn, tid).block_recurrences == 1
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # Round 2: a re-review handoff with the SAME kind as round 1.
+        kb.block_task(
+            conn, tid,
+            reason="review-required (re-review round 2): PR #444 reworked",
+            kind="needs_input",
+        )
+        t = kb.get_task(conn, tid)
+        assert t.status == "blocked", (
+            "a clean review-required handoff must never escalate to triage"
+        )
+        assert t.block_recurrences == 1, (
+            "a review-required handoff must not count toward the loop"
+        )
+
+
+def test_repeated_review_required_handoffs_never_escalate(
+    kanban_home: Path,
+) -> None:
+    """Multiple review-required handoffs in a row (rework laps) never triage."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        for i in range(3):
+            if i > 0:
+                _make_running_again(conn, tid)
+            kb.block_task(
+                conn, tid,
+                reason=f"review-required (re-review round {i}): reworked",
+                kind="needs_input",
+            )
+            t = kb.get_task(conn, tid)
+            assert t.status == "blocked", f"review lap {i} must stay blocked"
+            assert t.block_recurrences == 1, (
+                f"review lap {i} must not accumulate loop count"
+            )
+            kb.unblock_task(conn, tid)
+
+
+def test_review_changes_requested_still_escalates_regression(
+    kanban_home: Path,
+) -> None:
+    """The regression that matters most: ``review-changes-requested`` (the
+    reviewer's bounce) must KEEP participating in loop detection so a genuinely
+    looping rework on the IDENTICAL finding still escalates. The review-required
+    carve-out must not widen to the bounce prefix."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(
+            conn, tid,
+            reason="review-changes-requested: fix the null deref in foo()",
+            kind="needs_input",
+        )
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(
+            conn, tid,
+            reason="review-changes-requested: fix the null deref in foo()",
+            kind="needs_input",
+        )
+        t = kb.get_task(conn, tid)
+        assert t.status == "triage", (
+            "an identical-finding review bounce is a genuine loop worth escalating"
+        )
+        assert t.block_recurrences == 2
+
+
+def test_arbitrary_needs_input_still_escalates_regression(
+    kanban_home: Path,
+) -> None:
+    """A stuck worker's free-text ``needs_input`` reason must still escalate --
+    the carve-out must not weaken the loop breaker's actual purpose."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="which config key?", kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="still which config key?", kind="needs_input")
+        t = kb.get_task(conn, tid)
+        assert t.status == "triage"
+        assert t.block_recurrences == 2
+
+
+def test_review_requiredness_does_not_match_word_boundary(
+    kanban_home: Path,
+) -> None:
+    """Word-boundary coverage: a longer token that merely STARTS with the prefix
+    (``review-requiredness``) must NOT be exempted -- it escalates like any other
+    same-cause loop."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(
+            conn, tid, reason="review-requiredness is a made-up word",
+            kind="needs_input",
+        )
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(
+            conn, tid, reason="review-requiredness is a made-up word",
+            kind="needs_input",
+        )
+        t = kb.get_task(conn, tid)
+        assert t.status == "triage", (
+            "review-requiredness must not match the review-required carve-out"
+        )
+        assert t.block_recurrences == 2
+
+
+# ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
 
