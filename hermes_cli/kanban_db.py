@@ -4326,6 +4326,42 @@ _REVIEW_BOUNCE_REASON_PREFIX = "review-changes-requested"
 # word-boundary care below so a longer unrelated token can't false-positive.
 _REVIEW_REQUIRED_REASON_PREFIX = "review-required"
 
+# The acceptance/PASS block reason prefix. A reviewer's PASS parks the card for
+# the principal's sign-off with this reason; the ``blocked`` event carrying it is
+# what fires the acceptance notification (``gateway/kanban_watchers.py`` pings on
+# ``kind == "blocked"``). This is the counterpart to ``_REVIEW_BOUNCE_REASON_PREFIX``.
+# Consumed by the acceptance-notifier / sticky-block detectors further down; kept
+# here so all three clean-lifecycle prefixes share one definition site.
+_ACCEPTANCE_SIGNOFF_REASON_PREFIX = "awaiting-casey-signoff"
+
+# The reason prefix a worker uses when it finishes a SUCCESSFUL rework round and
+# hands the card back for re-review: ``kanban_block(reason="rework-complete: …")``.
+# Like the acceptance park and the no-PR review handoff, this is a CLEAN lifecycle
+# signal — the rework landed, the review thread resolved, nothing is stuck — NOT a
+# failure repeating. It re-blocks with the SAME ``kind`` as the earlier review
+# bounce, so without an exemption the ``prev_kind == kind`` loop classifier would
+# count a clean second round as "the same failure again" and escalate a healthy
+# card to phantom ``triage`` at the limit. See ``_CLEAN_LIFECYCLE_REASON_PREFIXES``.
+_REWORK_COMPLETE_REASON_PREFIX = "rework-complete"
+
+# Single source of truth for the CLEAN-LIFECYCLE reason prefixes: block reasons
+# that signal a healthy stage handoff (a PASS parked for sign-off, a no-PR review
+# handoff, a completed rework ready for re-review), NOT a failure repeating. The
+# unblock-loop breaker in :func:`block_task` must NEVER count any of these toward
+# the recurrence counter — each clean handoff resets the counter to 1 and always
+# lands in ``blocked`` for the appropriate router, while genuine failure/rework
+# blocks and the reviewer's ``review-changes-requested`` bounce still escalate.
+# Defined here in ONE place (matched with word-boundary care by
+# :func:`_is_clean_lifecycle_reason`) so the next clean prefix added elsewhere is
+# registered here once, not re-implemented as another one-off exemption branch
+# that reintroduces the wedge. Deliberately EXCLUDES ``review-changes-requested``
+# (the reviewer's bounce — a genuinely looping same-finding rework MUST escalate).
+_CLEAN_LIFECYCLE_REASON_PREFIXES: tuple[str, ...] = (
+    _ACCEPTANCE_SIGNOFF_REASON_PREFIX,
+    _REVIEW_REQUIRED_REASON_PREFIX,
+    _REWORK_COMPLETE_REASON_PREFIX,
+)
+
 
 def _latest_sticky_block_reason(
     conn: sqlite3.Connection, task_id: str,
@@ -4420,23 +4456,6 @@ def _is_review_bounce_reason(reason: Optional[str]) -> bool:
     return bool(reason) and reason.lstrip().startswith(_REVIEW_BOUNCE_REASON_PREFIX)
 
 
-def _is_acceptance_signoff_reason(reason: Optional[str]) -> bool:
-    """True iff ``reason`` is the PASS acceptance sign-off park.
-
-    Matched on the ``awaiting-casey-signoff`` prefix (leading whitespace
-    tolerated). An acceptance park is a clean human sign-off gate, NOT a failure
-    repeating, so :func:`block_task` must never count it toward the unblock-loop
-    breaker (a bounce -> rework -> PASS -> acceptance cycle re-blocks with the
-    same ``kind`` and would otherwise escalate a cleanly-accepted card to
-    phantom ``triage``). ``_ACCEPTANCE_SIGNOFF_REASON_PREFIX`` is defined further
-    down alongside its counterpart ``_REVIEW_BOUNCE_REASON_PREFIX``; it resolves
-    as a module global at call time, so the ordering is not a problem.
-    """
-    if not reason:
-        return False
-    return reason.lstrip().startswith(_ACCEPTANCE_SIGNOFF_REASON_PREFIX)
-
-
 def _is_review_required_reason(reason: Optional[str]) -> bool:
     """True iff ``reason`` is a no-PR ``review-required`` review handoff.
 
@@ -4460,6 +4479,38 @@ def _is_review_required_reason(reason: Optional[str]) -> bool:
     # ``review-requiredness`` would NOT match).
     rest = stripped[len(_REVIEW_REQUIRED_REASON_PREFIX):]
     return rest == "" or not (rest[0].isalnum() or rest[0] == "_")
+
+
+def _is_clean_lifecycle_reason(reason: Optional[str]) -> bool:
+    """True iff ``reason`` is any CLEAN-LIFECYCLE stage handoff.
+
+    Matches any prefix in :data:`_CLEAN_LIFECYCLE_REASON_PREFIXES` (leading
+    whitespace tolerated), with a word boundary after the token so a longer
+    unrelated word cannot false-positive (``review-requiredness`` /
+    ``rework-completeness`` do NOT match). A clean-lifecycle block is a healthy
+    stage handoff — a PASS parked for sign-off, a no-PR review handoff, a
+    completed rework ready for re-review — NOT a failure repeating, so
+    :func:`block_task` must never count it toward the unblock-loop breaker.
+
+    This is the single class discriminator replacing the former per-prefix
+    exemptions. Deliberately does NOT match ``review-changes-requested`` (the
+    reviewer's bounce — a genuinely looping same-finding rework MUST keep
+    escalating) nor any bare free-text ``needs_input`` reason (a real stuck
+    worker MUST still escalate).
+    """
+    if not reason:
+        return False
+    stripped = reason.lstrip()
+    for prefix in _CLEAN_LIFECYCLE_REASON_PREFIXES:
+        if not stripped.startswith(prefix):
+            continue
+        # Word-boundary guard: the char right after the prefix must be a
+        # separator (``:``/whitespace/``-``) or end-of-string — never an
+        # alphanumeric that would make this a longer, different token.
+        rest = stripped[len(prefix):]
+        if rest == "" or not (rest[0].isalnum() or rest[0] == "_"):
+            return True
+    return False
 
 
 def _review_bounce_finding(reason: Optional[str]) -> str:
@@ -4970,7 +5021,9 @@ def route_feedback_to_author(
 # the principal's sign-off with this reason; the ``blocked`` event carrying it is
 # what fires the acceptance notification (``gateway/kanban_watchers.py`` pings on
 # ``kind == "blocked"``). This is the counterpart to ``_REVIEW_BOUNCE_REASON_PREFIX``.
-_ACCEPTANCE_SIGNOFF_REASON_PREFIX = "awaiting-casey-signoff"
+# Defined further up alongside the other clean-lifecycle prefixes
+# (``_CLEAN_LIFECYCLE_REASON_PREFIXES``); kept here as a back-reference for the
+# acceptance-notifier / sticky-block detectors that read it in this vicinity.
 
 
 def _acceptance_owner_from_owner_map(
@@ -7626,35 +7679,28 @@ def block_task(
             ):
                 same_cause = False
 
-        # Acceptance exception: an ``awaiting-casey-signoff`` block is a clean
-        # human sign-off park (a reviewer PASS routing the card to Casey's
-        # acceptance lane), NOT a failure repeating. A clean bounce -> rework ->
-        # PASS -> acceptance cycle re-blocks with the SAME ``kind`` as the earlier
-        # review bounce, so the ``prev_kind == kind`` classifier would count the
-        # acceptance park as "the same failure again" and escalate a cleanly
-        # accepted card to phantom ``triage`` at the limit. Acceptance parks never
-        # participate in the loop breaker: force a fresh cause so the counter
-        # resets to 1 and the card always lands in ``blocked`` for Casey. Genuine
-        # failure/rework blocks are unaffected and still escalate.
-        if _is_acceptance_signoff_reason(reason):
-            same_cause = False
-
-        # Review-required exception: a ``review-required`` block is the sanctioned
-        # no-PR / re-review HANDOFF token (moved into the review lane by
-        # :func:`auto_promote_no_pr_review`), NOT a failure repeating. A card that
-        # legitimately hands off twice (round-1 review, then round-2 re-review after
-        # a rework) re-blocks with the SAME ``kind`` each time, so the
-        # ``prev_kind == kind`` classifier would count the second, entirely normal
-        # handoff as "the same failure again" and escalate a healthy card to phantom
-        # ``triage`` at the limit — stranding it OFF the promoter (which only scans
-        # ``status = 'blocked'``, so it never sees a ``triage`` card). Review-required
-        # handoffs never participate in the loop breaker: force a fresh cause so the
-        # counter resets to 1 and the card always lands in ``blocked`` for the
-        # promoter. Deliberately keyed on ``_is_review_required_reason`` alone, so it
-        # does NOT match ``review-changes-requested`` (the reviewer's bounce, which
-        # MUST keep escalating a genuinely looping rework) nor any other free-text
-        # ``needs_input`` reason (a real stuck worker MUST still escalate).
-        if _is_review_required_reason(reason):
+        # Clean-lifecycle exception (class fix): a block whose reason is a CLEAN
+        # stage handoff — a reviewer PASS parked for Casey's sign-off
+        # (``awaiting-casey-signoff``), a no-PR review / re-review handoff
+        # (``review-required``, moved into the review lane by
+        # :func:`auto_promote_no_pr_review`), or a completed rework ready for
+        # re-review (``rework-complete``) — is NOT a failure repeating. A clean
+        # bounce -> rework -> {PASS | re-review handoff | rework-complete} cycle
+        # re-blocks with the SAME ``kind`` as the earlier review bounce, so the
+        # ``prev_kind == kind`` classifier would count the clean handoff as "the
+        # same failure again" and escalate a healthy card to phantom ``triage`` at
+        # the limit — stranding it OFF the router that only scans
+        # ``status = 'blocked'``. Clean-lifecycle handoffs never participate in the
+        # loop breaker: force a fresh cause so the counter resets to 1 and the card
+        # always lands in ``blocked`` for the appropriate router. The exempt prefix
+        # set is defined in ONE place (:data:`_CLEAN_LIFECYCLE_REASON_PREFIXES`),
+        # matched with word-boundary care by :func:`_is_clean_lifecycle_reason`, so
+        # the next clean prefix is added there once rather than as another one-off
+        # branch here. Deliberately EXCLUDES ``review-changes-requested`` (the
+        # reviewer's bounce — a genuinely looping same-finding rework MUST keep
+        # escalating) and any bare free-text ``needs_input`` reason (a real stuck
+        # worker MUST still escalate).
+        if _is_clean_lifecycle_reason(reason):
             same_cause = False
 
         recurrences = prev_recurrences + 1 if same_cause else 1
