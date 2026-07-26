@@ -1905,7 +1905,9 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     The block absorbed the load-bearing worker/orchestrator reference
     details (workspace kinds, deliverable artifacts, created-card claims,
     profile discovery) when the standalone kanban-worker / kanban-orchestrator
-    skills were removed and folded into this always-injected guidance, so the
+    skills were removed and folded into this always-injected guidance, and
+    the step-5 handoff was later split into three explicit exits
+    (complete-for-non-PR, end-the-run-after-PR, block-for-needs-input), so the
     ceiling is sized to fit that content with a little headroom.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
@@ -1916,8 +1918,69 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 6_000, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
+    )
+
+
+def test_kanban_guidance_code_handoff_ends_run_after_pr_not_complete_or_block():
+    """The code/PR handoff path must instruct END THE RUN after opening the
+    PR — NOT a `kanban_complete` and NOT a `review-required:` self-block.
+
+    `kanban_complete` sets the card to `done` (≡ merged), which is wrong for
+    an unmerged draft PR; a `review-required:` self-block substitutes a human
+    gate for the `running → review` move the `github-prs` webhook +
+    `stage-pr-review` performs automatically. The canonical PR exit is: open
+    the marker-stamped draft PR, comment the URL, and stop.
+    """
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    lowered = KANBAN_GUIDANCE.lower()
+
+    # No `review-required:` self-block as the code/PR handoff exit.
+    assert "review-required" not in lowered, (
+        "KANBAN_GUIDANCE still instructs a `review-required:` self-block for "
+        "the code/PR handoff; the PR path must open the PR, comment the URL, "
+        "and END THE RUN — the webhook performs the running→review move."
+    )
+    # The PR path must tell the worker to end the run after opening the PR.
+    assert "end the run" in lowered, (
+        "KANBAN_GUIDANCE must instruct the worker to END THE RUN after "
+        "opening a code-change PR (webhook does running→review), rather than "
+        "completing or self-blocking."
+    )
+    # And it must name the webhook as the mover so the worker knows not to
+    # move the card itself.
+    assert "github-prs" in lowered or "stage-pr-review" in lowered, (
+        "KANBAN_GUIDANCE must name the github-prs webhook / stage-pr-review as "
+        "the mechanism that moves the card running→review after PR open."
+    )
+
+
+def test_kanban_guidance_pr_path_does_not_steer_to_kanban_complete():
+    """On the PR/code path, the worker must NOT be told to hand off via
+    `kanban_complete` — `done` is reserved for *merged*, and the PR is an
+    unmerged draft at hand-off time."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    lowered = KANBAN_GUIDANCE.lower()
+    # The guidance must explicitly steer the PR/code handoff AWAY from
+    # kanban_complete (it says "do NOT `kanban_complete`" on the PR path).
+    assert "do not `kanban_complete`" in lowered, (
+        "KANBAN_GUIDANCE must explicitly tell the worker NOT to "
+        "`kanban_complete` on the code-change PR path (done ≡ merged)."
+    )
+
+
+def test_kanban_guidance_reserves_block_for_needs_input():
+    """`kanban_block` must be reserved for a genuine needs-input fork (a real
+    human decision), never presented as the normal code/PR handoff exit."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    # Block is still described as the tool for a human-decision fork.
+    assert "human decision" in KANBAN_GUIDANCE, (
+        "KANBAN_GUIDANCE must still reserve kanban_block for a genuine "
+        "human-decision (needs_input) fork."
     )
 
 
