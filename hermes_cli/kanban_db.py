@@ -9229,33 +9229,51 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # owner-map reviewer to auto-advance the card to (``review``); stays
             # None for every other shape (which release to ``ready`` as before).
             advance_review_owner: Optional[str] = None
-            if kind in ("clean_exit", "unknown") and _lane_work_provably_done(
-                conn, row["id"]
-            ):
+            if kind in (
+                "clean_exit", "unknown", "signaled", "nonzero_exit"
+            ) and _lane_work_provably_done(conn, row["id"]):
                 # Worker's task is still ``running`` but the lane's work is
                 # provably done (a prior completed run, or a PR URL /
-                # ready-for-review handoff in a recent comment). Two reap
+                # ready-for-review handoff in a recent comment). FOUR reap
                 # shapes reach here:
                 #   * ``clean_exit`` — rc=0 captured in the reap registry
-                #     (the exit the worker itself made), and
+                #     (the exit the worker itself made),
                 #   * ``unknown`` — the worker's exit was NOT captured (reaped
                 #     by init, or gone between the reap tick and this liveness
-                #     check), so it would otherwise fall into the generic
-                #     "pid not alive" → ``crashed`` branch below.
-                # Both are the completed-but-un-signposted exit —
-                # indistinguishable at the row level from a real crash /
-                # protocol violation, but NOT a failure: counting either trips
-                # a FALSE ``gave_up`` and strands a finished card (a draft-PR
-                # handoff, an edit-in-place card). Treat it as a benign no-op:
-                # release the task (a later tick / the respawn guard's
-                # recent_success / active_pr check handles it) and do NOT count
-                # a failure — mirroring the rate-limited carve-out below.
+                #     check), and
+                #   * ``signaled`` / ``nonzero_exit`` — a REAL captured worker
+                #     death (SIGKILL / OOM killer / non-zero rc): a silent
+                #     worker crash AFTER the lane work already landed.
+                # All four are indistinguishable at the row level from a
+                # failure the retry budget should count, but the durable proof
+                # says the deliverable IS on disk — so counting any of them
+                # trips a FALSE ``gave_up`` and strands finished work (a
+                # draft-PR handoff, an edit-in-place card). Crash-vs-clean-exit
+                # is orthogonal to whether the work landed: the SAME proof the
+                # clean-exit path trusts must reconcile a crashed card too,
+                # rather than discarding proven work. Treat it as a benign
+                # no-op: release the task (the respawn guard's recent_success /
+                # active_pr check defers a dup spawn) or, for a PR-open code
+                # card, auto-advance to review (below) — and do NOT count a
+                # failure, mirroring the rate-limited carve-out below.
+                #
+                # This is proof-GATED: with no proof, ``signaled`` /
+                # ``nonzero_exit`` fall through to the strict ``crashed`` branch
+                # unchanged, so a genuine crash with no deliverable STILL
+                # ``gave_up``. The ``_lane_work_provably_done`` shape predicate
+                # (``_card_requires_pr``) keeps a PR-requiring card held to a
+                # real PR / completed-run artifact, so the no-PR handoff-comment
+                # carve-out never leaks into the PR-backed crash path.
                 protocol_violation = False
                 clean_exit_after_done = True
-                _how = (
-                    "cleanly (rc=0)" if kind == "clean_exit"
-                    else "without a captured status (pid not alive)"
-                )
+                if kind == "clean_exit":
+                    _how = "cleanly (rc=0)"
+                elif kind == "signaled":
+                    _how = f"after a crash (killed by signal {code})"
+                elif kind == "nonzero_exit":
+                    _how = f"after a crash (exit code {code})"
+                else:
+                    _how = "without a captured status (pid not alive)"
                 error_text = (
                     f"pid {pid} exited {_how} after its lane work was "
                     f"provably done — benign no-op, not counted as a failure"
@@ -9267,19 +9285,38 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "exit_code": code,
                     "exit_kind": kind,
                 }
-                # PR-open code card: the provably-done signal is a PR handoff
-                # (a ``pull/<n>`` URL in a comment) AND the card's own owner map
-                # declares a ``review`` owner. Merely releasing this card to
-                # ``ready`` is a dead end — the ``active_pr`` respawn guard HOLDS
-                # an open-PR card out of respawn WITHOUT advancing it, so it
-                # wedges in ``running`` until an orchestrator hand-stages it. So
-                # MOVE it ``running -> review`` + the owner-map reviewer atomically
-                # with the reap (below), mirroring ``complete_task``'s canonical
-                # author-lane handoff. The no-PR edit-in-place shape (Proof 3) and
-                # a PR card with no resolvable reviewer are NOT auto-advanced:
-                # they fall through to the benign release-to-``ready`` unchanged,
-                # so this narrows to exactly the code-author-opened-a-PR case.
-                if _card_has_pr_artifact(conn, row["id"]):
+                # A provably-done card that would otherwise be DISCARDED
+                # (protocol_violation / crash → ``gave_up``) reconciles FORWARD
+                # to ``review`` + the owner-map reviewer instead of stranding —
+                # the deliverable is real but UNREVIEWED (never ``done``). Two
+                # provably-done shapes auto-advance:
+                #
+                #   * a PR-open code card (ANY reap kind) — the proof is a
+                #     ``pull/<n>`` URL in a comment (Proof 2). Merely releasing
+                #     it to ``ready`` is a dead end: the ``active_pr`` respawn
+                #     guard HOLDS an open-PR card out of respawn WITHOUT
+                #     advancing it, so it wedges in ``running`` → ``ready`` until
+                #     hand-staged. (#76 behavior — unchanged.)
+                #   * a no-PR edit-in-place card with a durable landed-work
+                #     handoff comment (Proof 3), but ONLY when the worker
+                #     CRASHED (``signaled`` / ``nonzero_exit`` / ``unknown``
+                #     pid-not-alive). On the CLEAN-EXIT path such a card releases
+                #     to ``ready`` unchanged (#75 behavior — a fresh dispatch
+                #     re-runs the idempotent edit, no review lane needed). But on
+                #     the CRASH path the retry budget is what strands it: after
+                #     ``failure_limit`` crashes it ``gave_up``s in ``blocked``
+                #     even though the deliverable landed. Advancing it to
+                #     ``review`` is the reconciliation the crash-vs-clean-exit
+                #     asymmetry demands.
+                #
+                # Either way the MOVE is gated on a resolvable owner-map
+                # ``review`` owner; without one there is no review destination,
+                # so the card falls through to the benign release-to-``ready``
+                # (the pre-existing #47 draft-PR carve-out) — never wedged,
+                # never crashed.
+                _has_pr = _card_has_pr_artifact(conn, row["id"])
+                _crashed_kind = kind in ("signaled", "nonzero_exit", "unknown")
+                if _has_pr or _crashed_kind:
                     advance_review_owner = _review_owner_from_owner_map(
                         conn, row["id"]
                     )

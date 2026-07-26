@@ -1896,6 +1896,196 @@ def test_pr_requiring_card_handoff_comment_is_not_third_proof(
 
 
 # ---------------------------------------------------------------------------
+# CRASH path (signaled / nonzero_exit) with landed-work proof.
+#
+# The two carve-outs above only fire for a reap classified ``clean_exit``
+# (rc=0 captured) or ``unknown`` (no reap record). A worker that dies a REAL
+# death whose exit IS captured — ``signaled`` (SIGKILL / OOM killer) or
+# ``nonzero_exit`` — falls into the generic ``crashed`` branch, which counts a
+# failure and, on retry-budget exhaustion, emits ``gave_up`` + strands the card
+# in ``blocked``. That branch NEVER consults ``_lane_work_provably_done``, so a
+# card whose lane work provably landed (a self-verified no-PR edit-in-place
+# handoff, or a draft-PR handoff) but whose worker then crashed is falsely
+# stranded — the exact ``t_e999ef95`` incident. Crash-vs-clean-exit is
+# orthogonal to whether the work landed: the SAME proof must reconcile a
+# crashed card to its owner-map REVIEW lane (deliverable is real but
+# UNREVIEWED — never ``done``). Absence of proof preserves the strict crash →
+# ``gave_up`` behavior exactly, and the no-PR carve-out must not leak into the
+# PR-requiring path.
+# ---------------------------------------------------------------------------
+
+
+def _stage_signaled_exit(conn, kb_mod, tid, pid, signal=9):
+    """Point ``tid`` at a dead host-local pid whose reap record is a SIGNAL.
+
+    ``_classify_worker_exit`` returns ``("signaled", <sig>)`` for a
+    ``WIFSIGNALED`` child — a real crash (SIGKILL, OOM killer). This is the
+    captured-crash shape the two prior carve-outs (clean_exit / unknown) do
+    NOT cover.
+    """
+    host = kb_mod._claimer_id().split(":", 1)[0]
+    kb.claim_task(conn, tid, claimer=f"{host}:w")
+    conn.execute(
+        "UPDATE tasks SET worker_pid = ?, consecutive_failures = 0 WHERE id = ?",
+        (pid, tid),
+    )
+    conn.commit()
+    # WIFSIGNALED raw status: the low 7 bits carry the signal number.
+    kb_mod._record_worker_exit(pid, signal)
+
+
+def test_crash_no_pr_edit_in_place_with_handoff_advances_to_review(
+    kanban_home, monkeypatch,
+):
+    """The reported ``t_e999ef95`` incident: a no-PR edit-in-place card whose
+    worker CRASHES (captured ``signaled`` death — a real silent worker death,
+    not a clean exit) AFTER posting a durable landed-work handoff comment must
+    reconcile to ``review`` + the owner-map reviewer, NOT ``gave_up``. The
+    deliverable is real but unreviewed, so it goes to review — never ``done``.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        # Default workspace_kind 'scratch' → a no-PR edit-in-place card.
+        tid = kb.create_task(conn, title="edit-in-place-crash", assignee="eckert")
+        _stamp_submit_owner_map(conn, tid, ready="eckert", review="lamport")
+        kb.add_comment(
+            conn, tid, "eckert",
+            "review-required: applied the config edit; validator green on disk",
+        )
+
+        _stage_signaled_exit(conn, _kb, tid, 70001)
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid not in crashed, (
+            "a crashed no-PR card with a landed-work handoff must not be "
+            "treated as a crash"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "review", (
+            f"a crashed provably-done no-PR card must advance to review, "
+            f"got {task.status}"
+        )
+        assert task.assignee == "lamport", (
+            f"the card must be assigned to the owner-map reviewer, "
+            f"got {task.assignee}"
+        )
+        assert task.worker_pid is None
+        assert task.claim_lock is None
+        assert task.consecutive_failures == 0, (
+            "a proven crash reconcile must not increment the failure counter, "
+            f"got {task.consecutive_failures}"
+        )
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "crashed" not in kinds, kinds
+        assert "gave_up" not in kinds, kinds
+        sc = [
+            e for e in events
+            if e.kind == "status_changed"
+            and (e.payload or {}).get("to") == "review"
+        ]
+        assert sc, f"expected a status_changed ->review event, got {kinds}"
+        moved = sc[-1].payload or {}
+        assert moved.get("from") == "running", moved
+        assert moved.get("assignee") == "lamport", moved
+
+
+def test_crash_no_pr_card_without_proof_still_gives_up(
+    kanban_home, monkeypatch,
+):
+    """A no-PR card that CRASHES (captured ``signaled`` death) with NO
+    landed-work proof must STILL count a failure and, at the retry limit,
+    ``gave_up``. The crash-path carve-out is proof-gated: a genuine crash with
+    no deliverable cannot be masked.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="crash-no-proof", assignee="eckert")
+        # A chatty comment that is NOT a landed-work handoff must not count.
+        kb.add_comment(conn, tid, "eckert", "starting on this now")
+
+        for i in range(_kb.DEFAULT_FAILURE_LIMIT):
+            pid = 71000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?", (pid, tid),
+            )
+            conn.commit()
+            _kb._record_worker_exit(pid, 9)  # WIFSIGNALED, no proof → real crash
+            crashed = kb.detect_crashed_workers(conn)
+            assert tid in crashed, f"iter {i}: crashed no-proof card must crash"
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"a repeatedly-crashing no-proof card must gave_up, got {task.status}"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "crashed" in kinds, kinds
+        assert "gave_up" in kinds, kinds
+
+
+def test_crash_pr_requiring_card_with_handoff_no_pr_still_gives_up(
+    kanban_home, monkeypatch,
+):
+    """A PR-requiring worktree card that CRASHES with a ``review-required:``
+    handoff comment but NO PR URL and NO completed run must STILL ``gave_up`` —
+    the no-PR handoff-comment carve-out (Proof 3) is scoped by
+    ``_card_requires_pr`` and must not leak into the PR-backed crash path. A
+    worktree card is held to a real PR / completed-run artifact.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(
+            conn, title="worktree-crash-no-pr", assignee="eckert",
+            workspace_kind="worktree",
+            workspace_path="/Users/caseywest/src/hermes-agent",
+        )
+        _stamp_submit_owner_map(conn, tid, ready="eckert", review="lamport")
+        # A handoff comment but NO PR URL — a PR-requiring card is not proven
+        # done by a comment alone.
+        kb.add_comment(
+            conn, tid, "eckert",
+            "review-required: implemented, tests green",
+        )
+
+        for i in range(_kb.DEFAULT_FAILURE_LIMIT):
+            pid = 72000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?", (pid, tid),
+            )
+            conn.commit()
+            _kb._record_worker_exit(pid, 9)  # WIFSIGNALED, no PR → real crash
+            crashed = kb.detect_crashed_workers(conn)
+            assert tid in crashed, (
+                f"iter {i}: PR-requiring card w/o a PR artifact must still crash"
+            )
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"PR-requiring card w/o PR that crashes must gave_up, "
+            f"got {task.status}"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "crashed" in kinds, kinds
+        assert "gave_up" in kinds, kinds
+
+
+# ---------------------------------------------------------------------------
 # Auto-advance a PR-open code card to review on clean-exit-after-done.
 #
 # When a code-author card's worker opens a PR, pushes, and exits rc=0 WITHOUT a
