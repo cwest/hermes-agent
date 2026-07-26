@@ -2883,16 +2883,35 @@ class DiscordAdapter(BasePlatformAdapter):
 
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
-                channel = self._client.get_channel(int(thread_id))
+                try:
+                    thread_ref = int(thread_id)
+                except (TypeError, ValueError):
+                    # A malformed (non-numeric) thread_id can never become valid,
+                    # so fail via the documented SendResult contract instead of
+                    # raising into the catch-all handler and spamming ERROR
+                    # tracebacks on every retry. Name the offending value so the
+                    # bad subscription is identifiable from the log alone.
+                    return SendResult(
+                        success=False,
+                        error=f"Invalid thread_id {thread_id!r}: not a numeric Discord ID",
+                    )
+                channel = self._client.get_channel(thread_ref)
                 if not channel:
-                    channel = await self._client.fetch_channel(int(thread_id))
+                    channel = await self._client.fetch_channel(thread_ref)
                 if not channel:
                     return SendResult(success=False, error=f"Thread {thread_id} not found")
             else:
                 # Get the parent channel
-                channel = self._client.get_channel(int(chat_id))
+                try:
+                    chat_ref = int(chat_id)
+                except (TypeError, ValueError):
+                    return SendResult(
+                        success=False,
+                        error=f"Invalid chat_id {chat_id!r}: not a numeric Discord ID",
+                    )
+                channel = self._client.get_channel(chat_ref)
                 if not channel:
-                    channel = await self._client.fetch_channel(int(chat_id))
+                    channel = await self._client.fetch_channel(chat_ref)
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
