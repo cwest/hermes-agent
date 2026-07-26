@@ -6761,8 +6761,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
-    Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
-    are intentionally preserved.
+    ``scratch`` workspaces are removed outright; ``worktree`` workspaces are
+    reaped via :func:`_reap_worktree_workspace` (safety-gated — dirty or
+    unmerged worktrees are preserved); ``dir`` workspaces are left in place.
     """
     try:
         row = conn.execute(
@@ -6852,11 +6853,13 @@ def _worktree_has_uncommitted_changes(worktree: Path) -> bool:
 def _worktree_head_reachable_from_remote(worktree: Path) -> bool:
     """True if the worktree's HEAD commit is contained in a remote-tracking branch.
 
-    This is the "the work is preserved elsewhere, so the worktree is garbage"
-    signal. A HEAD that lives on no ``refs/remotes/*`` branch is local-only —
-    unmerged/unpushed work that must NOT be force-deleted ("unreachable work is
-    not garbage"). When the answer can't be determined we return ``False`` (fail
-    safe: preserve rather than reap).
+    This is the "the exact commit still lives on a remote, so the worktree is
+    garbage" signal. It only fires while the branch's commits are literally
+    reachable from some ``refs/remotes/*`` ref — i.e. before a squash-merge
+    rewrites them and the remote branch is deleted. For that dominant terminal
+    case use :func:`_worktree_work_is_preserved`, which also accepts
+    patch-equivalence. When the answer can't be determined we return ``False``
+    (fail safe: preserve rather than reap).
     """
     head = subprocess.run(
         ["git", "-C", str(worktree), "rev-parse", "HEAD"],
@@ -6874,6 +6877,41 @@ def _worktree_head_reachable_from_remote(worktree: Path) -> bool:
     if contains.returncode != 0:
         return False
     return bool((contains.stdout or "").strip())
+
+
+def _worktree_work_is_preserved(worktree: Path) -> bool:
+    """True if the worktree's work is safe to discard — reachable OR merged.
+
+    A worktree is reap-eligible only when its commits are preserved elsewhere.
+    Two distinct forms of "preserved" both count:
+
+    * **Reachable** — HEAD still lives on a ``refs/remotes/*`` branch
+      (:func:`_worktree_head_reachable_from_remote`). True before the branch is
+      merged and deleted.
+    * **Patch-equivalent** — every local-only commit is already upstream in
+      squashed/cherry-picked form, so the branch is content-merged even though
+      no remote ref reaches the exact SHAs. This is the *dominant* terminal
+      case: Casey squash-merges the PR and deletes the branch, leaving the local
+      commits unreachable-but-merged. ``git cherry`` detects this; the predicate
+      lives in :mod:`cli` (``_worktree_commits_all_merged_upstream``) and is
+      imported lazily here because ``cli`` imports this module, so a top-level
+      ``import cli`` would be circular.
+
+    A worktree that is neither reachable nor patch-equivalent carries real
+    unmerged work — "unreachable work is not garbage" — and must be preserved.
+    Fails SAFE toward ``False`` (preserve) whenever the answer can't be
+    determined.
+    """
+    if _worktree_head_reachable_from_remote(worktree):
+        return True
+    try:
+        from cli import _worktree_commits_all_merged_upstream
+    except Exception:
+        return False
+    try:
+        return bool(_worktree_commits_all_merged_upstream(str(worktree)))
+    except Exception:
+        return False
 
 
 def _reap_worktree_workspace(conn: sqlite3.Connection, task_id: str) -> None:
@@ -6941,13 +6979,13 @@ def _reap_worktree_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                     {"path": str(worktree), "reason": "dirty (uncommitted changes)"},
                 )
             return
-        if not _worktree_head_reachable_from_remote(worktree):
+        if not _worktree_work_is_preserved(worktree):
             with write_txn(conn):
                 _append_event(
                     conn, task_id, "worktree_reap_skipped",
                     {
                         "path": str(worktree),
-                        "reason": "unreachable (commits not on any remote branch)",
+                        "reason": "unreachable (commits neither on a remote branch nor merged upstream)",
                     },
                 )
             return

@@ -4295,6 +4295,63 @@ def test_reap_preserves_dirty_worktree(kanban_home, tmp_path):
     assert "dirty" in (skipped[-1].payload.get("reason") or "")
 
 
+def test_reap_squash_merged_branch_deleted_worktree(kanban_home, tmp_path):
+    """A squash-merged, branch-deleted worktree IS reaped (the dominant leak).
+
+    Casey's merge path is squash-and-delete-branch: the worktree's local commits
+    are rewritten into one squash commit on ``main`` and the PR branch is
+    deleted. The exact local SHAs then live on no ``refs/remotes/*`` branch, so
+    the reachability-only gate (``git branch -r --contains``) reports the work
+    as "unreachable" and preserves the worktree forever — the dominant
+    ``.worktrees/`` leak this fix closes.
+
+    Patch-equivalence (``git cherry``) recognizes the commit as already merged
+    and reaps it. RED against the reachability-only gate: the worktree survives
+    with a ``worktree_reap_skipped``/unreachable event; GREEN after: reaped.
+    """
+    repo = tmp_path / "repo"
+    origin = tmp_path / "origin.git"
+    _init_git_repo_with_origin(repo, origin)
+    with kb.connect() as conn:
+        t, ws = _worktree_card(conn, repo, title="squash-merged")
+
+        # 1. The card's "PR work": a local commit in the worktree, never pushed.
+        (ws / "feature.txt").write_text("the feature\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(ws), "add", "feature.txt"], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(ws), "commit", "-m", "feat: the feature"], check=True, capture_output=True, text=True)
+
+        # 2. Simulate Casey's squash-merge: apply the SAME content onto main in
+        #    the primary checkout and push it to origin/main as one commit. The
+        #    branch is never pushed, so the local SHA above lands on no remote
+        #    branch — patch-equivalent-but-unreachable, exactly the merged state.
+        (repo / "feature.txt").write_text("the feature\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "feature.txt"], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "feat: the feature (squashed #1)"], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(repo), "push", "origin", "main"], check=True, capture_output=True, text=True)
+
+        # 3. The worktree learns about the advanced origin/main (as it would
+        #    after any fetch), so git cherry can compare against it.
+        subprocess.run(["git", "-C", str(ws), "fetch", "origin"], check=True, capture_output=True, text=True)
+
+        # Precondition: the reachability-only gate MUST report unreachable here
+        # (this is what makes the old code preserve — and the test RED).
+        assert kb._worktree_head_reachable_from_remote(ws) is False
+        # The combined gate recognizes the merge and clears the worktree to reap.
+        assert kb._worktree_work_is_preserved(ws) is True
+
+        assert kb.archive_task(conn, t) is True
+        events = kb.list_events(conn, t)
+
+    assert not ws.exists(), "squash-merged worktree must be reaped"
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert str(ws) not in listed
+    assert any(e.kind == "worktree_reaped" for e in events)
+    assert not any(e.kind == "worktree_reap_skipped" for e in events)
+
+
 def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path):
     """A worktree task created with no explicit path inherits the board's
     default_workdir as its anchor and materializes a per-task linked worktree
