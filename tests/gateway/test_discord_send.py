@@ -161,6 +161,84 @@ async def test_send_does_not_retry_on_unrelated_errors():
 
 
 # ---------------------------------------------------------------------------
+# Malformed ID handling — a non-numeric thread_id/chat_id must return a failed
+# SendResult naming the bad value, NOT raise ValueError out of int(). A raw
+# exception escaping send() breaks callers that correctly handle a failed
+# SendResult and drives the notifier into infinite exponential backoff on an
+# ID that can never become valid.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_malformed_thread_id_returns_failed_result_without_raising(caplog):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _id: (_ for _ in ()).throw(
+            AssertionError("get_channel should not be reached for a malformed id")
+        ),
+        fetch_channel=AsyncMock(),
+    )
+
+    import logging as _logging
+
+    with caplog.at_level(_logging.ERROR):
+        result = await adapter.send(
+            "555", "hello", metadata={"thread_id": "NEW"}
+        )
+
+    assert result.success is False
+    # Error names the offending value so the bad subscription is identifiable
+    # from the log alone.
+    assert "NEW" in (result.error or "")
+    # A malformed id is a permanent, self-inflicted error — it must fail via the
+    # documented contract, NOT the catch-all "Failed to send Discord message"
+    # traceback path that spams ERROR logs on every retry.
+    assert "Failed to send Discord message" not in caplog.text
+    # Never reached the real lookup — coercion failed cleanly first.
+    adapter._client.fetch_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_malformed_chat_id_returns_failed_result_without_raising(caplog):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _id: (_ for _ in ()).throw(
+            AssertionError("get_channel should not be reached for a malformed id")
+        ),
+        fetch_channel=AsyncMock(),
+    )
+
+    import logging as _logging
+
+    with caplog.at_level(_logging.ERROR):
+        result = await adapter.send("not-a-number", "hello")
+
+    assert result.success is False
+    assert "not-a-number" in (result.error or "")
+    assert "Failed to send Discord message" not in caplog.text
+    adapter._client.fetch_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_wellformed_missing_thread_id_unchanged():
+    """Regression guard: a well-formed but missing thread id still returns the
+    documented 'Thread <id> not found' result — the malformed-id fix must not
+    alter this existing contract."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(return_value=None),
+    )
+
+    result = await adapter.send(
+        "555", "hello", metadata={"thread_id": "12345"}
+    )
+
+    assert result.success is False
+    assert result.error == "Thread 12345 not found"
+
+
+# ---------------------------------------------------------------------------
 # Forum channel tests
 # ---------------------------------------------------------------------------
 
