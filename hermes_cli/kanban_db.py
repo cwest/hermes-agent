@@ -4257,6 +4257,19 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 # Casey and must NEVER auto-route — matching on this prefix excludes it by design.
 _REVIEW_BOUNCE_REASON_PREFIX = "review-changes-requested"
 
+# The reason prefix a no-PR (edit-in-place) worker uses when it finishes its lane
+# and hands the card off for review: ``kanban_block(reason="review-required: …")``.
+# This is the edit-in-place analog of the PR-backed ``running -> review`` handoff
+# (which a ``github-prs`` webhook fires). :func:`auto_promote_no_pr_review` keys on
+# this prefix to MOVE such a card ``blocked -> review`` + its owner-map reviewer.
+# It is DELIBERATELY distinct from ``review-changes-requested`` (the reviewer's
+# bounce, routed back to the author by :func:`auto_route_review_bounce`) and from
+# ``awaiting-casey-signoff`` (the acceptance park — Casey's lane); a bare
+# ``needs_input`` decision hold carries neither prefix and is left for a human.
+# NOTE: ``review-required`` is a strict prefix of nothing else here — matched with
+# word-boundary care below so a longer unrelated token can't false-positive.
+_REVIEW_REQUIRED_REASON_PREFIX = "review-required"
+
 
 def _latest_sticky_block_reason(
     conn: sqlite3.Connection, task_id: str,
@@ -4366,6 +4379,31 @@ def _is_acceptance_signoff_reason(reason: Optional[str]) -> bool:
     if not reason:
         return False
     return reason.lstrip().startswith(_ACCEPTANCE_SIGNOFF_REASON_PREFIX)
+
+
+def _is_review_required_reason(reason: Optional[str]) -> bool:
+    """True iff ``reason`` is a no-PR ``review-required`` review handoff.
+
+    Matched on the ``review-required`` prefix (leading whitespace tolerated),
+    with a word boundary after the token so a longer unrelated word cannot
+    false-positive. Deliberately does NOT match ``review-changes-requested`` (the
+    reviewer's bounce, routed by :func:`auto_route_review_bounce`) nor
+    ``awaiting-casey-signoff`` (the acceptance park — Casey's lane) nor a bare
+    ``needs_input`` decision hold (which carries a decision-fork reason, not this
+    prefix). The prefix is the sole discriminator; see
+    :func:`auto_promote_no_pr_review`.
+    """
+    if not reason:
+        return False
+    stripped = reason.lstrip()
+    if not stripped.startswith(_REVIEW_REQUIRED_REASON_PREFIX):
+        return False
+    # Word-boundary guard: the char right after the prefix must be a separator
+    # (``:``/whitespace/``-``) or end-of-string — never an alphanumeric that would
+    # make this a longer, different token (e.g. a hypothetical
+    # ``review-requiredness`` would NOT match).
+    rest = stripped[len(_REVIEW_REQUIRED_REASON_PREFIX):]
+    return rest == "" or not (rest[0].isalnum() or rest[0] == "_")
 
 
 def _review_bounce_finding(reason: Optional[str]) -> str:
@@ -4554,6 +4592,156 @@ def auto_route_review_bounce(
             pass
         routed += 1
     return routed
+
+
+def _last_spawned_pid(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Return the pid of the most recent ``spawned`` event, or None.
+
+    ``block_task`` clears ``tasks.worker_pid`` when a card lands ``blocked``, so
+    the author worker's pid no longer lives on the task row. The ``spawned`` event
+    (written by :func:`_set_worker_pid` at claim time) preserves it in the audit
+    trail — this recovers the latest one so a liveness check
+    (:func:`_pid_alive`) can tell a mid-wrapup author from a finished one.
+    Returns None when no ``spawned`` event exists or its payload is unparseable.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'spawned' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pid = payload.get("pid")
+    return int(pid) if isinstance(pid, int) else None
+
+
+def auto_promote_no_pr_review(
+    conn: sqlite3.Connection, *, enabled: bool = True,
+) -> int:
+    """Auto-promote a no-PR ``review-required`` block into the review lane.
+
+    Closes the ONE lane transition in the lifecycle with no mechanism behind it:
+    the edit-in-place (no-PR) analog of the PR-backed ``running -> review`` handoff.
+    A PR-backed card reaches review because a ``github-prs`` webhook fires on
+    PR-open; a no-PR card has no equivalent trigger. When a worker on such a card
+    finishes and correctly calls ``kanban_block(reason="review-required: …")``, the
+    block is recorded ``kind=needs_input`` ("truly blocked") and — with no handler
+    reading the ``review-required`` prefix — the card parks in ``blocked`` under
+    its author forever, no reviewer ever spawned.
+
+    On the housekeeping tick, a ``blocked`` card whose most-recent sticky block
+    carries the ``review-required`` prefix is MOVED ``blocked -> review`` + assignee
+    = the card's owner-map reviewer (``state_owners[review]`` — resolved from the
+    stamped submit-stage audit comment, NEVER hard-coded and NEVER inferred from
+    event history), with a dispatcher audit comment. One card, MOVED — never a
+    second card. The dispatcher then spawns the reviewer on the next tick exactly
+    as it would for a PR-backed review card.
+
+    Guard rails (each a distinct reason this handler leaves a card alone):
+
+    * **Author pid must be DEAD.** A live author worker pid means the worker is
+      still wrapping up; promoting under it is the stale-lock wedge. ``block_task``
+      clears ``tasks.worker_pid``, so the pid is recovered from the last ``spawned``
+      event (:func:`_last_spawned_pid`) and checked with :func:`_pid_alive`. Only a
+      host-local pid is meaningful; an off-host claimer is treated as "not
+      provably alive here" (proceed) exactly as :func:`detect_crashed_workers`
+      scopes its liveness check host-locally.
+    * **Only the ``review-required`` prefix fires.** An ``awaiting-casey-signoff``
+      block (the acceptance gate — Casey's lane), a ``review-changes-requested``
+      bounce (already routed by :func:`auto_route_review_bounce`), and a generic
+      ``needs_input`` decision hold all carry a different (or no) prefix and are
+      left untouched. The reason PREFIX is the sole discriminator.
+    * **Reviewer must resolve from the owner map.** No stamped
+      ``state_owners[review]`` owner → leave the card for a human rather than
+      guess. A card whose reviewer already equals its assignee is a no-op.
+
+    Idempotency (load-bearing): the promotion flips the card off ``blocked`` to
+    ``review``, so the detector naturally won't re-fire for the same card on a
+    later tick — two consecutive ticks produce exactly one promotion and one
+    audit comment. A card already in ``review`` is never scanned (the query is
+    ``status = 'blocked'`` only).
+
+    Returns the number of cards promoted this call. ``enabled=False`` (config
+    ``kanban.auto_promote_no_pr_review: false``) makes it a no-op.
+    """
+    if not enabled:
+        return 0
+    promoted = 0
+    blocked_rows = conn.execute(
+        "SELECT id, assignee FROM tasks WHERE status = 'blocked'"
+    ).fetchall()
+    for row in blocked_rows:
+        task_id = row["id"]
+        reason = _latest_sticky_block_reason(conn, task_id)
+        if not _is_review_required_reason(reason):
+            continue
+        # Author-pid liveness guard. ``block_task`` clears ``tasks.worker_pid`` AND
+        # ``claim_lock`` when the card lands ``blocked``, so the author's spawned
+        # pid survives only in the last ``spawned`` event. Recover it and refuse to
+        # promote while it is still alive — a live author worker means the worker
+        # is still wrapping up, and promoting under it is the stale-lock wedge. A
+        # clean ``kanban_block`` handoff is terminal (the worker has exited), so in
+        # steady state the pid is dead and the guard passes. The dispatcher design
+        # is single-host (``_default_spawn`` runs the worker on the dispatcher's
+        # host, same assumption :func:`detect_crashed_workers` relies on), so a
+        # recovered pid is checkable here; an unrecoverable pid cannot be proven
+        # alive, so we proceed.
+        pid = _last_spawned_pid(conn, task_id)
+        if pid is not None and _pid_alive(pid):
+            continue
+        # Resolve the reviewer from the card's stamped owner map. NEVER hard-code a
+        # profile name and NEVER infer from event history (the failure
+        # auto_route_review_bounce already fixed). No resolvable reviewer → leave
+        # the card for a human. A reviewer that already equals the assignee is a
+        # no-op (nothing to move).
+        reviewer = _review_owner_from_owner_map(conn, task_id)
+        if not reviewer or reviewer == row["assignee"]:
+            continue
+        # MOVE the one card blocked -> review + reviewer, fenced on the card still
+        # being blocked so a concurrent status change between the scan and here is
+        # a clean skip rather than a mis-move. Emits both a status_changed and an
+        # assigned {from, to} event so the review-lane machinery resolves the hop.
+        with write_txn(conn):
+            upd = conn.execute(
+                "UPDATE tasks SET status = 'review', assignee = ? "
+                "WHERE id = ? AND status = 'blocked'",
+                (reviewer, task_id),
+            )
+            if upd.rowcount != 1:
+                # Card changed status between the scan and here — skip.
+                continue
+            _append_event(
+                conn, task_id, "status_changed",
+                {"from": "blocked", "to": "review",
+                 "by": "dispatcher:auto-promote-no-pr-review"},
+            )
+            _append_event(
+                conn, task_id, "assigned",
+                {"from": row["assignee"], "to": reviewer,
+                 "by": "dispatcher:auto-promote-no-pr-review"},
+            )
+        # Audit comment recording the promotion, authored as the dispatcher so the
+        # trail attributes the action to a distinct identity. Mirrors the §9.1
+        # ``[audit]`` shape used by the one-card move helpers.
+        gist = (reason or "").strip()
+        body_lines = [
+            "[audit] actor=dispatcher stage=review",
+            f"notes: auto-promoted no-PR review-required handoff into the review "
+            f"lane; assigned reviewer {reviewer}; {gist}",
+        ]
+        try:
+            add_comment(conn, task_id, author="dispatcher", body="\n".join(body_lines))
+        except ValueError:
+            pass
+        promoted += 1
+    return promoted
 
 
 def route_feedback_to_author(
@@ -8293,6 +8481,13 @@ class DispatchResult:
     lane under the acceptance owner's name — contradictory AND silent (no
     ``blocked`` event → the acceptance ping never fires). See
     :func:`reconcile_pass_acceptance`."""
+    promoted_no_pr_review: int = 0
+    """Count of no-PR ``review-required`` blocks auto-promoted into the review lane
+    this tick (the edit-in-place analog of the PR-backed ``running -> review``
+    handoff). A worker that finishes a no-PR card and correctly calls
+    ``kanban_block(reason="review-required: …")`` would otherwise park in
+    ``blocked`` forever with no reviewer ever spawned. See
+    :func:`auto_promote_no_pr_review`."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -10270,6 +10465,7 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     auto_route_review_bounce_enabled: bool = True,
     reconcile_pass_acceptance_enabled: bool = True,
+    auto_promote_no_pr_review_enabled: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -10307,6 +10503,7 @@ def dispatch_once(
             max_spawn_per_tick=max_spawn_per_tick,
             auto_route_review_bounce_enabled=auto_route_review_bounce_enabled,
             reconcile_pass_acceptance_enabled=reconcile_pass_acceptance_enabled,
+            auto_promote_no_pr_review_enabled=auto_promote_no_pr_review_enabled,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -10326,6 +10523,7 @@ def dispatch_once(
             max_spawn_per_tick=max_spawn_per_tick,
             auto_route_review_bounce_enabled=auto_route_review_bounce_enabled,
             reconcile_pass_acceptance_enabled=reconcile_pass_acceptance_enabled,
+            auto_promote_no_pr_review_enabled=auto_promote_no_pr_review_enabled,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -10349,6 +10547,7 @@ def _dispatch_once_locked(
     max_spawn_per_tick: Optional[int] = None,
     auto_route_review_bounce_enabled: bool = True,
     reconcile_pass_acceptance_enabled: bool = True,
+    auto_promote_no_pr_review_enabled: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10436,6 +10635,14 @@ def _dispatch_once_locked(
     # safety net so the atomic invariant holds even if half the transition drops.
     result.reconciled_pass_acceptance = reconcile_pass_acceptance(
         conn, enabled=reconcile_pass_acceptance_enabled,
+    )
+    # Auto-promote a no-PR ``review-required`` block into the review lane (the
+    # edit-in-place analog of the PR-backed ``running -> review`` handoff a
+    # ``github-prs`` webhook fires — the no-PR path has no equivalent trigger).
+    # Runs BEFORE recompute_ready so a card just moved into ``review`` is eligible
+    # for the reviewer to be claimed/spawned this same tick.
+    result.promoted_no_pr_review = auto_promote_no_pr_review(
+        conn, enabled=auto_promote_no_pr_review_enabled,
     )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 

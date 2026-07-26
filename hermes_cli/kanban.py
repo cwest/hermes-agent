@@ -2496,6 +2496,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         reconcile_pass_acceptance_enabled = bool(
             _kanban_cfg.get("reconcile_pass_acceptance", True)
         )
+        auto_promote_no_pr_review_enabled = bool(
+            _kanban_cfg.get("auto_promote_no_pr_review", True)
+        )
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2511,6 +2514,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         auto_route_review_bounce_enabled = True
+        reconcile_pass_acceptance_enabled = True
+        auto_promote_no_pr_review_enabled = True
         max_spawn = getattr(args, "max", None)
         max_spawn_per_tick = None
     with kb.connect_closing() as conn:
@@ -2525,6 +2530,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress_per_profile=max_in_progress_per_profile,
             auto_route_review_bounce_enabled=auto_route_review_bounce_enabled,
             reconcile_pass_acceptance_enabled=reconcile_pass_acceptance_enabled,
+            auto_promote_no_pr_review_enabled=auto_promote_no_pr_review_enabled,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2535,6 +2541,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
             "routed_review_bounce": res.routed_review_bounce,
+            "promoted_no_pr_review": res.promoted_no_pr_review,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
@@ -2562,6 +2569,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    if res.promoted_no_pr_review:
+        print(f"Promoted (no-PR review): {res.promoted_no_pr_review}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
