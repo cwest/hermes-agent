@@ -225,6 +225,17 @@ _OWNER_MAP_RE = re.compile(r"state_owners=\{([^}]*)\}")
 # readers provably equivalent regardless of comment order.
 _SUBMIT_AUDIT_RE = re.compile(r"^\[audit\][^\n]*\bstage=submit\b", re.MULTILINE)
 
+# Parses the human-prose owner-map form a card carries when it is filed via a
+# bare ``create_task`` with an inline routing line rather than through the
+# ``submit_card`` gate (which stamps the strict ``state_owners={…}`` audit form
+# above). Homestead / fork-core conventions write ``Routing (owner map): {ready:
+# …, review: …, blocked-acceptance: …}`` into the card BODY (or an intake audit
+# comment). This is exactly what ``t_baaa247f`` carried while the strict-form
+# reader returned ``None`` and the staging path's ``resolve_reviewer`` resolved a
+# reviewer from the same map — the None-vs-owner split this reconciles. The lane
+# body is the same ``{lane: owner, …}`` payload, so the pair-splitting is shared.
+_PROSE_OWNER_MAP_RE = re.compile(r"[Rr]outing\s*\(owner map\)\s*:\s*\{([^}]*)\}")
+
 # Matches a GitHub pull-request URL and captures owner/repo/number so two
 # spellings of the same PR (trailing path, query string, or surrounding prose)
 # collapse to one canonical identity. The host is matched case-insensitively;
@@ -3704,6 +3715,22 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     ]
 
 
+def _lane_owner_from_map_body(map_body: str, lane: str) -> Optional[str]:
+    """Return the ``lane`` owner from a ``{lane: owner, …}`` map payload.
+
+    Shared by the strict (``state_owners={…}``) and prose (``Routing (owner
+    map): {…}``) readers — both carry the identical ``{lane: owner, …}`` shape,
+    so the pair-splitting lives in one place.
+    """
+    for pair in map_body.split(","):
+        if ":" not in pair:
+            continue
+        candidate, owner = pair.split(":", 1)
+        if candidate.strip() == lane and owner.strip():
+            return owner.strip()
+    return None
+
+
 def _owner_from_owner_map(
     conn: sqlite3.Connection, task_id: str, lane: str
 ) -> Optional[str]:
@@ -3711,14 +3738,26 @@ def _owner_from_owner_map(
 
     Reads the ``state_owners={ready: …, review: …, …}`` fragment recorded in the
     card's ``submit``-stage audit comment (the owner map lives in the audit trail,
-    not a column). Only the ``submit``-stage audit comment is authoritative: this
-    keys off the SAME comment ``stage-pr-review``'s ``resolve_reviewer`` reads
-    (which filters ``parse_audit(...)`` for the submit stage before parsing the
-    map), so every reader resolves the same owner regardless of comment order.
-    A later comment that merely echoes a ``state_owners={…}`` fragment (a
-    different stage's note, quoted prose) is ignored. Returns the ``lane`` owner
-    when stamped, else ``None`` so the caller can fall back.
+    not a column). Only the ``submit``-stage audit comment is authoritative for the
+    strict form: this keys off the SAME comment ``stage-pr-review``'s
+    ``resolve_reviewer`` reads (which filters ``parse_audit(...)`` for the submit
+    stage before parsing the map), so every reader resolves the same owner
+    regardless of comment order. A later comment that merely echoes a
+    ``state_owners={…}`` fragment (a different stage's note, quoted prose) is
+    ignored.
+
+    Fallback (reconciles the resolver split, fixed for ``t_baaa247f``): a card
+    filed via a bare ``create_task`` with an inline ``Routing (owner map): {…}``
+    line — the ``cwest/hermes-config`` edit-in-place work class — never carries a
+    ``stage=submit`` audit comment, so the strict reader returned ``None`` while
+    the staging path's ``resolve_reviewer`` resolved a reviewer from that same
+    prose map (the None-vs-owner split that let such a card self-complete past its
+    reviewer). When the strict form yields nothing we therefore also read the
+    human-prose form from the card BODY and from ANY comment. Returns the ``lane``
+    owner when stamped in either form, else ``None`` so the caller can fall back.
     """
+    # 1) Strict ``state_owners={…}`` form — authoritative in the submit-stage
+    #    audit comment only.
     for c in list_comments(conn, task_id):
         body = c.body or ""
         if not _SUBMIT_AUDIT_RE.search(body):
@@ -3726,12 +3765,29 @@ def _owner_from_owner_map(
         m = _OWNER_MAP_RE.search(body)
         if not m:
             continue
-        for pair in m.group(1).split(","):
-            if ":" not in pair:
-                continue
-            candidate, owner = pair.split(":", 1)
-            if candidate.strip() == lane and owner.strip():
-                return owner.strip()
+        owner = _lane_owner_from_map_body(m.group(1), lane)
+        if owner:
+            return owner
+    # 2) Prose ``Routing (owner map): {…}`` form — read from the card body first
+    #    (the canonical placement for a bare-create_task inline routing line),
+    #    then any comment. Preferring the body keeps a card whose body declares
+    #    the map authoritative over an incidental later echo.
+    row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is not None and row["body"]:
+        pm = _PROSE_OWNER_MAP_RE.search(row["body"])
+        if pm:
+            owner = _lane_owner_from_map_body(pm.group(1), lane)
+            if owner:
+                return owner
+    for c in list_comments(conn, task_id):
+        pm = _PROSE_OWNER_MAP_RE.search(c.body or "")
+        if not pm:
+            continue
+        owner = _lane_owner_from_map_body(pm.group(1), lane)
+        if owner:
+            return owner
     return None
 
 
@@ -5987,6 +6043,68 @@ def _card_has_pr_artifact(conn: sqlite3.Connection, task_id: str) -> bool:
     return False
 
 
+def _card_declares_owner_map(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when the card declares an owner/routing map in ANY form.
+
+    The named signal that a card is a lifecycle work-ITEM rather than a bare
+    bookkeeping tick: it carries a ``state_owners={…}`` strict-form map (a
+    submit-gated card) OR a human-prose ``Routing (owner map): {…}`` line — in
+    the card body or any comment. This is deliberately looser than
+    :func:`_owner_from_owner_map` (which requires the ``review`` LANE to be
+    present): a card whose map declares lanes but omits/malforms the review lane
+    is still a review-eligible work-item whose reviewer merely failed to resolve,
+    and must be REFUSED rather than silently completed to ``done``.
+    """
+    row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is not None and row["body"] and (
+        _OWNER_MAP_RE.search(row["body"]) or _PROSE_OWNER_MAP_RE.search(row["body"])
+    ):
+        return True
+    for c in list_comments(conn, task_id):
+        body = c.body or ""
+        if _PROSE_OWNER_MAP_RE.search(body):
+            return True
+        if _SUBMIT_AUDIT_RE.search(body) and _OWNER_MAP_RE.search(body):
+            return True
+    return False
+
+
+def _card_is_review_eligible(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when a card is subject to the author→review lane, not exempt.
+
+    ``done`` means "Casey merged/accepted" — an author's end-of-lane completion is
+    not that. A card is review-eligible (its author completion MUST route to a
+    reviewer, never straight to ``done``) when it shows ANY of the concrete,
+    core-visible signals that it is a real pipeline work-item:
+
+      * it declares an owner/routing map (:func:`_card_declares_owner_map`) — the
+        card was filed as a gated work-item with a review lane (strict
+        ``state_owners={…}`` or prose ``Routing (owner map): {…}``); OR
+      * it builds in an isolated git worktree cut for a branch/PR
+        (:func:`_card_requires_pr`); OR
+      * it already owns an open PR artifact (:func:`_card_has_pr_artifact`).
+
+    A card with NONE of these — a plain ``scratch`` bookkeeping tick, a
+    dispatcher/system-authored housekeeping card, a legacy card with no map and no
+    PR — is genuinely review-EXEMPT and completes to ``done`` as before. This is
+    the explicit, NAMED exemption the fall-through fix hinges on: the exempt set is
+    "no review signal at all," not the incidental "``_card_requires_pr`` is False"
+    it used to be (which wrongly exempted every ``scratch`` / ``~/.hermes``
+    edit-in-place card that DID declare a review lane — the ``t_baaa247f``
+    false-``done``).
+    """
+    if _card_declares_owner_map(conn, task_id):
+        return True
+    ws = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if ws is not None and _card_requires_pr(ws["workspace_kind"], ws["workspace_path"]):
+        return True
+    return _card_has_pr_artifact(conn, task_id)
+
+
 class HallucinatedCardsError(ValueError):
     """Raised by ``complete_task`` when ``created_cards`` contains ids
     that don't exist or weren't created by the completing worker.
@@ -6278,41 +6396,46 @@ def complete_task(
                         run_id=run_id,
                     )
                 return True
-            # No review owner resolved from the card's owner map. For a card that
-            # is unambiguously a review-eligible PIPELINE card — one that either
-            # builds in an isolated git worktree cut for a branch/PR
-            # (``_card_requires_pr``, the same signal the missing-PR guard above
-            # uses) OR already OWNS an open PR artifact (``_card_has_pr_artifact``,
-            # a resolvable ``pull/<n>`` URL in a comment — the same idiom the
-            # active_pr respawn guard trusts) — the author lane MUST hand off to a
-            # reviewer. Falling through to the ``-> done`` UPDATE below would land
-            # the card in ``done`` past the reviewer and past Casey's acceptance —
-            # the exact false-``done`` this redirect exists to prevent, silently,
-            # whenever the owner map was never stamped (a card filed off the
-            # ``submit_card`` path). So instead of a silent fall-through we REFUSE:
-            # a clean no-op (returns False, no state mutation) with an auditable
-            # ``completion_redirect_unresolved`` event, the same shape as the
-            # acceptance and missing-PR guards above.
+            # No review owner resolved from the card's owner map. A card that is
+            # review-ELIGIBLE — one whose author completion must hand off to a
+            # reviewer rather than land ``done`` — MUST NOT fall through to the
+            # ``-> done`` UPDATE below: that would land the card in ``done`` past
+            # the reviewer and past Casey's acceptance, the exact false-``done``
+            # this redirect exists to prevent, silently, whenever the review owner
+            # could not be resolved (a card filed off the ``submit_card`` path, or
+            # one whose declared map omits/malforms the review lane). So instead of
+            # a silent fall-through we REFUSE: a clean no-op (returns False, no
+            # state mutation) with an auditable ``completion_redirect_unresolved``
+            # event, the same shape as the acceptance and missing-PR guards above.
             #
-            # The PR-artifact arm closes the ``dir``-workspace blind spot:
-            # ``_card_requires_pr`` is True ONLY for ``worktree`` cards, so a
-            # ``dir``-workspace card that owns an open PR — EVERY caseywest.com
-            # writing card builds in ``~/src/cwest.github.io`` as ``dir``, not an
-            # isolated worktree — was invisible to the worktree-only arm and fell
-            # through to ``done`` (the live PR #131 false-``done``). A card that
-            # carries a resolvable open PR is review-eligible regardless of its
-            # ``workspace_kind``, so PR-exists ⇒ never a generic ``-> done``.
+            # Review-eligibility is the explicit, NAMED predicate
+            # :func:`_card_is_review_eligible` — the card declares an owner/routing
+            # map in ANY form (strict ``state_owners={…}`` OR prose ``Routing
+            # (owner map): {…}``, body or comment), OR is PR-requiring
+            # (``_card_requires_pr``), OR owns an open PR (``_card_has_pr_artifact``).
+            # This closes the two false-``done`` classes the earlier PR-only guard
+            # missed:
+            #   * the ``t_baaa247f`` class — a ``scratch`` / ``~/.hermes``
+            #     edit-in-place card that carries NO PR signal but DOES declare a
+            #     review lane (in its ``Routing (owner map):`` body prose). The
+            #     reconciled ``_review_owner_from_owner_map`` now reads that prose
+            #     map, so such a card normally resolves its reviewer and MOVEs to
+            #     review (the branch above); this refusal is the belt-and-suspenders
+            #     for one whose map is present but names no resolvable review owner.
+            #   * the ``dir`` caseywest.com writing class (PR #131) — a ``dir``
+            #     card owning an open PR, invisible to the worktree-only
+            #     ``_card_requires_pr`` arm; ``_card_has_pr_artifact`` (folded into
+            #     the eligibility predicate) covers it.
             #
-            # Still scoped to the population core can identify WITHOUT a card
-            # ``kind`` column (there is none — the owner map lives in the audit
-            # trail by design). A card that is neither PR-requiring NOR owns a PR
-            # (plain ``scratch`` task, a ``dir`` build with no PR, a ``~/.hermes``
-            # edit-in-place card) has no core-visible review signal, so it is NOT
-            # refused and completes to ``done`` exactly as before — research /
-            # plain / config-edit cards are untouched.
-            elif _card_requires_pr(
-                _row["workspace_kind"], _row["workspace_path"]
-            ) or _card_has_pr_artifact(conn, task_id):
+            # The exempt set is now "no review signal at all" — a plain ``scratch``
+            # bookkeeping tick, a dispatcher/system-authored housekeeping card, a
+            # legacy card with no map and no PR — rather than the incidental
+            # "``_card_requires_pr`` is False" that used to wrongly exempt every
+            # edit-in-place card that declared a review lane. Those genuinely
+            # review-exempt cards are NOT refused and complete to ``done`` exactly
+            # as before (there is no ``kind`` column; the map lives in the audit
+            # trail by design).
+            elif _card_is_review_eligible(conn, task_id):
                 with write_txn(conn):
                     _append_event(
                         conn, task_id, "completion_redirect_unresolved",
@@ -6470,6 +6593,116 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
+    return True
+
+
+# The lanes a reconciliation may walk a ``done`` card back into. ``done`` is
+# reserved for Casey's merge/accept; reopen returns the card to a LIVE lane so
+# the lifecycle can proceed. Excludes the terminal ``done``/``archived`` (nothing
+# to reopen into) and ``running`` (a reopen must not fake an in-flight claim — a
+# dispatcher claim is what makes a card ``running``).
+_REOPEN_TARGET_STATUSES = {"triage", "todo", "ready", "blocked", "review"}
+
+
+def reopen_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    to_status: str = "todo",
+    assignee: Optional[str] = None,
+    actor: str = "onecard",
+) -> bool:
+    """Walk a ``done`` card back to a live lane — the sanctioned un-done path.
+
+    ``done`` on the board is terminal and means exactly one thing: Casey
+    merged/accepted the work. ``move_card`` refuses to move a ``done`` card, and
+    there was no sanctioned verb to reconcile a card that reached ``done`` by a
+    route OTHER than Casey's merge/accept — e.g. the ``t_baaa247f`` false-``done``
+    where a worker's ``kanban_complete`` self-completed a review-eligible card past
+    its reviewer. Ad-hoc SQL to un-done such a card leaves no audit trail; this is
+    the audited primitive.
+
+    Semantics (mirrors the clean-no-op contract of the completion guards):
+      * ONLY a ``done`` card is reconcilable — a non-``done`` card is a no-op
+        (returns ``False``, no mutation). ``archived`` is terminal by a different
+        route and is not reopened here.
+      * ``reason`` is MANDATORY (non-empty) — the reconciliation must record WHY
+        the card is being pulled out of ``done``. It is stored on the audited
+        ``reopened`` event payload.
+      * ``to_status`` defaults to ``todo`` (re-enter the lifecycle from the top so
+        the normal promotion/claim path applies); an explicit target from
+        :data:`_REOPEN_TARGET_STATUSES` is accepted (e.g. ``review`` + the review
+        owner to route straight back to the reviewer that was skipped). An invalid
+        target raises :class:`ValueError`.
+      * ``completed_at`` is cleared and ``current_run_id`` reset so the card no
+        longer looks completed. The consecutive-failure counter is NOT touched.
+      * dependents are recomputed (a reopened parent must un-promote children that
+        had auto-advanced onto its ``done``).
+
+    Returns ``True`` when the card was reopened, ``False`` when it was not
+    ``done``.
+    """
+    if not reason or not str(reason).strip():
+        raise ValueError("reopen_task requires a non-empty reason")
+    reason = str(reason).strip()
+    if to_status not in _REOPEN_TARGET_STATUSES:
+        raise ValueError(
+            f"reopen_task to_status must be one of "
+            f"{sorted(_REOPEN_TARGET_STATUSES)}, got {to_status!r}"
+        )
+    assignee = _canonical_assignee(assignee)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] != "done":
+            # Not a done card — nothing to reconcile. Clean no-op.
+            return False
+        prev_assignee = row["assignee"]
+        new_assignee = assignee if assignee is not None else prev_assignee
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status       = ?,
+                   assignee     = ?,
+                   completed_at = NULL,
+                   result       = NULL,
+                   current_run_id = NULL,
+                   claim_lock   = NULL,
+                   claim_expires= NULL,
+                   worker_pid   = NULL,
+                   block_kind   = NULL
+             WHERE id = ?
+               AND status = 'done'
+            """,
+            (to_status, new_assignee, task_id),
+        )
+        if cur.rowcount != 1:
+            # Raced with another writer between the read and the write.
+            return False
+        _append_event(
+            conn, task_id, "reopened",
+            {
+                "from": "done",
+                "to": to_status,
+                "assignee": new_assignee,
+                "reason": reason,
+                "by": actor,
+            },
+        )
+        _append_event(
+            conn, task_id, "status_changed",
+            {
+                "from": "done",
+                "to": to_status,
+                "assignee": new_assignee,
+                "by": f"{actor}:reopen",
+            },
+        )
+    # Recompute dependents outside the reopen txn: a child that auto-promoted
+    # onto this parent's ``done`` must demote now that the parent is live again.
+    recompute_ready(conn)
     return True
 
 
