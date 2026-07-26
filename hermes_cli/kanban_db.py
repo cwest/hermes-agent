@@ -7191,6 +7191,24 @@ def block_task(
         if _is_acceptance_signoff_reason(reason):
             same_cause = False
 
+        # Review-required exception: a ``review-required`` block is the sanctioned
+        # no-PR / re-review HANDOFF token (moved into the review lane by
+        # :func:`auto_promote_no_pr_review`), NOT a failure repeating. A card that
+        # legitimately hands off twice (round-1 review, then round-2 re-review after
+        # a rework) re-blocks with the SAME ``kind`` each time, so the
+        # ``prev_kind == kind`` classifier would count the second, entirely normal
+        # handoff as "the same failure again" and escalate a healthy card to phantom
+        # ``triage`` at the limit — stranding it OFF the promoter (which only scans
+        # ``status = 'blocked'``, so it never sees a ``triage`` card). Review-required
+        # handoffs never participate in the loop breaker: force a fresh cause so the
+        # counter resets to 1 and the card always lands in ``blocked`` for the
+        # promoter. Deliberately keyed on ``_is_review_required_reason`` alone, so it
+        # does NOT match ``review-changes-requested`` (the reviewer's bounce, which
+        # MUST keep escalating a genuinely looping rework) nor any other free-text
+        # ``needs_input`` reason (a real stuck worker MUST still escalate).
+        if _is_review_required_reason(reason):
+            same_cause = False
+
         recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
