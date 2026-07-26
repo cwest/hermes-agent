@@ -1644,6 +1644,15 @@ class GatewayKanbanWatchersMixin:
             kanban_cfg.get("reconcile_pass_acceptance", True)
         )
 
+        # Read kanban.auto_promote_no_pr_review — promote a no-PR review-required
+        # block into the review lane (the edit-in-place analog of the PR-backed
+        # running -> review handoff a github-prs webhook fires; the no-PR path has
+        # no equivalent trigger). Defaults ON; set false to leave no-PR
+        # review-required blocks parked for a human to stage.
+        auto_promote_no_pr_review_enabled = bool(
+            kanban_cfg.get("auto_promote_no_pr_review", True)
+        )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1740,6 +1749,7 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     auto_route_review_bounce_enabled=auto_route_review_bounce_enabled,
                     reconcile_pass_acceptance_enabled=reconcile_pass_acceptance_enabled,
+                    auto_promote_no_pr_review_enabled=auto_promote_no_pr_review_enabled,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
