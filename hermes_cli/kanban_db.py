@@ -6773,6 +6773,17 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        if kind == "worktree" and path:
+            # A card reaching a terminal lane (``done`` / archived) no longer
+            # needs its isolated git worktree — reap it at source so the pool
+            # doesn't leak. Safety-gated: never removes a worktree with
+            # uncommitted changes or commits not reachable from a remote
+            # ("unreachable work is not garbage"), and defers while active
+            # children still need it. See ``_reap_worktree_workspace``.
+            _reap_worktree_workspace(conn, task_id)
+            _cleanup_worker_tmux(conn, task_id)
+            _try_cleanup_parent_workspaces(conn, task_id)
+            return
         if kind != "scratch" or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
@@ -6823,6 +6834,172 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         _try_cleanup_parent_workspaces(conn, task_id)
     except Exception:
         pass  # best-effort — never block completion
+
+
+def _worktree_has_uncommitted_changes(worktree: Path) -> bool:
+    """True if the worktree has staged/unstaged/untracked changes."""
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "status", "--porcelain"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    if result.returncode != 0:
+        # Can't determine cleanliness — treat as dirty (fail safe: don't reap).
+        return True
+    return bool((result.stdout or "").strip())
+
+
+def _worktree_head_reachable_from_remote(worktree: Path) -> bool:
+    """True if the worktree's HEAD commit is contained in a remote-tracking branch.
+
+    This is the "the work is preserved elsewhere, so the worktree is garbage"
+    signal. A HEAD that lives on no ``refs/remotes/*`` branch is local-only —
+    unmerged/unpushed work that must NOT be force-deleted ("unreachable work is
+    not garbage"). When the answer can't be determined we return ``False`` (fail
+    safe: preserve rather than reap).
+    """
+    head = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    if head.returncode != 0 or not (head.stdout or "").strip():
+        return False
+    sha = head.stdout.strip()
+    contains = subprocess.run(
+        ["git", "-C", str(worktree), "branch", "-r", "--contains", sha],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    if contains.returncode != 0:
+        return False
+    return bool((contains.stdout or "").strip())
+
+
+def _reap_worktree_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+    """Remove a terminal card's linked git worktree, safely.
+
+    Called from :func:`_cleanup_workspace` (the ``done`` path) and
+    :func:`archive_task` (the ``archived`` path) — the two terminal lanes. A
+    card reaching a terminal lane no longer needs its isolated worktree, and
+    leaving it registered leaks the worktree pool (and, when it holds ``main``,
+    breaks the deploy checkout's ``git pull --ff-only``).
+
+    Safety gates mirror the manual sweep — a worktree is PRESERVED (skipped,
+    with an auditable ``worktree_reap_skipped`` event) when it:
+
+    * has uncommitted changes, or
+    * carries commits not reachable from any remote branch ("unreachable work
+      is not garbage"), or
+    * still has non-terminal children that need it.
+
+    Removal is ``git worktree remove --force`` (plain remove refuses when an
+    ignored build cache is present) followed by ``git worktree prune`` in the
+    owning repo. Best-effort throughout: any failure emits an audit event and
+    never blocks the terminal transition. A ``dir`` / ``scratch`` /
+    edit-in-place card is out of scope and never reaches here.
+    """
+    try:
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["workspace_kind"] != "worktree" or not row["workspace_path"]:
+            return
+
+        # Defer while non-terminal children still need the worktree.
+        active_children = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks t ON t.id = l.child_id "
+            "WHERE l.parent_id = ? AND t.status NOT IN "
+            "('done', 'archived', 'failed', 'cancelled') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if active_children:
+            return
+
+        worktree = Path(row["workspace_path"]).expanduser()
+        if not worktree.exists():
+            # Already gone (or never materialized) — nothing to reap.
+            return
+        if not _is_linked_worktree_checkout(worktree):
+            # Not an isolated linked worktree (e.g. the main checkout, or a
+            # ``dir`` path that happens to be a repo root). Never touch it.
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "worktree_reap_skipped",
+                    {"path": str(worktree), "reason": "not-a-linked-worktree"},
+                )
+            return
+
+        repo_common = _git_common_dir(worktree)
+
+        if _worktree_has_uncommitted_changes(worktree):
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "worktree_reap_skipped",
+                    {"path": str(worktree), "reason": "dirty (uncommitted changes)"},
+                )
+            return
+        if not _worktree_head_reachable_from_remote(worktree):
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "worktree_reap_skipped",
+                    {
+                        "path": str(worktree),
+                        "reason": "unreachable (commits not on any remote branch)",
+                    },
+                )
+            return
+
+        # Resolve the owning repo root so we can prune its stale admin entry
+        # after removal. Prefer the common dir's parent (``.git`` -> repo root);
+        # fall back to walking up from the worktree's parent.
+        repo_root: Optional[Path] = None
+        if repo_common is not None:
+            candidate = repo_common.parent
+            if _git_toplevel(candidate) is not None:
+                repo_root = _git_toplevel(candidate)
+        if repo_root is None:
+            repo_root = _repo_root_for_worktree_target(worktree.parent)
+
+        remove = subprocess.run(
+            ["git", "-C", str(repo_root or worktree), "worktree", "remove",
+             "--force", str(worktree)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, check=False,
+        )
+        if remove.returncode != 0:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "worktree_reap_failed",
+                    {
+                        "path": str(worktree),
+                        "error": (remove.stderr or remove.stdout or "").strip()[:400],
+                    },
+                )
+            return
+        if repo_root is not None:
+            subprocess.run(
+                ["git", "-C", str(repo_root), "worktree", "prune"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=60, check=False,
+            )
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "worktree_reaped",
+                {"path": str(worktree)},
+            )
+    except Exception:
+        # Best-effort: never let a reap failure block the terminal transition.
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "worktree_reap_failed",
+                    {"reason": "unexpected error during reap"},
+                )
+        except Exception:
+            pass
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8055,6 +8232,11 @@ def archive_task(
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
+    # Reap the card's isolated git worktree at source — archiving is a terminal
+    # lane, so the worktree is no longer needed. Safety-gated (dirty / unmerged /
+    # active-children worktrees are preserved with an audit event); best-effort,
+    # never blocks the archive. ``done`` gets the same reap via _cleanup_workspace.
+    _reap_worktree_workspace(conn, task_id)
     return True
 
 
