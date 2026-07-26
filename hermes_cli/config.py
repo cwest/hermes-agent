@@ -1473,6 +1473,12 @@ DEFAULT_CONFIG = {
             "timeout": 120,        # seconds — LLM API call timeout; vision payloads need generous timeout
             "extra_body": {},      # OpenAI-compatible provider-specific request fields
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
+            # Gemini/Vertex image-resolution cost lever. "" (default) leaves the
+            # provider default untouched. "low" cuts IMAGE prompt tokens ~4x on
+            # coarse questions (measured 1,080 -> 260 on a 2400x1600 PNG with
+            # gemini-3.x flash); "high" == the provider default (no token win).
+            # Gemini-only: ignored cleanly by every other vision provider.
+            "media_resolution": "",  # "" | low | medium | high
         },
         "web_extract": {
             "provider": "auto",

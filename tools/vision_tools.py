@@ -159,6 +159,137 @@ def _resolve_vision_cpu_workers() -> int:
 
 _VISION_CPU_WORKERS = _resolve_vision_cpu_workers()
 
+
+# ---------------------------------------------------------------------------
+# Gemini/Vertex image-resolution cost lever (media_resolution)
+# ---------------------------------------------------------------------------
+# The Gemini generateContent API exposes generationConfig.mediaResolution, which
+# controls how many tokens an image is tiled into. On a coarse question ("what's
+# in this picture?") MEDIA_RESOLUTION_LOW cuts IMAGE prompt tokens ~4x for the
+# same answer (measured 1,080 -> 260 on a 2400x1600 PNG, gemini-3.x flash).
+# HIGH == the provider default here (no token win from raising it), so the lever
+# only pays off in the LOW direction.
+#
+# This is Gemini/Vertex-specific. The vision router can select other providers,
+# so the knob must be provider-aware and fail-soft: for any non-Gemini provider
+# we emit NO extra_body field at all — never error, never send an unknown field
+# that a strict provider would reject. Wire shape is a FLAT
+# extra_body {"media_resolution": "MEDIA_RESOLUTION_LOW"} — the key LiteLLM's
+# Vertex adapter maps onto generationConfig.mediaResolution. Verified live
+# against gemini-3.6-flash (IMAGE tokens 1,080 -> 260 with LOW); the nested
+# extra_body.google.* / generationConfig shapes are silently ignored by LiteLLM
+# and 400 on direct Vertex, so the flat key is the one that actually takes
+# effect. Do NOT "fix" this into a nested shape.
+
+# Re-exported for tests to patch; the tool resolves config lazily at call time
+# so a config change takes effect without a process restart.
+from hermes_cli.config import load_config  # noqa: E402
+
+_MEDIA_RESOLUTION_ENUM_MAP = {
+    "low": "MEDIA_RESOLUTION_LOW",
+    "medium": "MEDIA_RESOLUTION_MEDIUM",
+    "high": "MEDIA_RESOLUTION_HIGH",
+}
+
+# Values that explicitly mean "leave the provider default untouched".
+_MEDIA_RESOLUTION_DEFAULT_TOKENS = {"", "default", "unset", "none", "auto"}
+
+
+def _normalize_media_resolution(value: Any) -> Optional[str]:
+    """Map a user media_resolution value to the Gemini enum, or None (no-op).
+
+    Returns None for anything that means "leave the provider default" —
+    None/empty/"default" and any UNRECOGNIZED value (so a typo can never send a
+    garbage field). Accepts the friendly ``low``/``medium``/``high`` names and
+    the already-normalized ``MEDIA_RESOLUTION_*`` enums (idempotent passthrough).
+    """
+    if not isinstance(value, str):
+        return None
+    token = value.strip().lower()
+    if not token or token in _MEDIA_RESOLUTION_DEFAULT_TOKENS:
+        return None
+    if token in _MEDIA_RESOLUTION_ENUM_MAP:
+        return _MEDIA_RESOLUTION_ENUM_MAP[token]
+    upper = value.strip().upper()
+    if upper in set(_MEDIA_RESOLUTION_ENUM_MAP.values()):
+        return upper
+    # Unknown token — treat as default rather than forwarding garbage.
+    return None
+
+
+def _provider_model_is_gemini(provider: Any, model: Any) -> bool:
+    """True only when the resolved vision route is a Gemini/Vertex model.
+
+    The media_resolution field is Gemini-specific. A direct ``gemini``/``google``
+    provider always qualifies; an aggregator (openrouter/vertex/nous/...) only
+    qualifies when the routed MODEL name is Gemini-family, so a non-Gemini model
+    reached through an aggregator is correctly treated as unsupported.
+    """
+    p = str(provider or "").strip().lower()
+    m = str(model or "").strip().lower()
+    _GEMINI_PROVIDERS = {
+        "gemini", "google", "google-gemini", "google-vertex",
+        "google-vertex-gemini",
+    }
+    if p in _GEMINI_PROVIDERS:
+        return True
+    # Aggregators / vertex proxies: qualify only when the model is Gemini-family.
+    if "gemini" in m:
+        return True
+    return False
+
+
+def _build_media_resolution_extra_body(
+    provider: Any, model: Any, media_resolution: Any
+) -> Dict[str, Any]:
+    """Build the provider-specific extra_body fragment for media_resolution.
+
+    Provider-aware and fail-soft (Contract: never error, never send an unknown
+    field to a strict provider):
+      * media_resolution unset / default / unknown -> ``{}`` (unchanged behavior).
+      * a NON-Gemini provider/model -> ``{}`` (the knob is ignored cleanly).
+      * a Gemini/Vertex provider+model -> a flat ``media_resolution`` extra_body
+        param.
+
+    Wire shape: a FLAT ``{"media_resolution": "MEDIA_RESOLUTION_LOW"}`` in
+    extra_body. This is the shape LiteLLM's Vertex adapter maps onto
+    ``generationConfig.mediaResolution`` — verified live against
+    gemini-3.6-flash (IMAGE tokens 1,080 -> 260 with LOW; nested
+    ``google``/``generationConfig`` shapes are silently ignored by LiteLLM and
+    400 on direct Vertex, so the flat key is the one that actually takes effect).
+    """
+    try:
+        enum = _normalize_media_resolution(media_resolution)
+        if enum is None:
+            return {}
+        if not _provider_model_is_gemini(provider, model):
+            return {}
+        return {"media_resolution": enum}
+    except Exception:  # fail-soft — a bad input must never break vision
+        return {}
+
+
+def _resolve_media_resolution(override: Any = None) -> Optional[str]:
+    """Resolve the effective media_resolution value: per-call override > config.
+
+    Returns the RAW value (still friendly ``low``/``high``, not the enum) so the
+    provider-aware builder can decide whether to emit it. A per-call override
+    (the tool argument) always wins over ``auxiliary.vision.media_resolution``.
+    Fail-soft: a broken config read falls back to the override.
+    """
+    if isinstance(override, str) and override.strip():
+        return override.strip()
+    try:
+        cfg = load_config()
+        from hermes_cli.config import cfg_get
+        val = cfg_get(cfg, "auxiliary", "vision", "media_resolution")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    except Exception:
+        pass
+    return None
+
+
 # Dedicated, bounded executor for the CPU-bound encode/resize burst ONLY. We do
 # NOT use the default executor (run_in_executor(None, ...)) — that pool is shared
 # with the gateway and web server, so a fan-out would park encode work there and
@@ -935,6 +1066,7 @@ async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
     model: str = None,
+    media_resolution: str = None,
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -1110,6 +1242,32 @@ async def vision_analyze_tool(
         }
         if model:
             call_kwargs["model"] = model
+
+        # Image-resolution cost lever (Gemini/Vertex only, fail-soft). Resolve
+        # the effective vision provider+model so the knob is injected ONLY when
+        # the routed backend is Gemini — every other provider ignores it and no
+        # unknown field is ever sent. media_resolution=None/"" leaves the request
+        # byte-for-byte unchanged (default behavior).
+        effective_media_resolution = _resolve_media_resolution(media_resolution)
+        if effective_media_resolution:
+            try:
+                from agent.auxiliary_client import resolve_vision_provider_client
+                _eff_provider, _client, _eff_model = resolve_vision_provider_client(
+                    model=model or None,
+                )
+                mr_extra = _build_media_resolution_extra_body(
+                    _eff_provider, _eff_model, effective_media_resolution
+                )
+                if mr_extra:
+                    call_kwargs["extra_body"] = mr_extra
+                    logger.info(
+                        "vision: media_resolution=%s applied (provider=%s model=%s)",
+                        effective_media_resolution, _eff_provider, _eff_model,
+                    )
+            except Exception as _mr_err:
+                # Never let the cost lever break a working vision call.
+                logger.debug("media_resolution resolution skipped: %s", _mr_err)
+
         # Try full-size image first; on size-related rejection, downscale and retry.
         try:
             response = await async_call_llm(**call_kwargs)
@@ -1325,6 +1483,19 @@ VISION_ANALYZE_SCHEMA = {
             "question": {
                 "type": "string",
                 "description": "Your specific question or request about the image. Optional context the model uses on the next turn after seeing the image."
+            },
+            "media_resolution": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": (
+                    "Optional image-resolution cost lever (Gemini/Vertex vision "
+                    "backend only; ignored by other providers). Omit to use the "
+                    "configured default. 'low' sends the image at reduced "
+                    "resolution — ~4x fewer image tokens — ideal for coarse "
+                    "questions ('what's in this picture?', 'is the chart up?'). "
+                    "'high' is the provider default (no token change). Use 'low' "
+                    "to save cost when fine detail isn't needed."
+                ),
             }
         },
         "required": ["image_url", "question"]
@@ -1335,6 +1506,10 @@ VISION_ANALYZE_SCHEMA = {
 async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
+    # Optional per-call image-resolution override (Gemini/Vertex only). Defaults
+    # to the auxiliary.vision.media_resolution config value, which itself
+    # defaults to unchanged behavior.
+    media_resolution = args.get("media_resolution")
 
     # The fan-out cap lives inside the encode/resize step (offloaded to the
     # bounded _vision_cpu_executor), NOT around the whole analysis — so a
@@ -1347,6 +1522,11 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     # return the image bytes as a multimodal tool-result envelope. The main
     # model sees the pixels directly on its next turn — no aux call, no
     # information loss, no extra latency.
+    #
+    # media_resolution is a knob on the AUXILIARY vision call's request; the
+    # native path hands raw bytes to the main model and does not make that call,
+    # so the knob does not apply there (the main model's own provider config
+    # governs its image handling).
     if _should_use_native_vision_fast_path():
         logger.info("vision_analyze: native fast path")
         return await _vision_analyze_native(image_url, question)
@@ -1357,7 +1537,9 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
         f"following question:\n\n{question}"
     )
     model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return await vision_analyze_tool(image_url, full_prompt, model)
+    return await vision_analyze_tool(
+        image_url, full_prompt, model, media_resolution=media_resolution
+    )
 
 
 registry.register(
