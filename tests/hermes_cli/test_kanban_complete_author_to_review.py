@@ -205,15 +205,27 @@ def test_unstamped_card_completes_to_done(kanban_home: Path) -> None:
         assert task.completed_at is not None
 
 
-def test_owner_map_without_review_lane_completes_to_done(kanban_home: Path) -> None:
-    """A stamped card whose owner map has no ``review`` lane completes to done."""
+def test_owner_map_without_review_lane_is_refused(kanban_home: Path) -> None:
+    """A stamped card whose owner map DECLARES lanes but omits the ``review``
+    lane is a review-ELIGIBLE work-item whose reviewer merely failed to resolve.
+    It must be REFUSED (clean no-op, ``completion_redirect_unresolved`` emitted),
+    NOT silently completed to ``done`` past a reviewer — the no-PR fall-through
+    fix narrows the exempt set to cards with NO review signal at all, and a
+    stamped owner map is a review signal even when the review lane is absent."""
     with kb.connect() as conn:
         tid = _author_card(conn, owner_map="ready: eckert, blocked-acceptance: casey")
 
         ok = kb.complete_task(conn, tid, summary="no review lane")
 
-        assert ok is True
-        assert kb.get_task(conn, tid).status == "done"
+        assert ok is False, "a stamped card with no resolvable reviewer is refused"
+        task = kb.get_task(conn, tid)
+        assert task.status == "running", "card must not move to done"
+        assert task.completed_at is None
+        refusals = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "completion_redirect_unresolved"
+        ]
+        assert refusals, "a completion_redirect_unresolved event must be recorded"
 
 
 # ---------------------------------------------------------------------------
