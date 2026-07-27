@@ -603,6 +603,55 @@ def _sudo_stdin_block_result(description: str) -> dict:
 # Dangerous command patterns
 # =========================================================================
 
+# --- git push force classification -------------------------------------
+# `--force-with-lease` / `--force-if-includes` are the *guarded* force: git
+# aborts the push if the remote ref advanced since the last fetch, so they
+# cannot overwrite a ref another party moved -- the exact hazard the
+# unconditional-force gate exists to prevent. They get their own
+# non-history-rewriting description so the permanent allowlist (which keys off
+# the description string) can allow the guarded form without also allowing an
+# unconditional history rewrite.
+#
+# CRITICAL -- unconditional `--force`/`-f` WINS even when a lease flag is also
+# present. git's own precedence (`set_ref_status_for_push` in remote.c:
+# `force_ref_update = ref->force || force_update`, with the note "--force will
+# defeat any rejection implemented by the rules above") means an unconditional
+# force token anywhere in a `git push` invocation makes it a real history
+# rewrite regardless of a lease flag also being present.
+#
+# These three keys are matched PER SHELL SEGMENT by _classify_force_push()
+# (strictest key wins across segments), NOT by a whole-string re.search over
+# the raw command. A whole-string search cannot express the per-invocation
+# property "does THIS push carry an unconditional token?": with two chained
+# pushes on one line (`git push --force ... && git push --force-with-lease ...`)
+# it retries at the second push, finds no unconditional token to its right, and
+# wrongly returns the guarded key -- which would regress the pre-existing gate.
+# Segmenting with the shared quote-aware _iter_top_level_shell_segments() makes
+# chaining, ordering, and pipes fall out for free. The lease pattern's leading
+# negative lookahead still handles the both-flags-in-ONE-segment case; the
+# per-segment strictest-wins loop handles the across-segments case. Keep the
+# tuples in DANGEROUS_PATTERNS too so their description strings register in the
+# approval-key alias map (existing command_allowlist entries key off them).
+_FORCE_PUSH_LEASE_KEY = "git force push with lease (guarded; cannot overwrite others' work)"
+_FORCE_PUSH_UNCONDITIONAL_KEY = "git force push (rewrites remote history)"
+_FORCE_PUSH_SHORT_FLAG_KEY = "git force push short flag (rewrites remote history)"
+# The lease rule declines whenever a sibling unconditional force token
+# (`--forc[a-z]*` as a complete token, or a standalone `-f`) appears in the
+# SAME segment, so a both-flags-one-segment push falls through to the
+# unconditional rule. It then requires a hyphenated `--forc...-w`/`--forc...-i`
+# discriminator (matching `--force-with-lease`, `--force-if-includes`, git's
+# long-flag prefix abbreviations, and an optional `=<ref>` value).
+_FORCE_PUSH_LEASE_PATTERN = (
+    r'\bgit\s+push\b(?!.*(?:--forc[a-z]*(?=[\s=;|&]|$)|(?<![\w-])-f(?=[\s;|&]|$)))'
+    r'.*--forc[a-z]*-(?:w|i)[a-z-]*'
+)
+# Unconditional force rewrites remote history and can silently clobber another
+# party's push. `--forc[a-z]*` matches git's abbreviated long-flag prefixes
+# (`--forc`, `--force`, `--forced`); the trailing `(?!-)` ensures it does not
+# also claim the hyphenated lease forms handled above.
+_FORCE_PUSH_UNCONDITIONAL_PATTERN = r'\bgit\s+push\b.*--forc[a-z]*\b(?!-)'
+_FORCE_PUSH_SHORT_FLAG_PATTERN = r'\bgit\s+push\b.*-f\b'
+
 DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
@@ -769,44 +818,17 @@ DANGEROUS_PATTERNS = [
     # this cannot collide with another reset mode. It also does not match
     # `--help`, which git special-cases before mode resolution.
     (r'\bgit\s+reset\s+--h(?:a(?:r(?:d)?)?)?\b', "git reset --hard (destroys uncommitted changes)"),
-    # `--force-with-lease` / `--force-if-includes` are the *guarded* force: git
-    # aborts the push if the remote ref advanced since the last fetch, so they
-    # cannot overwrite a ref another party moved — the exact hazard the
-    # unconditional-force gate exists to prevent. Classify them as their own
-    # non-history-rewriting category so the permanent-allowlist (which keys off
-    # the description string) can allow the guarded form without also allowing
-    # an unconditional history rewrite. This pattern is ordered BEFORE the
-    # unconditional `--forc[a-z]*` rule so a lease-guarded push is claimed here
-    # first. Both `--force-with-lease` and `--force-if-includes` (plus git's
-    # unambiguous long-flag prefix abbreviations like `--force-w`, `--force-i`,
-    # and an optional `=<ref>` value) are caught via the `-(?:w|i)` discriminator
-    # after the force prefix.
-    #
-    # CRITICAL — unconditional `--force` WINS even when a lease flag is also
-    # present. git's own precedence (`set_ref_status_for_push` in remote.c:
-    # `force_ref_update = ref->force || force_update`, with the note "--force
-    # will defeat any rejection implemented by the rules above") means an
-    # unconditional `--force`/`-f` anywhere on the line makes the push a real
-    # history rewrite regardless of a lease flag being present too. Since these
-    # patterns match with re.search over the raw string (not a parsed argv),
-    # ordering the lease rule first is NOT enough: `git push --force
-    # --force-with-lease` would otherwise be claimed by the lease rule and get
-    # the guarded (allowlistable) key — a hole that lets an unconditional force
-    # push run unattended. The leading `(?!.*<uncond>)` negative lookahead makes
-    # the lease rule DECLINE the match whenever a sibling unconditional force
-    # token (`--forc[a-z]*` as a complete token, or `-f`) appears anywhere in
-    # the command, so such a command falls through to the unconditional rule
-    # below and is classified as the history rewrite it actually is. Do NOT
-    # "simplify" this lookahead away — it is what keeps the split from weakening
-    # the unconditional-force gate.
-    (r'\bgit\s+push\b(?!.*(?:--forc[a-z]*(?=[\s=;|&]|$)|(?<![\w-])-f(?=[\s;|&]|$))).*--forc[a-z]*-(?:w|i)[a-z-]*', "git force push with lease (guarded; cannot overwrite others' work)"),
-    # Unconditional force rewrites remote history and can silently clobber
-    # another party's push. `--forc[a-z]*` keeps matching git's abbreviated
-    # long-flag prefixes (`--forc`, `--force`, `--forced`); the `(?!-)`
-    # lookahead after the flag boundary ensures this does NOT also claim the
-    # hyphenated lease forms handled by the rule above.
-    (r'\bgit\s+push\b.*--forc[a-z]*\b(?!-)', "git force push (rewrites remote history)"),
-    (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
+    # `--force-with-lease` / `--force-if-includes` (guarded) vs unconditional
+    # `--force`/`-f` (history rewrite). See the _FORCE_PUSH_* constants above
+    # for the full rationale and git's precedence rule. These three tuples are
+    # kept here so their description strings register in the approval-key alias
+    # map, but the ACTUAL classification of a `git push` command runs PER SHELL
+    # SEGMENT via _classify_force_push() (called first in
+    # detect_dangerous_command), which the whole-string re.search below cannot
+    # do correctly for chained pushes.
+    (_FORCE_PUSH_LEASE_PATTERN, _FORCE_PUSH_LEASE_KEY),
+    (_FORCE_PUSH_UNCONDITIONAL_PATTERN, _FORCE_PUSH_UNCONDITIONAL_KEY),
+    (_FORCE_PUSH_SHORT_FLAG_PATTERN, _FORCE_PUSH_SHORT_FLAG_KEY),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
     # `-D` is shorthand for `-d --force`; the long-flag spellings
@@ -857,6 +879,26 @@ DANGEROUS_PATTERNS_COMPILED = [
     (re.compile(pattern, _RE_FLAGS), description)
     for pattern, description in DANGEROUS_PATTERNS
 ]
+
+# Compiled force-push classifiers, ordered lease-first then unconditional.
+# Applied PER SHELL SEGMENT by _classify_force_push(); see the _FORCE_PUSH_*
+# constants for why whole-string matching is wrong here. Order matters within a
+# segment: the lease pattern's own lookahead declines a segment that also
+# carries an unconditional token, so the unconditional/short-flag rules claim
+# it -- exactly the both-flags-one-segment precedence git enforces.
+_FORCE_PUSH_PATTERNS_COMPILED = [
+    (re.compile(_FORCE_PUSH_LEASE_PATTERN, _RE_FLAGS), _FORCE_PUSH_LEASE_KEY),
+    (re.compile(_FORCE_PUSH_UNCONDITIONAL_PATTERN, _RE_FLAGS), _FORCE_PUSH_UNCONDITIONAL_KEY),
+    (re.compile(_FORCE_PUSH_SHORT_FLAG_PATTERN, _RE_FLAGS), _FORCE_PUSH_SHORT_FLAG_KEY),
+]
+# Rank so the STRICTEST (history-rewriting) key wins when a chained command has
+# both a lease push in one segment and an unconditional push in another. Higher
+# rank = stricter. The two unconditional keys tie above the guarded lease key.
+_FORCE_PUSH_KEY_RANK = {
+    _FORCE_PUSH_LEASE_KEY: 1,
+    _FORCE_PUSH_UNCONDITIONAL_KEY: 2,
+    _FORCE_PUSH_SHORT_FLAG_KEY: 2,
+}
 
 
 def _legacy_pattern_key(pattern: str) -> str:
@@ -2021,6 +2063,42 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
 
 
+def _classify_force_push(command: str):
+    """Classify a `git push` force command per shell segment (strictest wins).
+
+    Splits *command* into top-level shell segments with the shared quote-aware
+    splitter and classifies each segment independently against the force-push
+    patterns. Returns the strictest key found across all segments, or ``None``
+    if no segment is a force push.
+
+    Per-segment classification is what makes chained/piped/ordered pushes
+    correct: a whole-string ``re.search`` retries at a later ``git push`` and
+    can return the guarded lease key for a line that also carries an
+    unconditional ``--force`` in an earlier segment (regressing the gate). Here,
+    if ANY segment is an unconditional history rewrite, that wins over a guarded
+    lease push in a sibling segment -- matching git's own precedence.
+    """
+    best_key = None
+    best_rank = 0
+    for segment in _iter_top_level_shell_segments(command):
+        segment_lower = segment.lower()
+        for pattern_re, key in _FORCE_PUSH_PATTERNS_COMPILED:
+            if pattern_re.search(segment_lower):
+                rank = _FORCE_PUSH_KEY_RANK[key]
+                if rank > best_rank:
+                    best_rank = rank
+                    best_key = key
+                # First matching rule for THIS segment decides the segment
+                # (lease-first ordering + the lease lookahead already enforce
+                # the both-flags-one-segment precedence); move to the next
+                # segment rather than letting a broader rule re-claim it.
+                break
+        if best_rank >= max(_FORCE_PUSH_KEY_RANK.values()):
+            # Already at the strictest possible key; no segment can beat it.
+            break
+    return best_key
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
@@ -2032,12 +2110,24 @@ def detect_dangerous_command(command: str) -> tuple:
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
 
+    _force_push_keys = frozenset(_FORCE_PUSH_KEY_RANK)
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
             if pattern_re.search(command_lower):
-                pattern_key = description
-                return (True, pattern_key, description)
+                # A force-push pattern matched on the whole string, but the
+                # whole-string patterns can't express "does THIS push carry an
+                # unconditional token?" -- for chained pushes they mis-key.
+                # Re-derive the key PER SHELL SEGMENT (strictest wins) so an
+                # unconditional force anywhere on the line wins over a guarded
+                # lease push in a sibling segment. Earlier (non-force) rules
+                # keep their original precedence: this only refines the key
+                # when the winning match was itself a force-push rule.
+                if description in _force_push_keys:
+                    refined = _classify_force_push(command_variant)
+                    if refined is not None:
+                        return (True, refined, refined)
+                return (True, description, description)
     normalized = _normalize_command_for_detection(command)
     for description, _ in _execution_flag_findings(normalized):
         return (True, description, description)

@@ -174,3 +174,115 @@ class TestLeaseOnlyFormsUnchanged:
             assert key not in _HISTORY_REWRITE_KEYS, (
                 f"lease-only push must stay guarded, got {key!r} for {command!r}"
             )
+
+
+class TestChainedForcePushStrictestWins:
+    """A single command line can chain two `git push` invocations. Classification
+    runs per shell segment (strictest key wins), so an unconditional force in ANY
+    segment classifies the whole line as history-rewriting even when a later
+    segment is a guarded lease push.
+
+    Whole-string matching regressed here: `re.search` retried at the second push,
+    found no unconditional token to its right, and returned the guarded lease key
+    for a line that also carried `--force` earlier — a classification the base
+    (pre-split) pattern got right and the split briefly broke.
+    """
+
+    def test_force_then_lease_chained_and_is_history_rewriting(self):
+        dangerous, key, _ = detect_dangerous_command(
+            "git push --force origin main && git push --force-with-lease origin other"
+        )
+        assert dangerous is True
+        assert key in _HISTORY_REWRITE_KEYS, (
+            "an unconditional force in an earlier chained segment must classify "
+            f"the whole line as history-rewriting, got {key!r}"
+        )
+
+    def test_force_then_lease_chained_semicolon_is_history_rewriting(self):
+        dangerous, key, _ = detect_dangerous_command(
+            "git push --force origin main ; git push --force-with-lease origin other"
+        )
+        assert dangerous is True
+        assert key in _HISTORY_REWRITE_KEYS, (
+            f"`;`-separated unconditional force must win, got {key!r}"
+        )
+
+    def test_short_f_first_segment_chained_is_history_rewriting(self):
+        dangerous, key, _ = detect_dangerous_command(
+            "git push -f origin main | tee log && git push --force-with-lease origin b"
+        )
+        assert dangerous is True
+        assert key in _HISTORY_REWRITE_KEYS, (
+            "the short unconditional flag `-f` in a piped/chained earlier segment "
+            f"must win over a later lease push, got {key!r}"
+        )
+
+    def test_lease_first_segment_then_unconditional_is_history_rewriting(self):
+        """Order reversed across segments — the strictest segment still wins."""
+        dangerous, key, _ = detect_dangerous_command(
+            "git push --force-with-lease origin a && git push --force origin b"
+        )
+        assert dangerous is True
+        assert key in _HISTORY_REWRITE_KEYS, (
+            f"unconditional force in a later segment must win, got {key!r}"
+        )
+
+    def test_lease_only_chain_stays_guarded(self):
+        """Two chained lease pushes with no unconditional token stay guarded."""
+        dangerous, key, _ = detect_dangerous_command(
+            "git push --force-with-lease origin a && git push --force-if-includes origin b"
+        )
+        assert dangerous is True
+        assert key not in _HISTORY_REWRITE_KEYS, (
+            f"a chain of lease-only pushes must stay guarded, got {key!r}"
+        )
+
+
+class TestParityOrStricterVsBasePattern:
+    """Regression guard: anything the pre-split base pattern classified as
+    history-rewriting must STILL classify as history-rewriting (or stricter).
+
+    The base classified force-push with a single whole-string rule,
+    ``\\bgit\\s+push\\b.*--forc[a-z]*\\b`` plus ``.*-f\\b``. This test reproduces
+    that rule and asserts the current classifier never *downgrades* an input the
+    base flagged as history-rewriting to the guarded lease key. This is the
+    invariant the earlier round-2 matrix lacked, and it is what catches a chained
+    push where an unconditional force would otherwise leak into the lease key.
+    """
+
+    import re as _re
+
+    # The base's whole-string force-push detectors (unconditional long + short).
+    _BASE_FORCE = _re.compile(
+        r"\bgit\s+push\b.*--forc[a-z]*\b|\bgit\s+push\b.*-f\b",
+        _re.IGNORECASE | _re.DOTALL,
+    )
+
+    def test_no_downgrade_of_base_history_rewrites(self):
+        # Inputs the base's single pattern classified as history-rewriting.
+        # Every one must remain history-rewriting under the split classifier.
+        inputs = [
+            "git push --force origin main",
+            "git push -f origin main",
+            "git push --forc origin main",
+            "git push --forced origin main",
+            "git push origin main --force",
+            "git push --force-with-lease --force origin main",
+            "git push --force --force-with-lease origin main",
+            "git push --force-with-lease -f origin main",
+            "git push --force origin main && git push --force-with-lease origin other",
+            "git push --force origin main ; git push --force-with-lease origin other",
+            "git push -f origin main | tee log && git push --force-with-lease origin b",
+            "git push --force-with-lease origin a && git push --force origin b",
+        ]
+        for command in inputs:
+            # Precondition: the base pattern really did flag this input.
+            assert self._BASE_FORCE.search(command.lower()), (
+                f"test input not flagged by the base pattern: {command!r}"
+            )
+            dangerous, key, _ = detect_dangerous_command(command)
+            assert dangerous is True, command
+            assert key in _HISTORY_REWRITE_KEYS, (
+                "the split classifier must not DOWNGRADE a base history-rewrite "
+                f"to the guarded lease key, got {key!r} for {command!r}"
+            )
