@@ -109,3 +109,68 @@ class TestUnconditionalForceStillHistoryRewriting:
             "git push --set-upstream origin feature"
         )
         assert dangerous is False
+
+
+class TestUnconditionalForceWinsOverLease:
+    """A command carrying BOTH an unconditional force token and a lease flag is
+    an unconditional history rewrite — git's `--force` defeats the stale-ref
+    rejection the lease relies on (`set_ref_status_for_push` in remote.c:
+    `force_ref_update = ref->force || force_update`). The lease rule must decline
+    such a command so it cannot be classified as the allowlistable guarded key,
+    which would let an unconditional force push run unattended.
+    """
+
+    def test_lease_then_unconditional_force_is_history_rewriting(self):
+        dangerous, key, _ = detect_dangerous_command(
+            "git push --force-with-lease --force origin main"
+        )
+        assert dangerous is True
+        assert key == _HISTORY_REWRITE_KEY, (
+            "a command with both --force-with-lease and --force is an "
+            f"unconditional history rewrite, got {key!r}"
+        )
+
+    def test_unconditional_force_then_lease_is_history_rewriting(self):
+        """Order reversed — still an unconditional history rewrite."""
+        dangerous, key, _ = detect_dangerous_command(
+            "git push --force --force-with-lease origin main"
+        )
+        assert dangerous is True
+        assert key == _HISTORY_REWRITE_KEY, (
+            "--force present anywhere makes the push unconditional regardless of "
+            f"the lease flag, got {key!r}"
+        )
+
+    def test_lease_with_short_f_is_history_rewriting(self):
+        """The short unconditional flag `-f` also wins over a lease flag."""
+        dangerous, key, _ = detect_dangerous_command(
+            "git push --force-with-lease -f origin main"
+        )
+        assert dangerous is True
+        assert key == _HISTORY_REWRITE_SHORT_KEY, (
+            "-f present alongside --force-with-lease is an unconditional history "
+            f"rewrite, got {key!r}"
+        )
+
+
+class TestLeaseOnlyFormsUnchanged:
+    """Guard against regressing the very thing the split was filed to enable:
+    a lease flag with NO sibling unconditional force token stays in the guarded,
+    allowlistable category.
+    """
+
+    def test_lease_only_forms_stay_guarded(self):
+        commands = [
+            "git push --force-with-lease origin topic/x",
+            "git push --force-with-lease=main origin topic/x",
+            "git push --force-if-includes origin topic/x",
+            "git push --force-w origin topic/x",
+            "git push --force-i origin topic/x",
+            "git push origin topic/x --force-with-lease",
+        ]
+        for command in commands:
+            dangerous, key, _ = detect_dangerous_command(command)
+            assert dangerous is True, command
+            assert key not in _HISTORY_REWRITE_KEYS, (
+                f"lease-only push must stay guarded, got {key!r} for {command!r}"
+            )

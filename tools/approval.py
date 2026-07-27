@@ -777,12 +777,29 @@ DANGEROUS_PATTERNS = [
     # the description string) can allow the guarded form without also allowing
     # an unconditional history rewrite. This pattern is ordered BEFORE the
     # unconditional `--forc[a-z]*` rule so a lease-guarded push is claimed here
-    # first; the unconditional rule is additionally anchored with `(?!-)` so it
-    # cannot also match the hyphenated lease forms. Both `--force-with-lease`
-    # and `--force-if-includes` (plus git's unambiguous long-flag prefix
-    # abbreviations like `--force-w`, `--force-i`, and an optional `=<ref>`
-    # value) are caught via the `-(?:w|i)` discriminator after the force prefix.
-    (r'\bgit\s+push\b.*--forc[a-z]*-(?:w|i)[a-z-]*', "git force push with lease (guarded; cannot overwrite others' work)"),
+    # first. Both `--force-with-lease` and `--force-if-includes` (plus git's
+    # unambiguous long-flag prefix abbreviations like `--force-w`, `--force-i`,
+    # and an optional `=<ref>` value) are caught via the `-(?:w|i)` discriminator
+    # after the force prefix.
+    #
+    # CRITICAL — unconditional `--force` WINS even when a lease flag is also
+    # present. git's own precedence (`set_ref_status_for_push` in remote.c:
+    # `force_ref_update = ref->force || force_update`, with the note "--force
+    # will defeat any rejection implemented by the rules above") means an
+    # unconditional `--force`/`-f` anywhere on the line makes the push a real
+    # history rewrite regardless of a lease flag being present too. Since these
+    # patterns match with re.search over the raw string (not a parsed argv),
+    # ordering the lease rule first is NOT enough: `git push --force
+    # --force-with-lease` would otherwise be claimed by the lease rule and get
+    # the guarded (allowlistable) key — a hole that lets an unconditional force
+    # push run unattended. The leading `(?!.*<uncond>)` negative lookahead makes
+    # the lease rule DECLINE the match whenever a sibling unconditional force
+    # token (`--forc[a-z]*` as a complete token, or `-f`) appears anywhere in
+    # the command, so such a command falls through to the unconditional rule
+    # below and is classified as the history rewrite it actually is. Do NOT
+    # "simplify" this lookahead away — it is what keeps the split from weakening
+    # the unconditional-force gate.
+    (r'\bgit\s+push\b(?!.*(?:--forc[a-z]*(?=[\s=;|&]|$)|(?<![\w-])-f(?=[\s;|&]|$))).*--forc[a-z]*-(?:w|i)[a-z-]*', "git force push with lease (guarded; cannot overwrite others' work)"),
     # Unconditional force rewrites remote history and can silently clobber
     # another party's push. `--forc[a-z]*` keeps matching git's abbreviated
     # long-flag prefixes (`--forc`, `--force`, `--forced`); the `(?!-)`
