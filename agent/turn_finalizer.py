@@ -28,6 +28,90 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 
 
+def _last_tool_name_in(messages) -> str | None:
+    """Name of the most recent tool call in *messages*, or ``None``.
+
+    This is the concrete signpost of what the timed-out run was doing when the
+    budget ran out — the last tool it invoked. The re-claim reads it to know
+    where the prior run stopped rather than inferring it. Walks backward over
+    the assistant rows that carry ``tool_calls`` and returns the last call's
+    function name; defensive against malformed rows (test-double density on this
+    path is high).
+    """
+    for m in reversed(messages or []):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        tcs = m.get("tool_calls")
+        if not tcs:
+            continue
+        try:
+            fn = tcs[-1].get("function", {})
+            name = fn.get("name")
+        except (AttributeError, IndexError, TypeError):
+            name = None
+        if name:
+            return name
+    return None
+
+
+def _build_resume_note(
+    *,
+    api_call_count: int,
+    budget_max: int,
+    branch: str | None,
+    pr_url: str | None,
+    last_tool: str | None,
+) -> str:
+    """Compose the budget-exhaustion resume note in the ``[audit]`` convention.
+
+    The note is a structured, machine-legible handoff — NOT free prose — so a
+    re-claiming run can act on it without parsing ambiguity. It mirrors the
+    ``[audit] actor=… stage=…\\nnotes: key=val …`` shape the one-card move
+    helpers already use (the precedent the card asks us to follow rather than
+    inventing a second format).
+
+    Only facts the exhausted run can know for certain are recorded: the budget
+    it ran out of, the branch it was working on, any in-flight PR already handed
+    off on the card, and the last tool it was running. ``next_step`` is a
+    concrete directive for the re-claim rather than a guessed semantic step —
+    the honest fact is "resume from the in-flight artifact / last tool", which
+    is reading, not inference.
+    """
+    notes: list[str] = [
+        "reason=budget_exhausted",
+        f"budget_used={api_call_count}",
+        f"budget_max={budget_max}",
+    ]
+    if branch:
+        notes.append(f"branch={branch}")
+    if pr_url:
+        notes.append(f"artifact={pr_url}")
+    if last_tool:
+        notes.append(f"last_tool={last_tool}")
+
+    # A concrete, non-ambiguous next-step directive for the re-claim. Point it
+    # at the durable artifact when one exists (verify PR state, land the pending
+    # change) and otherwise at continuing from where the last tool left off.
+    if pr_url:
+        next_step = (
+            "resume the in-flight PR: verify its state and CI, then land the "
+            "pending change and post the ready-for-review handoff"
+        )
+    elif last_tool:
+        next_step = (
+            f"continue the work-in-progress from the last tool ({last_tool}); "
+            "the branch already carries partial state"
+        )
+    else:
+        next_step = "re-orient off the card and resume the in-progress work"
+    notes.append(f"next_step={next_step}")
+
+    return (
+        "[audit] actor=worker stage=resume\n"
+        "notes: " + " ".join(notes)
+    )
+
+
 def _is_pure_tool_call_tail(msg: dict) -> bool:
     """An assistant row with ``tool_calls`` but no visible text content of its own.
 
@@ -157,6 +241,41 @@ def finalize_turn(
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
+                    # Record an explicit, machine-legible resume note on the
+                    # card BEFORE the terminal timeout event, so the
+                    # dispatcher's re-claim reads where this run stopped instead
+                    # of inferring it. The note lands in the card's comment
+                    # thread — the same place other handoff context lives — in
+                    # the ``[audit]`` convention (the precedent, not a second
+                    # format). This adds legibility; it does NOT suppress the
+                    # genuine timeout recorded just below.
+                    try:
+                        _pr_url = None
+                        try:
+                            for _c in _kb.list_comments(_conn, _kanban_task):
+                                _pr_url = _kb._canonical_pr_url(
+                                    getattr(_c, "body", "") or ""
+                                )
+                                if _pr_url:
+                                    break
+                        except Exception:
+                            _pr_url = None
+                        _note = _build_resume_note(
+                            api_call_count=api_call_count,
+                            budget_max=agent.max_iterations,
+                            branch=os.environ.get("HERMES_KANBAN_BRANCH") or None,
+                            pr_url=_pr_url,
+                            last_tool=_last_tool_name_in(messages),
+                        )
+                        _kb.add_comment(
+                            _conn, _kanban_task, author="worker", body=_note,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to record resume note for task %s",
+                            _kanban_task,
+                            exc_info=True,
+                        )
                     _kb._record_task_failure(
                         _conn,
                         _kanban_task,
