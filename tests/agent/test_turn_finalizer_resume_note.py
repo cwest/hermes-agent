@@ -136,7 +136,7 @@ def test_budget_exhaustion_records_resume_note_with_artifact_and_next_step(monke
     artifact and a concrete next step, in the ``[audit]`` convention."""
     comment, record, _order = _wire_kanban(monkeypatch)
     # A prior comment on the card carries the in-flight PR URL (the
-    # ready-for-review handoff the implementer posted before running out).
+    # ready-for-review handoff the prior run posted before running out).
     pr_url = "https://github.com/cwest/knowledge-base/pull/449"
     monkeypatch.setattr(
         "hermes_cli.kanban_db.list_comments",

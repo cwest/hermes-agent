@@ -78,7 +78,7 @@ def _build_resume_note(
     is reading, not inference.
     """
     notes: list[str] = [
-        f"reason=budget_exhausted",
+        "reason=budget_exhausted",
         f"budget_used={api_call_count}",
         f"budget_max={budget_max}",
     ]
