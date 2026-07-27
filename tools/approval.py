@@ -769,7 +769,26 @@ DANGEROUS_PATTERNS = [
     # this cannot collide with another reset mode. It also does not match
     # `--help`, which git special-cases before mode resolution.
     (r'\bgit\s+reset\s+--h(?:a(?:r(?:d)?)?)?\b', "git reset --hard (destroys uncommitted changes)"),
-    (r'\bgit\s+push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
+    # `--force-with-lease` / `--force-if-includes` are the *guarded* force: git
+    # aborts the push if the remote ref advanced since the last fetch, so they
+    # cannot overwrite a ref another party moved — the exact hazard the
+    # unconditional-force gate exists to prevent. Classify them as their own
+    # non-history-rewriting category so the permanent-allowlist (which keys off
+    # the description string) can allow the guarded form without also allowing
+    # an unconditional history rewrite. This pattern is ordered BEFORE the
+    # unconditional `--forc[a-z]*` rule so a lease-guarded push is claimed here
+    # first; the unconditional rule is additionally anchored with `(?!-)` so it
+    # cannot also match the hyphenated lease forms. Both `--force-with-lease`
+    # and `--force-if-includes` (plus git's unambiguous long-flag prefix
+    # abbreviations like `--force-w`, `--force-i`, and an optional `=<ref>`
+    # value) are caught via the `-(?:w|i)` discriminator after the force prefix.
+    (r'\bgit\s+push\b.*--forc[a-z]*-(?:w|i)[a-z-]*', "git force push with lease (guarded; cannot overwrite others' work)"),
+    # Unconditional force rewrites remote history and can silently clobber
+    # another party's push. `--forc[a-z]*` keeps matching git's abbreviated
+    # long-flag prefixes (`--forc`, `--force`, `--forced`); the `(?!-)`
+    # lookahead after the flag boundary ensures this does NOT also claim the
+    # hyphenated lease forms handled by the rule above.
+    (r'\bgit\s+push\b.*--forc[a-z]*\b(?!-)', "git force push (rewrites remote history)"),
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
