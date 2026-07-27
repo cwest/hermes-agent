@@ -663,3 +663,97 @@ class TestAllowedBoardsGuard:
         finally:
             kbcli.kb.create_board = orig
         assert rc != 0
+
+
+# ---------------------------------------------------------------------------
+# allowed_boards guard on the implicit connect()/init_db() create path
+# ---------------------------------------------------------------------------
+
+class TestConnectAllowedBoardsGuard:
+    """``connect(board=<slug>)`` must not materialize a board behind the
+    ``allowed_boards`` guard.
+
+    ``create_board`` was the documented single choke point, but any caller
+    reaching ``connect(board=<unknown-slug>)`` used to run an unconditional
+    ``mkdir -p`` and silently create ``<root>/kanban/boards/<slug>/`` +
+    a fresh ``kanban.db``. These tests drive the real config-resolution
+    chain by writing ``config.yaml`` under the isolated ``HERMES_HOME``,
+    exercising ``_allowed_boards_config`` for real (no mocks).
+    """
+
+    @staticmethod
+    def _write_allowed(home: Path, slugs: list[str]) -> None:
+        body = "kanban:\n  allowed_boards:\n"
+        for s in slugs:
+            body += f"    - {s}\n"
+        (home / "config.yaml").write_text(body, encoding="utf-8")
+
+    def test_blocked_new_board_raises_and_leaves_no_dir(self, fresh_home):
+        # allowed_boards=[default]; a connect() for an unknown slug must raise
+        # rather than create the board directory as a side effect.
+        self._write_allowed(fresh_home, ["default"])
+        with pytest.raises(ValueError, match="restricted"):
+            kb.connect(board="apitest-probe")
+        # Regression: no board directory nor DB left on disk after refusal.
+        assert not kb.board_exists("apitest-probe")
+        assert not (fresh_home / "kanban" / "boards" / "apitest-probe").exists()
+
+    def test_allowed_new_board_connects(self, fresh_home):
+        # A slug on the allow-list connects and materializes normally.
+        self._write_allowed(fresh_home, ["knowledge"])
+        conn = kb.connect(board="knowledge")
+        try:
+            assert kb.board_exists("knowledge")
+        finally:
+            conn.close()
+
+    def test_existing_board_outside_list_still_connects(self, fresh_home):
+        # Create a board while unrestricted, then restrict the allow-list to
+        # exclude it. Reads of an existing board must never break (mkdir -p
+        # contract): connect() still works.
+        kb.create_board("legacy", kanban_cfg={})
+        assert kb.board_exists("legacy")
+        self._write_allowed(fresh_home, ["default"])
+        conn = kb.connect(board="legacy")
+        try:
+            assert kb.board_exists("legacy")
+        finally:
+            conn.close()
+
+    def test_guard_disabled_passthrough(self, fresh_home):
+        # With allowed_boards unset (no config), connect(board=<new>) behaves
+        # exactly as today — the upstream multi-board feature is preserved.
+        conn = kb.connect(board="freshproj")
+        try:
+            assert kb.board_exists("freshproj")
+        finally:
+            conn.close()
+
+    def test_default_always_connects(self, fresh_home):
+        # The base board can never be locked out, even when the allow-list
+        # omits it.
+        self._write_allowed(fresh_home, ["knowledge"])
+        conn = kb.connect(board="default")
+        try:
+            assert kb.board_exists("default")
+        finally:
+            conn.close()
+
+    def test_init_db_blocked_new_board_raises(self, fresh_home):
+        # init_db(board=<slug>) is a sibling create path and must be guarded
+        # too — the fix belongs at the slug→path resolution, not one caller.
+        self._write_allowed(fresh_home, ["default"])
+        with pytest.raises(ValueError, match="restricted"):
+            kb.init_db(board="apitest-probe")
+        assert not (fresh_home / "kanban" / "boards" / "apitest-probe").exists()
+
+    def test_explicit_db_path_is_unguarded(self, fresh_home):
+        # connect(db_path=...) has no board slug to check — legacy/test
+        # callers that pass a raw path are never gated by allowed_boards.
+        self._write_allowed(fresh_home, ["default"])
+        raw = fresh_home / "raw.db"
+        conn = kb.connect(db_path=raw)
+        try:
+            assert raw.exists()
+        finally:
+            conn.close()

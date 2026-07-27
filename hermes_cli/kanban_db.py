@@ -883,19 +883,7 @@ def create_board(
     if not normed:
         raise ValueError("board slug is required")
 
-    allowed = _allowed_boards_config(kanban_cfg)
-    if allowed is not None:
-        # ``default`` is always implicitly permitted; existing boards are
-        # honoured (mkdir -p) so a restricted config never breaks reads.
-        if (
-            normed != DEFAULT_BOARD
-            and normed not in allowed
-            and not board_exists(normed)
-        ):
-            raise ValueError(
-                f"board creation is restricted to {sorted(allowed)}; "
-                f"'{normed}' is not permitted"
-            )
+    _guard_board_creation_allowed(normed, kanban_cfg=kanban_cfg)
 
     meta = write_board_metadata(
         normed,
@@ -905,9 +893,46 @@ def create_board(
         color=color,
         default_workdir=default_workdir,
     )
-    # Touch the DB so list_boards() sees it immediately.
+    # Touch the DB so list_boards() sees it immediately. The metadata was
+    # just written, so ``board_exists`` is now True and the guard inside
+    # ``init_db`` → ``connect`` passes trivially (mkdir -p semantics).
     init_db(board=normed)
     return meta
+
+
+def _guard_board_creation_allowed(
+    slug: str, *, kanban_cfg: Optional[dict] = None
+) -> None:
+    """Raise if creating ``slug`` would violate the ``allowed_boards`` guard.
+
+    This is the ONE home for the opt-in single-board invariant. It is called
+    from :func:`create_board` (the documented choke point) AND from the
+    implicit board-materialization path in :func:`connect` / :func:`init_db`,
+    so a library caller that reaches ``connect(board=<unknown-slug>)`` can no
+    longer walk around the guard by triggering the unconditional ``mkdir -p``
+    (the historical hole: a stray board created behind ``allowed_boards``).
+
+    Semantics (identical to what ``create_board`` enforced before):
+
+    * ``allowed_boards`` absent / ``None`` / empty → NO restriction, so the
+      upstream multi-board feature is fully preserved for other installs.
+    * ``default`` is always implicitly permitted — the system can never lock
+      itself out of its own base board.
+    * An already-existing board is honoured even when it sits outside the
+      allow-list — a restricted config must never break reads of / connects
+      to an existing board (the documented ``mkdir -p`` contract).
+
+    ``slug`` is expected to be pre-normalized by the caller.
+    """
+    allowed = _allowed_boards_config(kanban_cfg)
+    if allowed is None:
+        return
+    if slug == DEFAULT_BOARD or slug in allowed or board_exists(slug):
+        return
+    raise ValueError(
+        f"board creation is restricted to {sorted(allowed)}; "
+        f"'{slug}' is not permitted"
+    )
 
 
 def _allowed_boards_config(kanban_cfg: Optional[dict] = None) -> Optional[set[str]]:
@@ -2259,6 +2284,14 @@ def connect(
     if db_path is not None:
         path = db_path
     else:
+        # Guard the implicit-create side effect BEFORE any mkdir: a
+        # ``connect(board=<unknown-slug>)`` for a board disallowed by
+        # ``kanban.allowed_boards`` must raise rather than silently
+        # materialize the board directory + DB. Only gated when a board
+        # slug is the path source; explicit ``db_path`` callers (legacy,
+        # tests) are never affected. Routes through the same single-home
+        # invariant helper ``create_board`` uses so the policy cannot drift.
+        _guard_board_creation_allowed(_normalize_board_slug(board) or DEFAULT_BOARD)
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2392,6 +2425,9 @@ def init_db(
     if db_path is not None:
         path = db_path
     else:
+        # Same implicit-create guard as connect(): a disallowed board slug
+        # must not be materialized via this sibling entry point either.
+        _guard_board_creation_allowed(_normalize_board_slug(board) or DEFAULT_BOARD)
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
