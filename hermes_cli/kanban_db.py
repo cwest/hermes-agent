@@ -936,24 +936,39 @@ def _guard_board_creation_allowed(
 
 
 def _kanban_root_anchors_db() -> bool:
-    """True when the DB actually in use lives under ``HERMES_KANBAN_HOME``.
+    """True when the caller DECLARED an isolated root AND the DB actually lives
+    under it.
 
-    ``HERMES_KANBAN_HOME`` being set is NOT sufficient to conclude the caller
-    is isolated: :func:`kanban_db_path` gives ``HERMES_KANBAN_DB`` strictly
-    higher precedence, so a process can point the kanban ROOT at a throwaway
-    dir while every write still lands in the live ``kanban.db`` (the dispatcher
-    injects ``HERMES_KANBAN_DB`` into every worker's env). Reading the isolated
-    root's (absent) config in that state would silently disarm the guard on the
-    LIVE board — strictly worse than the bug this whole change fixes.
+    Two conditions must BOTH hold:
 
-    The authoritative question is therefore not "is the root env var set?" but
-    "does the DB I am about to write actually live under that root?". Both
-    inputs are already derivable from existing functions; this asks the derived
-    fact instead of trusting a proxy signal.
+    1. ``HERMES_KANBAN_HOME`` is explicitly set. This is what makes the root a
+       *declared* isolation rather than the ambient shared default. Without an
+       explicit override, :func:`kanban_home` falls back to
+       ``get_default_hermes_root()`` — the shared ``<root>`` — whose default
+       DB ``<root>/kanban.db`` is trivially anchored under it. Treating that as
+       "isolated" would fire the direct-read branch in the ORDINARY live case
+       and read ``<root>/config.yaml`` instead of the active profile's config;
+       in profile mode (``HERMES_HOME=<root>/profiles/<name>``) those are
+       different files, so the live ``allowed_boards`` restriction would be
+       silently dropped and the guard disarmed on the live board.
+    2. The resolved DB actually lives under that declared root. Setting the
+       root env var is NOT sufficient on its own: :func:`kanban_db_path` gives
+       ``HERMES_KANBAN_DB`` strictly higher precedence, so a process can point
+       the kanban ROOT at a throwaway dir while every write still lands in the
+       live ``kanban.db`` (the dispatcher injects ``HERMES_KANBAN_DB`` into
+       every worker's env). Reading the isolated root's (absent) config in that
+       state would likewise disarm the guard on the LIVE board.
+
+    So the authoritative question is "did the caller declare an isolated root,
+    and does the DB I am about to write actually live under it?". Both inputs
+    are already derivable from existing env vars / functions; this asks the
+    derived fact instead of trusting a single proxy signal.
 
     Any resolution failure degrades to ``False`` — i.e. fall back to the live
     ``load_config()`` path, which is the safe (restriction-preserving) default.
     """
+    if not os.environ.get("HERMES_KANBAN_HOME", "").strip():
+        return False
     try:
         root = kanban_home().resolve()
         db = kanban_db_path().resolve()

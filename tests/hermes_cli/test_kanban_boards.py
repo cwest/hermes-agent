@@ -995,3 +995,108 @@ class TestAllowedBoardsGuardArmedWhenDbPinnedAtLiveRoot:
         monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
         kb._INITIALIZED_PATHS.clear()
         assert kb._kanban_root_anchors_db() is True
+
+
+class TestAllowedBoardsGuardArmedInProfileMode:
+    """The isolated-root branch must fire only when the caller DECLARED an
+    isolated root (``HERMES_KANBAN_HOME`` explicitly set), not for the ambient
+    shared default root.
+
+    Regression (round-2 review finding): the DB-anchoring predicate keyed off
+    "does the resolved DB live under ``kanban_home()``?" alone. But with NO
+    isolation env set, ``kanban_home()`` returns the shared default root and the
+    default DB ``<root>/kanban.db`` is trivially anchored under it — so the
+    predicate was true in the ORDINARY live case. The direct-read branch then
+    read ``<root>/config.yaml`` instead of the active profile's config. In
+    profile mode (``HERMES_HOME=<root>/profiles/<name>``) those are different
+    files: ``hermes config set`` writes the profile config, so
+    ``allowed_boards`` naturally lives in ``<root>/profiles/<name>/config.yaml``
+    while the shared-root ``<root>/config.yaml`` is absent → unrestricted → the
+    guard silently DISARMED on the live board.
+
+    ``load_config()`` reads the active profile's config; the shared-root direct
+    read does not. So the guard must fall through to ``load_config()`` whenever
+    ``HERMES_KANBAN_HOME`` is unset.
+    """
+
+    @staticmethod
+    def _profile_mode(tmp_path, monkeypatch, *, profile_slugs, shared_slugs=None):
+        """Wire a profile-mode layout: ``HERMES_HOME=<root>/profiles/<name>``.
+
+        The PROFILE config restricts ``allowed_boards`` to ``profile_slugs``.
+        The shared-root ``<root>/config.yaml`` is absent unless ``shared_slugs``
+        is given. No kanban env vars are set — this is the ordinary live case.
+
+        Returns ``(root, profile_home)``.
+        """
+        root = tmp_path / "root"
+        profile_home = root / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+
+        def _body(slugs):
+            b = "kanban:\n  allowed_boards:\n"
+            for s in slugs:
+                b += f"    - {s}\n"
+            return b
+
+        (profile_home / "config.yaml").write_text(
+            _body(profile_slugs), encoding="utf-8"
+        )
+        if shared_slugs is not None:
+            (root / "config.yaml").write_text(_body(shared_slugs), encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        for var in (
+            "HERMES_KANBAN_HOME",
+            "HERMES_KANBAN_DB",
+            "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        try:
+            import hermes_constants
+            hermes_constants._cached_default_hermes_root = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        kb._INITIALIZED_PATHS.clear()
+        return root, profile_home
+
+    def test_profile_config_restriction_is_honoured(self, tmp_path, monkeypatch):
+        # allowed_boards in the PROFILE config, shared-root config absent,
+        # no kanban isolation env. The allow-list must resolve from the profile
+        # config via load_config() — never from the (absent) shared-root config.
+        self._profile_mode(tmp_path, monkeypatch, profile_slugs=["default"])
+        assert kb._allowed_boards_config() == {"default"}
+
+    def test_profile_mode_refuses_stray_board(self, tmp_path, monkeypatch):
+        # Ground-truth parity: the base refused a stray board in this exact
+        # state; the head must too. Guard stays armed on the live board.
+        self._profile_mode(tmp_path, monkeypatch, profile_slugs=["default"])
+        with pytest.raises(ValueError, match=r"restricted to \['default'\]"):
+            kb.create_board("stray")
+        with pytest.raises(ValueError, match=r"restricted to \['default'\]"):
+            kb.connect(board="stray")
+        assert not kb.board_exists("stray")
+
+    def test_unset_kanban_home_never_anchors(self, tmp_path, monkeypatch):
+        # The predicate must be False whenever HERMES_KANBAN_HOME is unset, even
+        # though the default DB is anchored under the ambient shared root.
+        self._profile_mode(tmp_path, monkeypatch, profile_slugs=["default"])
+        assert kb._kanban_root_anchors_db() is False
+
+    def test_shared_root_config_does_not_override_profile(
+        self, tmp_path, monkeypatch
+    ):
+        # Even when the shared-root config exists, an unset HERMES_KANBAN_HOME
+        # means the PROFILE config governs (load_config path), not the shared
+        # root's direct read. The profile restricts to [default]; a shared-root
+        # list of [knowledge] must NOT leak in to permit a stray board.
+        self._profile_mode(
+            tmp_path,
+            monkeypatch,
+            profile_slugs=["default"],
+            shared_slugs=["knowledge"],
+        )
+        assert kb._allowed_boards_config() == {"default"}
+        with pytest.raises(ValueError, match=r"restricted to \['default'\]"):
+            kb.create_board("knowledge")
