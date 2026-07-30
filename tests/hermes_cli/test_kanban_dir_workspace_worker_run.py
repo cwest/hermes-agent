@@ -53,15 +53,27 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _make_deploy_clone(tmp_path: Path) -> Path:
-    repo = tmp_path / "office"
-    repo.mkdir()
+    """A deploy clone on ``main`` with a real tracked upstream.
+
+    A genuine deploy clone tracks an upstream so the post-merge
+    ``git pull --ff-only`` can fast-forward — the invariant the resolver's guard
+    protects. Model it (bare origin + clone whose ``main`` tracks ``origin/main``)
+    so the happy-path worker run reflects a real deploy checkout.
+    """
+    bare = tmp_path / "office-origin.git"
     subprocess.run(
-        ["git", "init", "-b", "main", str(repo)],
+        ["git", "init", "--bare", "-b", "main", str(bare)],
+        check=True, capture_output=True, text=True,
+    )
+    repo = tmp_path / "office"
+    subprocess.run(
+        ["git", "clone", str(bare), str(repo)],
         check=True, capture_output=True, text=True,
     )
     (repo / "index.html").write_text("<h1>office</h1>\n", encoding="utf-8")
     _git(repo, "add", "index.html")
     _git(repo, "commit", "-m", "init")
+    _git(repo, "push", "-u", "origin", "main")
     return repo
 
 

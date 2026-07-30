@@ -8857,44 +8857,37 @@ def _git_current_branch(path: Path) -> Optional[str]:
     return branch or None
 
 
-def _git_default_branch(repo_root: Path) -> Optional[str]:
-    """Best-effort resolution of a repo's default (integration) branch.
-
-    Order: the target of ``origin/HEAD`` (what the remote calls default), then
-    a local ``main``/``master`` if either exists, else the currently checked-out
-    branch. Returns ``None`` only when git can't tell us anything (e.g. a bare
-    detached HEAD with no remote and no conventional branch).
-    """
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "symbolic-ref", "--short",
-             "refs/remotes/origin/HEAD"],
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=30,
-            check=False,
-        )
-        if result.returncode == 0:
-            out = (result.stdout or "").strip()
-            # e.g. "origin/main" -> "main"
-            if out.startswith("origin/"):
-                return out[len("origin/"):]
-            if out:
-                return out
-    except Exception:
-        pass
-    for candidate in ("main", "master"):
-        if _git_branch_exists(repo_root, candidate):
-            return candidate
-    return _git_current_branch(repo_root)
-
-
 def _is_linked_worktree_checkout(path: Path) -> bool:
     git_dir = _git_dir(path)
     common_dir = _git_common_dir(path)
     if git_dir is None or common_dir is None:
         return False
     return git_dir != common_dir
+
+
+def _git_has_upstream(path: Path) -> bool:
+    """True when HEAD tracks an upstream — i.e. ``git pull --ff-only`` can run.
+
+    This is the real invariant the deploy-clone guard protects: a clone whose
+    checked-out branch has a configured upstream can fast-forward. It is False
+    for a detached HEAD (no symbolic HEAD to track from) and for a local-only
+    branch with no ``branch.<name>.remote`` — exactly the states where an
+    ``--ff-only`` pull cannot work. Branch NAME is irrelevant: a fork on its own
+    ``cwest/integration`` that tracks ``origin/cwest/integration`` is fine, while
+    a repo camped on a local ``main`` with no upstream is not.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--abbrev-ref",
+             "--symbolic-full-name", "@{upstream}"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and bool((result.stdout or "").strip())
 
 
 def _nearest_existing_path(path: Path) -> Path:
@@ -9130,23 +9123,31 @@ def _resolve_dir_workspace(task: Task) -> Path:
     if repo_root is None or p.resolve(strict=False) != repo_root:
         return p
 
-    # Guard: a deploy clone must be on its default branch. If a prior buggy
-    # worker left it on a topic branch, fail loudly rather than cutting a
-    # worktree off a dirty, wrong-branch base and silently succeeding.
-    default_branch = _git_default_branch(repo_root)
-    current_branch = _git_current_branch(repo_root)
-    if (
-        default_branch is not None
-        and current_branch is not None
-        and current_branch != default_branch
-    ):
-        raise RuntimeError(
-            f"deploy clone {repo_root} is not on its default branch "
-            f"{default_branch!r} (found {current_branch!r}); a card worker must "
-            f"never leave a dir-workspace repo root off its default branch. "
-            f"Restore it with `git -C {repo_root} checkout {default_branch}` "
-            f"before dispatching."
-        )
+    # A linked worktree's own root IS its git toplevel, so it reaches here too —
+    # but a worktree correctly sitting on its own topic branch is the whole point
+    # of a worktree, not a deploy clone left off main. Skip the fast-forward
+    # guard for it; the guard exists only for a true shared clone.
+    if not _is_linked_worktree_checkout(repo_root):
+        # Guard: a shared deploy clone must be able to fast-forward — that is the
+        # post-merge ``git pull --ff-only`` this redirect exists to protect. The
+        # real invariant is "HEAD tracks an upstream", NOT "the branch is named
+        # main": a fork legitimately deploys from its own integration branch
+        # (e.g. ``cwest/integration`` tracking ``origin/cwest/integration``). We
+        # refuse only the states where ``--ff-only`` genuinely cannot run — a
+        # detached HEAD, or a local-only branch with no upstream.
+        if not _git_has_upstream(repo_root):
+            current_branch = _git_current_branch(repo_root)
+            where = (
+                f"branch {current_branch!r}" if current_branch else "a detached HEAD"
+            )
+            raise RuntimeError(
+                f"deploy clone {repo_root} on {where} cannot be safely "
+                f"fast-forwarded: its HEAD does not track an upstream, so the "
+                f"post-merge `git pull --ff-only` this workspace depends on "
+                f"cannot run. A card worker must never build on a shared clone "
+                f"whose deploy branch cannot fast-forward. Put the clone on a "
+                f"branch that tracks its upstream before dispatching."
+            )
 
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     target = repo_root / ".worktrees" / task.id
