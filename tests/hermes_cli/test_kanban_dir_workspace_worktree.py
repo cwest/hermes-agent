@@ -206,3 +206,90 @@ def test_dir_deploy_clone_off_main_fails_loudly(kanban_home, tmp_path):
 
     with pytest.raises(RuntimeError, match="not on its default branch|off .*main"):
         kb.resolve_workspace(task)
+
+
+def _exclude_lines(repo: Path) -> list[str]:
+    common = kb._git_common_dir(repo)
+    assert common is not None
+    exclude = common / "info" / "exclude"
+    if not exclude.exists():
+        return []
+    return exclude.read_text(encoding="utf-8").splitlines()
+
+
+def test_dir_repo_root_excludes_worktrees_dir_from_anchor(kanban_home, tmp_path):
+    """The anchor clone gets ``.worktrees/`` in info/exclude, version-independent.
+
+    On git >= 2.54, ``git worktree add <repo>/.worktrees/<id>`` leaves the
+    anchor clone showing ``?? .worktrees/`` in ``git status`` — a dirty tree on
+    a deploy clone pinned to ``main``, which breaks the post-merge
+    ``git pull --ff-only`` this redirect exists to protect. Older git hid it, so
+    ``test_dir_repo_root_resolves_to_worktree_not_in_place``'s clean-tree
+    assertion only failed on newer git. This test asserts the actual fix — the
+    exclude entry — so it catches a regression on ANY git version.
+    """
+    repo = _make_repo(tmp_path)
+
+    # Precondition: the anchor does not already ignore .worktrees/.
+    assert ".worktrees/" not in _exclude_lines(repo)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="office feature",
+            workspace_kind="dir", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+
+    kb.resolve_workspace(task)
+
+    # The exclude now carries the entry, so the worktree dir never dirties the
+    # anchor regardless of git version.
+    assert ".worktrees/" in _exclude_lines(repo)
+    # And the anchor is clean — the assertion that fails on git 2.54 without
+    # the fix.
+    assert _git(repo, "status", "--porcelain").strip() == ""
+
+
+def test_dir_repo_root_exclude_is_idempotent(kanban_home, tmp_path):
+    """Resolving twice (or with a pre-existing entry) never duplicates the line."""
+    repo = _make_repo(tmp_path)
+
+    with kb.connect() as conn:
+        t1 = kb.create_task(
+            conn, title="card one",
+            workspace_kind="dir", workspace_path=str(repo),
+        )
+        t2 = kb.create_task(
+            conn, title="card two",
+            workspace_kind="dir", workspace_path=str(repo),
+        )
+        task1 = kb.get_task(conn, t1)
+        task2 = kb.get_task(conn, t2)
+
+    kb.resolve_workspace(task1)
+    kb.resolve_workspace(task2)
+
+    lines = _exclude_lines(repo)
+    assert lines.count(".worktrees/") == 1
+
+
+def test_worktree_kind_repo_root_also_excludes_worktrees_dir(kanban_home, tmp_path):
+    """The ``worktree`` kind writes under .worktrees/ too — same exclude fix.
+
+    A ``worktree``-kind task whose workspace_path names a repo root anchors a
+    linked worktree at ``<repo>/.worktrees/<id>``, so it shares the exact
+    dirty-anchor exposure. The exclude must be applied there as well.
+    """
+    repo = _make_repo(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="worktree card",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+
+    kb.resolve_workspace(task)
+
+    assert ".worktrees/" in _exclude_lines(repo)
+    assert _git(repo, "status", "--porcelain").strip() == ""

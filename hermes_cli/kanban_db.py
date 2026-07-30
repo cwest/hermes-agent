@@ -8915,6 +8915,58 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _ensure_worktree_dir_excluded(repo_root: Path, target: Path) -> None:
+    """Keep ``.worktrees/`` from dirtying the anchor clone's working tree.
+
+    ``git worktree add <repo>/.worktrees/<id>`` creates a directory *inside*
+    the anchor clone's working tree. On git >= 2.54 that directory shows up as
+    an untracked entry (``?? .worktrees/``) in ``git status`` of the anchor —
+    which dirties a deploy clone pinned to ``main`` and breaks the post-merge
+    ``git pull --ff-only`` this whole redirect exists to protect. (Older git,
+    e.g. 2.50, happened to hide it, so the hazard is version-dependent and only
+    surfaced on the CI runner.)
+
+    Fix it at the source: idempotently add ``.worktrees/`` to the anchor's
+    ``$GIT_COMMON_DIR/info/exclude``. Using ``info/exclude`` (not a committed
+    ``.gitignore``) means we never modify a tracked file in the shared clone —
+    the deploy checkout stays byte-identical to ``origin/main`` while its
+    worktrees live untracked-and-ignored underneath it. No-op unless ``target``
+    is the conventional ``<repo>/.worktrees/*`` layout under this clone.
+    """
+    top = _git_toplevel(repo_root)
+    if top is None:
+        return
+    try:
+        rel = target.resolve(strict=False).relative_to(top.resolve(strict=False))
+    except ValueError:
+        # target is not under the anchor's working tree (a detached target
+        # path); nothing in the anchor tree to exclude.
+        return
+    parts = rel.parts
+    if not parts or parts[0] != ".worktrees":
+        return
+    common = _git_common_dir(repo_root)
+    if common is None:
+        return
+    info_dir = common / "info"
+    exclude_file = info_dir / "exclude"
+    entry = ".worktrees/"
+    try:
+        existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
+        # Idempotent: only append when the exact entry is not already a line.
+        if entry not in existing.splitlines():
+            info_dir.mkdir(parents=True, exist_ok=True)
+            prefix = "" if (existing == "" or existing.endswith("\n")) else "\n"
+            with exclude_file.open("a", encoding="utf-8") as fh:
+                fh.write(f"{prefix}{entry}\n")
+    except OSError:
+        # Best-effort: a read-only .git is unusual and not worth failing
+        # dispatch over. The worktree still works; worst case the anchor shows
+        # an untracked .worktrees/ on newer git, which the deploy pull step
+        # tolerates via its own guard.
+        return
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -8922,7 +8974,14 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            # Already materialized. Still ensure the exclude entry exists so a
+            # worktree created before this fix landed doesn't leave the anchor
+            # dirty on newer git.
+            _ensure_worktree_dir_excluded(repo_root, target)
             return
+    # Exclude .worktrees/ from the anchor's working tree BEFORE creating the
+    # worktree, so the anchor clone never registers a dirty untracked entry.
+    _ensure_worktree_dir_excluded(repo_root, target)
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
