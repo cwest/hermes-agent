@@ -8857,6 +8857,38 @@ def _git_current_branch(path: Path) -> Optional[str]:
     return branch or None
 
 
+def _git_default_branch(repo_root: Path) -> Optional[str]:
+    """Best-effort resolution of a repo's default (integration) branch.
+
+    Order: the target of ``origin/HEAD`` (what the remote calls default), then
+    a local ``main``/``master`` if either exists, else the currently checked-out
+    branch. Returns ``None`` only when git can't tell us anything (e.g. a bare
+    detached HEAD with no remote and no conventional branch).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "symbolic-ref", "--short",
+             "refs/remotes/origin/HEAD"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+        if result.returncode == 0:
+            out = (result.stdout or "").strip()
+            # e.g. "origin/main" -> "main"
+            if out.startswith("origin/"):
+                return out[len("origin/"):]
+            if out:
+                return out
+    except Exception:
+        pass
+    for candidate in ("main", "master"):
+        if _git_branch_exists(repo_root, candidate):
+            return candidate
+    return _git_current_branch(repo_root)
+
+
 def _is_linked_worktree_checkout(path: Path) -> bool:
     git_dir = _git_dir(path)
     common_dir = _git_common_dir(path)
@@ -8883,6 +8915,58 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _ensure_worktree_dir_excluded(repo_root: Path, target: Path) -> None:
+    """Keep ``.worktrees/`` from dirtying the anchor clone's working tree.
+
+    ``git worktree add <repo>/.worktrees/<id>`` creates a directory *inside*
+    the anchor clone's working tree. On git >= 2.54 that directory shows up as
+    an untracked entry (``?? .worktrees/``) in ``git status`` of the anchor —
+    which dirties a deploy clone pinned to ``main`` and breaks the post-merge
+    ``git pull --ff-only`` this whole redirect exists to protect. (Older git,
+    e.g. 2.50, happened to hide it, so the hazard is version-dependent and only
+    surfaced on the CI runner.)
+
+    Fix it at the source: idempotently add ``.worktrees/`` to the anchor's
+    ``$GIT_COMMON_DIR/info/exclude``. Using ``info/exclude`` (not a committed
+    ``.gitignore``) means we never modify a tracked file in the shared clone —
+    the deploy checkout stays byte-identical to ``origin/main`` while its
+    worktrees live untracked-and-ignored underneath it. No-op unless ``target``
+    is the conventional ``<repo>/.worktrees/*`` layout under this clone.
+    """
+    top = _git_toplevel(repo_root)
+    if top is None:
+        return
+    try:
+        rel = target.resolve(strict=False).relative_to(top.resolve(strict=False))
+    except ValueError:
+        # target is not under the anchor's working tree (a detached target
+        # path); nothing in the anchor tree to exclude.
+        return
+    parts = rel.parts
+    if not parts or parts[0] != ".worktrees":
+        return
+    common = _git_common_dir(repo_root)
+    if common is None:
+        return
+    info_dir = common / "info"
+    exclude_file = info_dir / "exclude"
+    entry = ".worktrees/"
+    try:
+        existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
+        # Idempotent: only append when the exact entry is not already a line.
+        if entry not in existing.splitlines():
+            info_dir.mkdir(parents=True, exist_ok=True)
+            prefix = "" if (existing == "" or existing.endswith("\n")) else "\n"
+            with exclude_file.open("a", encoding="utf-8") as fh:
+                fh.write(f"{prefix}{entry}\n")
+    except OSError:
+        # Best-effort: a read-only .git is unusual and not worth failing
+        # dispatch over. The worktree still works; worst case the anchor shows
+        # an untracked .worktrees/ on newer git, which the deploy pull step
+        # tolerates via its own guard.
+        return
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -8890,7 +8974,14 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            # Already materialized. Still ensure the exclude entry exists so a
+            # worktree created before this fix landed doesn't leave the anchor
+            # dirty on newer git.
+            _ensure_worktree_dir_excluded(repo_root, target)
             return
+    # Exclude .worktrees/ from the anchor's working tree BEFORE creating the
+    # worktree, so the anchor clone never registers a dirty untracked entry.
+    _ensure_worktree_dir_excluded(repo_root, target)
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
@@ -9002,6 +9093,67 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+def _resolve_dir_workspace(task: Task) -> Path:
+    """Resolve a ``dir`` workspace, redirecting repo roots to a linked worktree.
+
+    A ``dir`` workspace_path that names a git repo ROOT is a shared clone — for
+    the office deploy checkout this is ``~/src/office``, pinned to ``main`` so
+    the post-merge ``git pull --ff-only`` can fast-forward. Handing that clone
+    to a worker means the worker runs ``git checkout <topic>`` in place, which
+    left the deploy clone on a topic branch (with the preview supervisor's
+    runtime WIP in the tree) twice in one session and broke the fast-forward.
+
+    So when the path is a repo root we materialize a per-task linked worktree at
+    ``<repo>/.worktrees/<task-id>`` (the same isolation the ``worktree`` kind
+    uses) and hand THAT to the worker: concurrent workers get distinct trees,
+    runtime files in the shared clone never enter a worker's branch, and the
+    shared clone's branch is never touched. A ``dir`` path that is NOT a repo
+    root (a plain ops directory, or a subdirectory of a repo scoped on purpose)
+    keeps the legacy behavior of returning the directory itself.
+    """
+    if not task.workspace_path:
+        raise ValueError(
+            f"task {task.id} has workspace_kind=dir but no workspace_path"
+        )
+    p = Path(task.workspace_path).expanduser()
+    if not p.is_absolute():
+        raise ValueError(
+            f"task {task.id} has non-absolute workspace_path "
+            f"{task.workspace_path!r}; use an absolute path "
+            f"(relative paths are ambiguous against the dispatcher's CWD)"
+        )
+    p.mkdir(parents=True, exist_ok=True)
+
+    # Only redirect when the path is the repo ROOT — a shared clone. A path
+    # inside a repo (or a non-repo dir) is left untouched.
+    repo_root = _git_toplevel(p)
+    if repo_root is None or p.resolve(strict=False) != repo_root:
+        return p
+
+    # Guard: a deploy clone must be on its default branch. If a prior buggy
+    # worker left it on a topic branch, fail loudly rather than cutting a
+    # worktree off a dirty, wrong-branch base and silently succeeding.
+    default_branch = _git_default_branch(repo_root)
+    current_branch = _git_current_branch(repo_root)
+    if (
+        default_branch is not None
+        and current_branch is not None
+        and current_branch != default_branch
+    ):
+        raise RuntimeError(
+            f"deploy clone {repo_root} is not on its default branch "
+            f"{default_branch!r} (found {current_branch!r}); a card worker must "
+            f"never leave a dir-workspace repo root off its default branch. "
+            f"Restore it with `git -C {repo_root} checkout {default_branch}` "
+            f"before dispatching."
+        )
+
+    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    target = repo_root / ".worktrees" / task.id
+    _ensure_git_worktree(repo_root, target, branch_name)
+    return target.resolve(strict=False)
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -9014,7 +9166,13 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       prevent confused-deputy traversal where ``../../../tmp/attacker``
       resolves against the dispatcher's CWD instead of a meaningful
       root.  Users who want a kanban-root-relative workspace should
-      compute the absolute path themselves.
+      compute the absolute path themselves.  When the path names a git
+      repo ROOT (a shared clone such as the office deploy checkout),
+      Hermes redirects to a per-task linked worktree at
+      ``<repo>/.worktrees/<task-id>`` so the worker never checks out its
+      branch in the shared clone, and raises if that clone is found off
+      its default branch. A path inside a repo, or a plain non-repo dir,
+      is returned as-is.
     - ``worktree``: a real linked git worktree. If ``workspace_path`` names
       a repo root, Hermes treats it as an anchor and materializes a linked
       worktree at ``<repo>/.worktrees/<task-id>``. If ``workspace_path`` names
@@ -9045,19 +9203,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "dir":
-        if not task.workspace_path:
-            raise ValueError(
-                f"task {task.id} has workspace_kind=dir but no workspace_path"
-            )
-        p = Path(task.workspace_path).expanduser()
-        if not p.is_absolute():
-            raise ValueError(
-                f"task {task.id} has non-absolute workspace_path "
-                f"{task.workspace_path!r}; use an absolute path "
-                f"(relative paths are ambiguous against the dispatcher's CWD)"
-            )
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        return _resolve_dir_workspace(task)
     if kind == "worktree":
         p, _branch_name = _resolve_worktree_workspace(task, board=board)
         return p
