@@ -935,6 +935,95 @@ def _guard_board_creation_allowed(
     )
 
 
+def _kanban_root_anchors_db() -> bool:
+    """True when the caller DECLARED an isolated root AND the DB actually lives
+    under it.
+
+    Two conditions must BOTH hold:
+
+    1. ``HERMES_KANBAN_HOME`` is explicitly set. This is what makes the root a
+       *declared* isolation rather than the ambient shared default. Without an
+       explicit override, :func:`kanban_home` falls back to
+       ``get_default_hermes_root()`` — the shared ``<root>`` — whose default
+       DB ``<root>/kanban.db`` is trivially anchored under it. Treating that as
+       "isolated" would fire the direct-read branch in the ORDINARY live case
+       and read ``<root>/config.yaml`` instead of the active profile's config;
+       in profile mode (``HERMES_HOME=<root>/profiles/<name>``) those are
+       different files, so the live ``allowed_boards`` restriction would be
+       silently dropped and the guard disarmed on the live board.
+    2. The resolved DB actually lives under that declared root. Setting the
+       root env var is NOT sufficient on its own: :func:`kanban_db_path` gives
+       ``HERMES_KANBAN_DB`` strictly higher precedence, so a process can point
+       the kanban ROOT at a throwaway dir while every write still lands in the
+       live ``kanban.db`` (the dispatcher injects ``HERMES_KANBAN_DB`` into
+       every worker's env). Reading the isolated root's (absent) config in that
+       state would likewise disarm the guard on the LIVE board.
+
+    So the authoritative question is "did the caller declare an isolated root,
+    and does the DB I am about to write actually live under it?". Both inputs
+    are already derivable from existing env vars / functions; this asks the
+    derived fact instead of trusting a single proxy signal.
+
+    Any resolution failure degrades to ``False`` — i.e. fall back to the live
+    ``load_config()`` path, which is the safe (restriction-preserving) default.
+    """
+    if not os.environ.get("HERMES_KANBAN_HOME", "").strip():
+        return False
+    try:
+        root = kanban_home().resolve()
+        db = kanban_db_path().resolve()
+    except Exception:
+        return False
+    return root in db.parents
+
+
+def _load_kanban_config_section() -> dict:
+    """Return the ``kanban`` config section, honouring an isolated root.
+
+    Resolution:
+
+    * When the caller has genuinely isolated the kanban root — i.e. the DB
+      actually in use lives under ``HERMES_KANBAN_HOME`` (see
+      :func:`_kanban_root_anchors_db`) — read the ``kanban`` section from
+      ``<HERMES_KANBAN_HOME>/config.yaml`` directly. A caller that has pointed
+      the kanban root at a throwaway directory gets THAT root's config (usually
+      absent → ``{}`` → unrestricted), not the live ``~/.hermes/config.yaml``.
+      Derived off the existing ``HERMES_KANBAN_HOME`` env var; no new env var is
+      introduced.
+    * Otherwise — including when ``HERMES_KANBAN_HOME`` is set but the resolved
+      DB still points at the live board (``HERMES_KANBAN_DB`` pinned) — fall
+      back to ``hermes_cli.config.load_config()`` exactly as before, so the
+      live root keeps its full deep-merge + migration pipeline and its
+      ``allowed_boards`` policy unchanged. This is what keeps the guard armed
+      whenever a write can reach the live DB.
+
+    Any read/parse failure degrades to ``{}`` (unrestricted), matching the
+    prior lazy-load's ``except Exception`` fallback — a broken config can never
+    brick board resolution.
+    """
+    if _kanban_root_anchors_db():
+        try:
+            from utils import fast_safe_load
+
+            cfg_path = kanban_home() / "config.yaml"
+            with open(cfg_path, encoding="utf-8") as f:
+                data = fast_safe_load(f) or {}
+            if isinstance(data, dict):
+                section = data.get("kanban")
+                return section if isinstance(section, dict) else {}
+            return {}
+        except (FileNotFoundError, OSError):
+            return {}
+        except Exception:
+            return {}
+    try:
+        from hermes_cli.config import load_config
+
+        return load_config().get("kanban") or {}
+    except Exception:
+        return {}
+
+
 def _allowed_boards_config(kanban_cfg: Optional[dict] = None) -> Optional[set[str]]:
     """Return the normalized ``kanban.allowed_boards`` allowlist, or ``None``.
 
@@ -945,14 +1034,26 @@ def _allowed_boards_config(kanban_cfg: Optional[dict] = None) -> Optional[set[st
 
     Reads ``config.yaml`` lazily via the established module pattern when
     ``kanban_cfg`` is not injected.
+
+    **Isolated-root awareness.** When the caller has genuinely isolated the
+    kanban root — the DB actually in use lives under ``HERMES_KANBAN_HOME``
+    (see :func:`_kanban_root_anchors_db`) — the allow-list is resolved from
+    ``<HERMES_KANBAN_HOME>/config.yaml`` rather than the live
+    ``~/.hermes/config.yaml``. This keeps the guard's policy intact for the
+    live root (``allowed_boards: [default]`` still refuses a stray board) —
+    including the case where ``HERMES_KANBAN_HOME`` is set but ``HERMES_KANBAN_DB``
+    still pins the live DB, which must stay guarded — while letting a
+    correctly-isolated harness (one that never touches the live board) resolve
+    its OWN (usually absent) allow-list. An isolated root with no config yields
+    no allow-list, i.e. unrestricted, so an isolated board is permitted. The
+    derivation is off the already-existing ``HERMES_KANBAN_HOME`` (via
+    :func:`kanban_home`) and ``HERMES_KANBAN_DB`` (via :func:`kanban_db_path`);
+    no new env var is introduced. The injected
+    ``kanban_cfg`` override path below is untouched — an explicit cfg always
+    wins regardless of the isolated root.
     """
     if kanban_cfg is None:
-        try:
-            from hermes_cli.config import load_config
-
-            kanban_cfg = (load_config().get("kanban") or {})
-        except Exception:
-            kanban_cfg = {}
+        kanban_cfg = _load_kanban_config_section()
     raw = (kanban_cfg or {}).get("allowed_boards")
     if not isinstance(raw, (list, tuple, set)) or not raw:
         return None
