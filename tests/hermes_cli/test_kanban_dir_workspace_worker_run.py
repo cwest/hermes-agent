@@ -38,6 +38,11 @@ def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
         [
             "git", "-C", str(cwd),
+            # Neutralize the host-global core.excludesfile: this dev host's
+            # ~/.gitignore-global carries ".worktrees/", which would mask the
+            # untracked worktree dir and let the clean-tree assertion below pass
+            # by accident on a broken resolver. CI has no such global.
+            "-c", "core.excludesfile=/dev/null",
             "-c", "user.name=Test User",
             "-c", "user.email=test@example.com",
             "-c", "commit.gpgsign=false",
