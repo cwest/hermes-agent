@@ -876,3 +876,122 @@ class TestAllowedBoardsRespectsIsolatedRoot:
         # And an injected empty/absent cfg is still unrestricted (None).
         assert kb._allowed_boards_config({}) is None
         assert kb._allowed_boards_config({"allowed_boards": []}) is None
+
+
+class TestAllowedBoardsGuardArmedWhenDbPinnedAtLiveRoot:
+    """The isolated-root branch must gate on where the DB actually resolves,
+    not on the mere presence of ``HERMES_KANBAN_HOME``.
+
+    Regression (acceptance-gate finding): ``HERMES_KANBAN_DB`` has strictly
+    higher precedence than ``HERMES_KANBAN_HOME`` in :func:`kanban_db_path`, so
+    a process can point the kanban ROOT at a throwaway dir while every write
+    still lands in the live ``kanban.db``. The first cut of the isolated-root
+    fix keyed off ``HERMES_KANBAN_HOME`` being set, so in that state it read the
+    throwaway root's (absent) config → unrestricted → the guard was silently
+    DISARMED on the live board. That is strictly worse than the false-positive
+    this whole change fixes: the operator loses the single-board protection they
+    already shipped. The dispatcher injects ``HERMES_KANBAN_DB`` into every
+    worker's env, so this is the common path, not a corner case.
+
+    The correct predicate is "does the resolved DB actually live under the
+    kanban root?" — a fact derived from the two existing resolution functions,
+    not a proxy signal.
+    """
+
+    @staticmethod
+    def _pin_db_at_live(tmp_path, monkeypatch, *, live_slugs, extra_env=()):
+        """Live root restricts to ``live_slugs``; kanban root is a throwaway
+        dir; ``HERMES_KANBAN_DB`` is pinned at the LIVE db path.
+
+        Returns ``(live_home, kanban_root, live_db)``.
+        """
+        live_home = tmp_path / "live_home"
+        live_home.mkdir()
+        body = "kanban:\n  allowed_boards:\n"
+        for s in live_slugs:
+            body += f"    - {s}\n"
+        (live_home / "config.yaml").write_text(body, encoding="utf-8")
+
+        kanban_root = tmp_path / "kanban_root"
+        kanban_root.mkdir()
+        live_db = live_home / "kanban.db"
+
+        monkeypatch.setenv("HERMES_HOME", str(live_home))
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_root))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(live_db))
+        for var, val in extra_env:
+            monkeypatch.setenv(var, val)
+        try:
+            import hermes_constants
+            hermes_constants._cached_default_hermes_root = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        kb._INITIALIZED_PATHS.clear()
+        return live_home, kanban_root, live_db
+
+    def test_db_pinned_at_live_keeps_restriction(self, tmp_path, monkeypatch):
+        # HERMES_KANBAN_HOME set (throwaway) BUT HERMES_KANBAN_DB pins the live
+        # db. The allow-list must resolve from the LIVE config ([default]), not
+        # the empty isolated root — the guard stays armed on the live board.
+        self._pin_db_at_live(tmp_path, monkeypatch, live_slugs=["default"])
+        assert kb._allowed_boards_config() == {"default"}
+
+    def test_db_pinned_at_live_refuses_stray_board(self, tmp_path, monkeypatch):
+        # Both entry points must refuse a stray board when the resolved DB is
+        # the live one, even with HERMES_KANBAN_HOME pointed elsewhere.
+        _live, kanban_root, live_db = self._pin_db_at_live(
+            tmp_path, monkeypatch, live_slugs=["default"]
+        )
+        with pytest.raises(ValueError, match=r"restricted to \['default'\]"):
+            kb.create_board("stray")
+        with pytest.raises(ValueError, match=r"restricted to \['default'\]"):
+            kb.connect(board="stray")
+        assert not kb.board_exists("stray")
+        # The stray board must not have materialized under EITHER root.
+        assert not (kanban_root / "kanban" / "boards" / "stray").exists()
+
+    def test_db_pinned_at_live_with_board_and_workspaces_env(
+        self, tmp_path, monkeypatch
+    ):
+        # The dispatcher co-sets HERMES_KANBAN_BOARD and
+        # HERMES_KANBAN_WORKSPACES_ROOT alongside HERMES_KANBAN_DB. The
+        # DB-anchoring predicate — not any single env var — must still resolve
+        # the live allow-list and refuse a stray board.
+        _live, _root, live_db = self._pin_db_at_live(
+            tmp_path,
+            monkeypatch,
+            live_slugs=["default"],
+            extra_env=(
+                ("HERMES_KANBAN_BOARD", "default"),
+                ("HERMES_KANBAN_WORKSPACES_ROOT", str(tmp_path / "ws")),
+            ),
+        )
+        assert kb._allowed_boards_config() == {"default"}
+        with pytest.raises(ValueError, match=r"restricted to \['default'\]"):
+            kb.create_board("stray")
+
+    def test_no_input_the_base_restricted_becomes_unrestricted(
+        self, tmp_path, monkeypatch
+    ):
+        # Parity assertion: the head must not classify as unrestricted anything
+        # a live restricted config would have classified as restricted. This is
+        # the criterion the isolated-root-only tests missed. With the live db
+        # pinned, the answer is the live [default] set — never None.
+        self._pin_db_at_live(tmp_path, monkeypatch, live_slugs=["default"])
+        assert kb._allowed_boards_config() is not None
+        # And a genuinely isolated DB (no pin) IS unrestricted — the card's fix.
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        kb._INITIALIZED_PATHS.clear()
+        assert kb._allowed_boards_config() is None
+
+    def test_root_anchors_db_predicate(self, tmp_path, monkeypatch):
+        # Direct unit coverage of the derived predicate.
+        _live, kanban_root, _db = self._pin_db_at_live(
+            tmp_path, monkeypatch, live_slugs=["default"]
+        )
+        # DB pinned at the live root → NOT anchored under the kanban root.
+        assert kb._kanban_root_anchors_db() is False
+        # Drop the pin → the DB resolves under the kanban root → anchored.
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        kb._INITIALIZED_PATHS.clear()
+        assert kb._kanban_root_anchors_db() is True

@@ -935,27 +935,58 @@ def _guard_board_creation_allowed(
     )
 
 
+def _kanban_root_anchors_db() -> bool:
+    """True when the DB actually in use lives under ``HERMES_KANBAN_HOME``.
+
+    ``HERMES_KANBAN_HOME`` being set is NOT sufficient to conclude the caller
+    is isolated: :func:`kanban_db_path` gives ``HERMES_KANBAN_DB`` strictly
+    higher precedence, so a process can point the kanban ROOT at a throwaway
+    dir while every write still lands in the live ``kanban.db`` (the dispatcher
+    injects ``HERMES_KANBAN_DB`` into every worker's env). Reading the isolated
+    root's (absent) config in that state would silently disarm the guard on the
+    LIVE board — strictly worse than the bug this whole change fixes.
+
+    The authoritative question is therefore not "is the root env var set?" but
+    "does the DB I am about to write actually live under that root?". Both
+    inputs are already derivable from existing functions; this asks the derived
+    fact instead of trusting a proxy signal.
+
+    Any resolution failure degrades to ``False`` — i.e. fall back to the live
+    ``load_config()`` path, which is the safe (restriction-preserving) default.
+    """
+    try:
+        root = kanban_home().resolve()
+        db = kanban_db_path().resolve()
+    except Exception:
+        return False
+    return root in db.parents
+
+
 def _load_kanban_config_section() -> dict:
     """Return the ``kanban`` config section, honouring an isolated root.
 
     Resolution:
 
-    * When ``HERMES_KANBAN_HOME`` is set, read the ``kanban`` section from
-      ``<HERMES_KANBAN_HOME>/config.yaml`` directly. This is the isolated-root
-      path: a caller that has pointed the kanban root at a throwaway directory
-      gets THAT root's config (usually absent → ``{}`` → unrestricted), not the
-      live ``~/.hermes/config.yaml``. Derived off the existing
-      ``HERMES_KANBAN_HOME`` env var; no new env var is introduced.
-    * Otherwise, fall back to ``hermes_cli.config.load_config()`` exactly as
-      before — the live root keeps its full deep-merge + migration pipeline and
-      its ``allowed_boards`` policy unchanged.
+    * When the caller has genuinely isolated the kanban root — i.e. the DB
+      actually in use lives under ``HERMES_KANBAN_HOME`` (see
+      :func:`_kanban_root_anchors_db`) — read the ``kanban`` section from
+      ``<HERMES_KANBAN_HOME>/config.yaml`` directly. A caller that has pointed
+      the kanban root at a throwaway directory gets THAT root's config (usually
+      absent → ``{}`` → unrestricted), not the live ``~/.hermes/config.yaml``.
+      Derived off the existing ``HERMES_KANBAN_HOME`` env var; no new env var is
+      introduced.
+    * Otherwise — including when ``HERMES_KANBAN_HOME`` is set but the resolved
+      DB still points at the live board (``HERMES_KANBAN_DB`` pinned) — fall
+      back to ``hermes_cli.config.load_config()`` exactly as before, so the
+      live root keeps its full deep-merge + migration pipeline and its
+      ``allowed_boards`` policy unchanged. This is what keeps the guard armed
+      whenever a write can reach the live DB.
 
     Any read/parse failure degrades to ``{}`` (unrestricted), matching the
     prior lazy-load's ``except Exception`` fallback — a broken config can never
     brick board resolution.
     """
-    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
-    if override:
+    if _kanban_root_anchors_db():
         try:
             from utils import fast_safe_load
 
@@ -989,16 +1020,20 @@ def _allowed_boards_config(kanban_cfg: Optional[dict] = None) -> Optional[set[st
     Reads ``config.yaml`` lazily via the established module pattern when
     ``kanban_cfg`` is not injected.
 
-    **Isolated-root awareness.** When the caller has explicitly isolated the
-    kanban root via ``HERMES_KANBAN_HOME``, the allow-list is resolved from
+    **Isolated-root awareness.** When the caller has genuinely isolated the
+    kanban root — the DB actually in use lives under ``HERMES_KANBAN_HOME``
+    (see :func:`_kanban_root_anchors_db`) — the allow-list is resolved from
     ``<HERMES_KANBAN_HOME>/config.yaml`` rather than the live
     ``~/.hermes/config.yaml``. This keeps the guard's policy intact for the
-    live root (``allowed_boards: [default]`` still refuses a stray board) while
-    letting a correctly-isolated harness — one that never touches the live
-    board — resolve its OWN (usually absent) allow-list. An isolated root with
-    no config yields no allow-list, i.e. unrestricted, so an isolated board is
-    permitted. The derivation is off the already-existing ``HERMES_KANBAN_HOME``
-    (via :func:`kanban_home`); no new env var is introduced. The injected
+    live root (``allowed_boards: [default]`` still refuses a stray board) —
+    including the case where ``HERMES_KANBAN_HOME`` is set but ``HERMES_KANBAN_DB``
+    still pins the live DB, which must stay guarded — while letting a
+    correctly-isolated harness (one that never touches the live board) resolve
+    its OWN (usually absent) allow-list. An isolated root with no config yields
+    no allow-list, i.e. unrestricted, so an isolated board is permitted. The
+    derivation is off the already-existing ``HERMES_KANBAN_HOME`` (via
+    :func:`kanban_home`) and ``HERMES_KANBAN_DB`` (via :func:`kanban_db_path`);
+    no new env var is introduced. The injected
     ``kanban_cfg`` override path below is untouched — an explicit cfg always
     wins regardless of the isolated root.
     """
