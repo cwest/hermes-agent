@@ -757,3 +757,122 @@ class TestConnectAllowedBoardsGuard:
             assert raw.exists()
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# allowed_boards guard resolves config from the ISOLATED kanban root
+# ---------------------------------------------------------------------------
+
+class TestAllowedBoardsRespectsIsolatedRoot:
+    """``_allowed_boards_config`` must read the allow-list from the isolated
+    kanban root when ``HERMES_KANBAN_HOME`` is set.
+
+    Regression: the guard resolved its allow-list from the *live*
+    ``~/.hermes/config.yaml`` (via ``load_config()``) even when the caller
+    had explicitly isolated the kanban root via ``HERMES_KANBAN_HOME``. A
+    correctly-isolated test harness — one that never touches the live board —
+    still had the production allow-list (``allowed_boards: [default]``)
+    applied and failed at ``connect(board="test")``. This is the
+    self-defeating-safety shape: the guard punishing the correct isolation.
+
+    These tests wire the two roots to *different* temp dirs: ``HERMES_HOME``
+    (the stand-in for the live root) carries ``allowed_boards: [default]``,
+    while ``HERMES_KANBAN_HOME`` (the isolated kanban root) has no config.
+    An isolated root with no config yields no allow-list, which under the
+    documented semantics means unrestricted — so an isolated board is
+    permitted while the live root keeps its restriction.
+    """
+
+    @staticmethod
+    def _split_roots(tmp_path, monkeypatch, *, live_slugs):
+        """Point HERMES_HOME (live) and HERMES_KANBAN_HOME (isolated) apart.
+
+        The live root gets a ``config.yaml`` restricting ``allowed_boards``
+        to ``live_slugs``; the isolated kanban root gets no config at all.
+        Returns ``(live_home, kanban_home)``.
+        """
+        live_home = tmp_path / "live_home"
+        live_home.mkdir()
+        body = "kanban:\n  allowed_boards:\n"
+        for s in live_slugs:
+            body += f"    - {s}\n"
+        (live_home / "config.yaml").write_text(body, encoding="utf-8")
+
+        kanban_home = tmp_path / "kanban_home"
+        kanban_home.mkdir()
+
+        monkeypatch.setenv("HERMES_HOME", str(live_home))
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+        for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+            monkeypatch.delenv(var, raising=False)
+        try:
+            import hermes_constants
+            hermes_constants._cached_default_hermes_root = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        kb._INITIALIZED_PATHS.clear()
+        return live_home, kanban_home
+
+    def test_isolated_root_allows_test_board(self, tmp_path, monkeypatch):
+        # HERMES_KANBAN_HOME isolated (no config) but the live HERMES_HOME
+        # restricts to [default]. connect(board="test") must SUCCEED because
+        # the guard reads the isolated root's (absent) config, not the live one.
+        _live, kanban_home = self._split_roots(
+            tmp_path, monkeypatch, live_slugs=["default"]
+        )
+        conn = kb.connect(board="test")
+        try:
+            assert kb.board_exists("test")
+            # And the board materialized under the ISOLATED root, never live.
+            assert (kanban_home / "kanban" / "boards" / "test").exists()
+        finally:
+            conn.close()
+
+    def test_isolated_root_yields_no_restriction(self, tmp_path, monkeypatch):
+        # _allowed_boards_config() must resolve None (unrestricted) from the
+        # isolated root even though the live config lists [default].
+        self._split_roots(tmp_path, monkeypatch, live_slugs=["default"])
+        assert kb._allowed_boards_config() is None
+
+    def test_isolated_root_honours_its_own_allowlist(self, tmp_path, monkeypatch):
+        # When the ISOLATED root itself carries an allow-list, THAT list wins
+        # (not the live one). Proves resolution is anchored on the kanban root.
+        _live, kanban_home = self._split_roots(
+            tmp_path, monkeypatch, live_slugs=["default"]
+        )
+        (kanban_home / "config.yaml").write_text(
+            "kanban:\n  allowed_boards:\n    - knowledge\n", encoding="utf-8"
+        )
+        # "knowledge" is on the isolated list → permitted.
+        conn = kb.connect(board="knowledge")
+        try:
+            assert kb.board_exists("knowledge")
+        finally:
+            conn.close()
+        # "test" is on neither list → refused by the isolated root's own guard.
+        with pytest.raises(ValueError, match="restricted"):
+            kb.connect(board="test")
+
+    def test_live_root_still_refuses_stray_board(self, fresh_home):
+        # Negative: with NO isolated root set and allowed_boards: [default] in
+        # the live config, a stray board is still refused. The guard's policy
+        # is untouched — this card fixes WHERE the list is read, not WHETHER
+        # it is enforced.
+        (fresh_home / "config.yaml").write_text(
+            "kanban:\n  allowed_boards:\n    - default\n", encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match=r"restricted to \['default'\]"):
+            kb.create_board("stray")
+        assert not kb.board_exists("stray")
+
+    def test_injected_cfg_override_unchanged(self, tmp_path, monkeypatch):
+        # The injected-kanban_cfg path is word-for-word unchanged: an explicit
+        # cfg always wins, regardless of HERMES_KANBAN_HOME. Isolated root has
+        # no config, but the injected [knowledge] list still governs.
+        self._split_roots(tmp_path, monkeypatch, live_slugs=["default"])
+        assert kb._allowed_boards_config({"allowed_boards": ["knowledge"]}) == {
+            "knowledge"
+        }
+        # And an injected empty/absent cfg is still unrestricted (None).
+        assert kb._allowed_boards_config({}) is None
+        assert kb._allowed_boards_config({"allowed_boards": []}) is None
