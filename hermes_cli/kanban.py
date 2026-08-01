@@ -2060,7 +2060,8 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             )
             return 1
         workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, task.id, str(workspace))
+        # Preserve a redirected ``dir`` anchor (see persist_resolved_workspace).
+        kb.persist_resolved_workspace(conn, task, str(workspace))
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
     return 0
