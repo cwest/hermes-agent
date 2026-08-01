@@ -161,6 +161,106 @@ def _assert_not_delegated_child_mutation() -> None:
         )
 
 
+def _is_test_context() -> bool:
+    """True when running under a test/harness context.
+
+    Two signals, in order:
+
+    1. ``PYTEST_CURRENT_TEST`` — pytest sets this per test function. Already
+       used across the codebase (cli.py, auth.py, credential_pool.py, …) as the
+       canonical "we are inside a test" marker.
+    2. ``HERMES_KANBAN_TEST`` — an explicit opt-in for standalone harness
+       scripts that do not run under pytest (the ``/tmp/e2e_*.py`` shape that
+       drove 36 junk cards onto the live board). A harness sets this so the
+       live-write guard applies to it too.
+    """
+    return bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("HERMES_KANBAN_TEST", "").strip()
+    )
+
+
+def _real_live_db_path() -> Optional[Path]:
+    """The un-redirectable path of the real production kanban DB.
+
+    Anchored to the OPERATING-SYSTEM account home, resolved from the passwd
+    database (POSIX) or ``%USERPROFILE%``-independent ``LOCALAPPDATA`` semantics
+    (Windows). Deliberately NOT via ``Path.home()`` / ``HERMES_HOME`` /
+    ``HERMES_KANBAN_*`` / ``$HOME``: those are exactly the knobs a test or
+    harness redirects (the hermetic fixture points ``HERMES_HOME`` at a tmp dir
+    and several fixtures ALSO monkeypatch ``Path.home`` at ``tmp_path``). If the
+    guard used any of them, a correctly-isolated test whose tmp path happened to
+    end in ``.hermes/kanban.db`` would be a false positive, and — worse — an
+    un-isolated harness that unset them would slip through.
+
+    Returns ``None`` when the real home cannot be determined (unusual
+    environments); callers treat that as "cannot prove this is the live DB" and
+    do not fire the guard.
+    """
+    if sys.platform == "win32":
+        # On Windows there is no passwd DB; LOCALAPPDATA is the account-scoped
+        # anchor and is not one of the kanban redirection knobs.
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if not local_appdata:
+            return None
+        return Path(local_appdata) / "hermes" / "kanban.db"
+    try:
+        import pwd
+
+        if not hasattr(os, "getuid"):
+            # No passwd-DB identity on this platform; cannot anchor the live path.
+            return None
+        real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok
+    except Exception:
+        return None
+    return real_home / ".hermes" / "kanban.db"
+
+
+def _would_write_live_db(path: Path) -> bool:
+    """True when ``path`` resolves to the real production kanban DB.
+
+    Compares the fully-resolved paths so a symlinked or relative path that lands
+    on the live DB is still caught. Returns ``False`` when the real live path
+    can't be determined — the guard must never fire on a guess.
+    """
+    live = _real_live_db_path()
+    if live is None:
+        return False
+    try:
+        return path.resolve() == live.resolve()
+    except Exception:
+        # A path that can't be resolved (e.g. permission oddity) is, by
+        # definition, not the canonical live DB.
+        return False
+
+
+def _assert_not_test_write_to_live_db(path: Path) -> None:
+    """Refuse to open the LIVE kanban DB from a test/harness context.
+
+    An E2E harness that imports ``kanban_db`` from a clone but forgets to
+    repoint ``HERMES_HOME`` / the DB path at a temp dir resolves ``connect()``
+    to the real ``~/.hermes/kanban.db`` and mutates production rows. This is the
+    single connection chokepoint, so a guard here covers ``create_task`` and
+    every other write path at once (Option 1 in card t_35f9878e: keep
+    ``create_task`` low-level; make isolation the un-forgettable default).
+
+    A properly isolated test resolves to a temp path (the autouse hermetic
+    fixture points ``HERMES_HOME`` at a per-test tmp dir), so this never fires
+    for it. Production (no test signal) is unaffected — the guard keys on the
+    test/harness signal, not on the path alone.
+    """
+    if _is_test_context() and _would_write_live_db(path):
+        raise RuntimeError(
+            "Refusing to open the LIVE kanban DB "
+            f"({path}) from a test/harness context. A test or E2E harness must "
+            "not write to the production board. Point HERMES_HOME (or "
+            "HERMES_KANBAN_DB) at a tmp dir before connecting — e.g. "
+            "os.environ['HERMES_KANBAN_DB'] = str(tmp_path / 'board.db'). "
+            "Set this BEFORE importing/using kanban_db. If you genuinely intend "
+            "to touch the live board (you almost never do), unset "
+            "HERMES_KANBAN_TEST and run outside pytest."
+        )
+
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
@@ -2394,6 +2494,12 @@ def connect(
         # invariant helper ``create_board`` uses so the policy cannot drift.
         _guard_board_creation_allowed(_normalize_board_slug(board) or DEFAULT_BOARD)
         path = kanban_db_path(board=board)
+    # Fail closed before touching the filesystem: a test/harness context that
+    # resolved to the real ~/.hermes/kanban.db must not create/open it. This is
+    # the single connection chokepoint (init_db / connect_closing both route
+    # through here), so the guard covers create_task and every other write path
+    # at once. See _assert_not_test_write_to_live_db (card t_35f9878e).
+    _assert_not_test_write_to_live_db(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
