@@ -32,11 +32,21 @@ from hermes_cli import kanban_db as kb
 
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Isolated HERMES_HOME with an empty kanban DB."""
+    """Isolated HERMES_HOME with an empty kanban DB.
+
+    Also stubs ``_resolve_pr_state`` to ``"open"`` so the open-PR cards these
+    tests stage are treated as genuinely active work without a live ``gh`` call.
+    Without this the guard would resolve the fixture's placeholder PR URL against
+    real GitHub -- a non-existent PR now resolves to ``not_found`` (terminal, not
+    active), which would clear the very guard these routing tests set out to
+    exercise. The routing logic under test is orthogonal to live PR-state
+    resolution, so pinning it keeps these tests hermetic and deterministic.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
     kb.init_db()
     return home
 
