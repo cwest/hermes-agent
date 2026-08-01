@@ -9441,6 +9441,41 @@ def set_workspace_path(
         )
 
 
+def persist_resolved_workspace(
+    conn: sqlite3.Connection, task: Task, workspace: Path | str
+) -> None:
+    """Persist a resolved workspace path back to the task row, without clobbering
+    a ``dir`` card's declared anchor.
+
+    The dispatcher resolves a card's workspace and needs the concrete path at
+    spawn time (the worker ``cd``s there) — that path is passed straight to the
+    spawn function and does NOT depend on this write-back. The write-back exists
+    only so a subsequent tick reuses the same directory.
+
+    For every kind EXCEPT a redirected ``dir`` card, persisting the resolved
+    path is correct and idempotent (``scratch`` resolves deterministically;
+    ``worktree`` re-recognizes an existing linked worktree on the persisted
+    path). But a ``dir`` card whose declared ``workspace_path`` names a repo
+    ROOT is redirected by ``_resolve_dir_workspace`` to
+    ``<repo>/.worktrees/<id>``; writing that resolved path back DESTROYS the
+    declared repo-root anchor. Because ``workspace_kind`` stays ``dir``, the
+    next tick then re-resolves against the worktree (its own git toplevel) and
+    cuts a nested ``.worktrees/<id>/.worktrees/<id>``. There is no other record
+    of the original anchor on the row, so the corruption is unrecoverable.
+
+    So: skip the write-back for a ``dir`` card whose resolved path differs from
+    its declared path (i.e. it was redirected). Its declared anchor survives the
+    run and re-resolves to the same worktree every tick.
+    """
+    if (task.workspace_kind or "scratch") == "dir" and task.workspace_path:
+        declared = Path(task.workspace_path).expanduser().resolve(strict=False)
+        resolved = Path(workspace).expanduser().resolve(strict=False)
+        if declared != resolved:
+            # Redirected anchor — keep the declared repo root on the row.
+            return
+    set_workspace_path(conn, task.id, str(workspace))
+
+
 def set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:
@@ -12125,7 +12160,8 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
+        # A redirected ``dir`` anchor is preserved (see persist_resolved_workspace).
+        persist_resolved_workspace(conn, claimed, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
@@ -12219,7 +12255,8 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
+        # A redirected ``dir`` anchor is preserved (see persist_resolved_workspace).
+        persist_resolved_workspace(conn, claimed, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
