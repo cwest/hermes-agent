@@ -16,8 +16,11 @@ isolation detection (``GIT_DIR != GIT_COMMON``) sees it and works there without
 touching the shared clone. A ``dir`` workspace that is NOT a repo root (a plain
 ops directory) keeps returning the directory itself.
 
-A guard fails loudly if the anchor deploy clone is found off its default branch,
-rather than silently building on a dirty, wrong-branch base.
+A guard fails loudly only when the anchor deploy clone genuinely cannot
+``git pull --ff-only`` — a detached HEAD, or a branch with no tracked upstream —
+rather than assuming the branch must be named ``main`` (a fork legitimately
+deploys from its own tracked integration branch). A linked worktree checkout is
+never subject to the guard: sitting on a topic branch is what a worktree is for.
 """
 
 from __future__ import annotations
@@ -59,16 +62,36 @@ def _git(cwd: Path, *args: str) -> str:
     ).stdout
 
 
-def _make_repo(tmp_path: Path, name: str = "office") -> Path:
-    repo = tmp_path / name
-    repo.mkdir()
+def _make_bare_origin(tmp_path: Path, name: str = "origin.git") -> Path:
+    """A bare remote to give clones a real upstream to track."""
+    bare = tmp_path / name
     subprocess.run(
-        ["git", "init", "-b", "main", str(repo)],
+        ["git", "init", "--bare", "-b", "main", str(bare)],
+        check=True, capture_output=True, text=True,
+    )
+    return bare
+
+
+def _make_repo(tmp_path: Path, name: str = "office") -> Path:
+    """A deploy clone on ``main`` with a real tracked upstream.
+
+    A genuine deploy clone tracks an upstream so the post-merge
+    ``git pull --ff-only`` can fast-forward — that tracking IS the invariant the
+    resolver's guard protects. The fixture models it (a bare origin + a clone
+    whose ``main`` tracks ``origin/main``) so happy-path resolution reflects
+    reality; a test that wants the no-upstream hazard drops the tracking by
+    cutting a local-only branch or detaching HEAD.
+    """
+    bare = _make_bare_origin(tmp_path, f"{name}-origin.git")
+    repo = tmp_path / name
+    subprocess.run(
+        ["git", "clone", str(bare), str(repo)],
         check=True, capture_output=True, text=True,
     )
     (repo / "README.md").write_text("base\n", encoding="utf-8")
     _git(repo, "add", "README.md")
     _git(repo, "commit", "-m", "init")
+    _git(repo, "push", "-u", "origin", "main")
     return repo
 
 
@@ -197,10 +220,15 @@ def test_dir_subdir_of_repo_still_returns_directory(kanban_home, tmp_path):
     assert workspace.resolve() == subdir.resolve()
 
 
-def test_dir_deploy_clone_off_main_fails_loudly(kanban_home, tmp_path):
-    """If the deploy clone is found off its default branch, raise — don't build."""
+def test_dir_deploy_clone_untracked_branch_fails_loudly(kanban_home, tmp_path):
+    """A clone on a branch with no upstream can't ff-only, so it must refuse.
+
+    A previous buggy worker left the shared clone on a local-only topic branch
+    that tracks nothing. ``git pull --ff-only`` cannot work there, so building on
+    it is the genuine hazard the guard exists to catch.
+    """
     repo = _make_repo(tmp_path)
-    # A previous buggy worker left the shared clone on a topic branch.
+    # A previous buggy worker left the shared clone on a local-only topic branch.
     _git(repo, "checkout", "-b", "topic/leftover")
 
     with kb.connect() as conn:
@@ -210,8 +238,112 @@ def test_dir_deploy_clone_off_main_fails_loudly(kanban_home, tmp_path):
         )
         task = kb.get_task(conn, tid)
 
-    with pytest.raises(RuntimeError, match="not on its default branch|off .*main"):
+    with pytest.raises(RuntimeError, match="cannot .*fast-forward|does not track an upstream"):
         kb.resolve_workspace(task)
+
+
+def _make_fork_clone_on_tracked_branch(
+    tmp_path: Path, deploy_branch: str, name: str = "fork"
+) -> Path:
+    """A real clone whose HEAD is a NON-main branch that TRACKS an upstream.
+
+    Models the hermes-agent fork: ``origin/HEAD`` mirrors upstream (``main``),
+    but the deploy checkout lives on its own integration branch that has a real
+    tracked upstream and fast-forwards cleanly. This is a legitimate deploy
+    clone, not drift.
+    """
+    bare = _make_bare_origin(tmp_path, f"{name}-origin.git")
+    repo = tmp_path / name
+    subprocess.run(
+        ["git", "clone", str(bare), str(repo)],
+        check=True, capture_output=True, text=True,
+    )
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "init")
+    _git(repo, "push", "-u", "origin", "main")
+    # origin/HEAD points at main (mirrors upstream), as on a real fork.
+    _git(repo, "remote", "set-head", "origin", "main")
+    # Cut the fork's own deploy branch and give it a tracked upstream.
+    _git(repo, "checkout", "-b", deploy_branch)
+    _git(repo, "push", "-u", "origin", deploy_branch)
+    return repo
+
+
+def test_dir_fork_clone_on_tracked_non_main_branch_dispatches(kanban_home, tmp_path):
+    """A fork clone on its own tracked integration branch resolves, not refuses.
+
+    ``origin/HEAD`` says ``main``, but the clone lives on ``cwest/integration``
+    which tracks ``origin/cwest/integration`` and fast-forwards cleanly. The
+    old guard demanded the branch be named ``main`` and refused this correct
+    state; the corrected guard accepts any branch that tracks an upstream.
+    """
+    repo = _make_fork_clone_on_tracked_branch(tmp_path, "cwest/integration")
+    assert _current_branch(repo) == "cwest/integration"
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="fork feature",
+            workspace_kind="dir", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+
+    # Must NOT raise, and must redirect to a per-task worktree (not the clone).
+    workspace = kb.resolve_workspace(task)
+    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    # The fork clone is untouched — still on its integration branch.
+    assert _current_branch(repo) == "cwest/integration"
+
+
+def test_dir_clone_detached_head_fails_loudly(kanban_home, tmp_path):
+    """A clone with a detached HEAD can't ff-only, so it must refuse."""
+    repo = _make_repo(tmp_path)
+    head_sha = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "checkout", "--detach", head_sha)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="office feature",
+            workspace_kind="dir", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+
+    with pytest.raises(RuntimeError, match="cannot .*fast-forward|does not track an upstream|detached"):
+        kb.resolve_workspace(task)
+
+
+def test_dir_linked_worktree_on_topic_branch_dispatches(kanban_home, tmp_path):
+    """A dir workspace pointing at a LINKED WORKTREE on a topic branch resolves.
+
+    The bug: ``_resolve_dir_workspace`` ran the default-branch guard against any
+    path whose resolved form equals its git toplevel. A linked worktree satisfies
+    that (its own root IS the toplevel), so a worktree correctly sitting on its
+    topic branch was misread as a deploy clone left off ``main`` and refused.
+
+    The fix consults ``_is_linked_worktree_checkout`` and skips the guard for a
+    worktree — being on a topic branch is exactly what a worktree is for. This
+    test fails if the guard is reintroduced without that predicate.
+    """
+    anchor = _make_repo(tmp_path, "anchor")
+    worktree = tmp_path / "wt-checkout"
+    _git(anchor, "worktree", "add", "-b", "topic/feature-x", str(worktree))
+
+    # Sanity: this really is a linked worktree on a topic branch.
+    assert kb._is_linked_worktree_checkout(worktree)
+    assert _current_branch(worktree) == "topic/feature-x"
+    assert kb._git_toplevel(worktree) == worktree.resolve()
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="work in a linked worktree",
+            workspace_kind="dir", workspace_path=str(worktree),
+        )
+        task = kb.get_task(conn, tid)
+
+    # Must NOT raise — the guard must be skipped for a linked worktree.
+    kb.resolve_workspace(task)
+    # The worktree is untouched — still on its topic branch.
+    assert _current_branch(worktree) == "topic/feature-x"
 
 
 def _exclude_lines(repo: Path) -> list[str]:
