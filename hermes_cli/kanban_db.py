@@ -3819,6 +3819,17 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # A branch name must be MEANINGFUL whether or not the card is
+                # project-linked. Project-linked cards get the richer
+                # ``<project-slug>/<task-id>-<title-slug>`` shape above; every
+                # other card still derives ``wt/<task-id>-<title-slug>`` from its
+                # title here. Without this, an unlinked card fell through to the
+                # bare ``wt/<task-id>`` fallback in ``_ensure_git_worktree`` and
+                # surfaced as an opaque ``t-39521e0e`` branch — unreadable in a
+                # branch list or a preview dashboard.
+                if not branch_name and workspace_kind == "worktree":
+                    branch_name = _derive_worktree_branch_name(task_id, title)
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -9992,6 +10003,25 @@ def _git_toplevel(path: Path) -> Optional[Path]:
         return Path(out).expanduser()
 
 
+_WORKTREE_BRANCH_SAFE_RE = re.compile(r"[^a-z0-9._-]+")
+_WORKTREE_TITLE_SLUG_MAX = 40
+
+
+def _derive_worktree_branch_name(task_id: str, title: str | None) -> str:
+    """Human-meaningful worktree branch name for a non-project-linked card.
+
+    Shape: ``wt/<task-id>-<title-slug>``, mirroring the slug rules
+    ``projects_db.branch_name_for`` uses for project-linked cards so both paths
+    produce the same readable style.
+
+    A bare ``wt/<task-id>`` is returned ONLY when the title is empty or slugs
+    away to nothing — the opaque form is a last resort, never the default.
+    """
+    slug = _WORKTREE_BRANCH_SAFE_RE.sub("-", str(title or "").strip().lower())
+    slug = slug.strip("-")[:_WORKTREE_TITLE_SLUG_MAX].strip("-")
+    return f"wt/{task_id}-{slug}" if slug else f"wt/{task_id}"
+
+
 def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     try:
         result = subprocess.run(
@@ -10377,7 +10407,9 @@ def _resolve_worktree_workspace(
     launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
     """
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    branch_name = (task.branch_name or "").strip() or _derive_worktree_branch_name(
+        task.id, getattr(task, "title", None)
+    )
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -10609,7 +10641,9 @@ def _resolve_dir_workspace(task: Task) -> Path:
                     f"to confirm, then reattach it to its deploy branch."
                 )
 
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    branch_name = (task.branch_name or "").strip() or _derive_worktree_branch_name(
+        task.id, getattr(task, "title", None)
+    )
     target = repo_root / ".worktrees" / task.id
     _ensure_git_worktree(repo_root, target, branch_name)
     return target.resolve(strict=False)
