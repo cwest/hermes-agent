@@ -7531,3 +7531,87 @@ def test_guard_allows_active_transition_for_non_terminal_card(kanban_home):
         assert kb.guard_active_lane_transition(
             conn, t, to_status="review", actor="dispatcher:auto-promote-no-pr-review",
         ) is True
+
+
+# ---------------------------------------------------------------------------
+# The owner-map reader must dequote lane keys AND owner values.
+#
+# ``_lane_owner_from_map_body`` is the shared choke point for BOTH the strict
+# ``state_owners={…}`` form and the prose ``Routing (owner map): {…}`` form. A
+# writer that emits the Python-repr quoted shape —
+# ``state_owners={'ready': 'reddy', 'review': 'avram'}`` — used to resolve to
+# ``None`` because ``"'review'" != "review"``, silently wedging a card that
+# could neither complete-to-done nor move-to-review. The reader must strip
+# surrounding single/double quotes from each side before comparing, while
+# leaving the canonical unquoted form (and internal apostrophes) intact.
+# ---------------------------------------------------------------------------
+
+
+def test_lane_owner_from_map_body_resolves_quoted_form():
+    """The Python-repr quoted shape resolves to the bare owner."""
+    body = "'ready': 'reddy', 'review': 'avram'"
+    assert kb._lane_owner_from_map_body(body, "review") == "avram"
+    assert kb._lane_owner_from_map_body(body, "ready") == "reddy"
+
+
+def test_lane_owner_from_map_body_still_resolves_unquoted_form():
+    """Regression guard: the canonical unquoted form is unaffected."""
+    body = "ready: reddy, review: avram"
+    assert kb._lane_owner_from_map_body(body, "review") == "avram"
+    assert kb._lane_owner_from_map_body(body, "ready") == "reddy"
+
+
+def test_lane_owner_from_map_body_resolves_mixed_and_whitespace_form():
+    """A mixed/whitespace map (quoted key, unquoted value + padding) resolves."""
+    body = "  'ready' :  reddy , review : 'avram'  "
+    assert kb._lane_owner_from_map_body(body, "review") == "avram"
+    assert kb._lane_owner_from_map_body(body, "ready") == "reddy"
+
+
+def test_lane_owner_from_map_body_double_quoted_form():
+    """Double-quoted tokens dequote the same as single-quoted."""
+    body = '"ready": "reddy", "review": "avram"'
+    assert kb._lane_owner_from_map_body(body, "review") == "avram"
+
+
+def test_lane_owner_from_map_body_preserves_internal_apostrophe():
+    """The outer-quote strip must not corrupt an owner with an internal
+    apostrophe — only surrounding quotes are stripped, not interior ones."""
+    body = "review: o'brien"
+    assert kb._lane_owner_from_map_body(body, "review") == "o'brien"
+    quoted = "'review': 'o'brien'"
+    # Only the balanced outer pair is stripped; the interior apostrophe stays.
+    assert kb._lane_owner_from_map_body(quoted, "review") == "o'brien"
+
+
+def _stamp_submit_owner_map_raw(conn, task_id, map_body):
+    """Stamp a submit-stage audit comment whose ``state_owners`` body is the
+    exact ``map_body`` given (so a quoted Python-repr shape can be injected)."""
+    kb.add_comment(
+        conn, task_id, "hollis",
+        "[audit] actor=hollis stage=submit ts=2026-08-02T19:46:36Z\n"
+        f"notes: state_owners={{{map_body}}} triager=hollis team=engineering",
+    )
+
+
+def test_review_owner_from_owner_map_resolves_quoted_audit_comment(kanban_home):
+    """A card whose submit-audit comment carries the Python-repr quoted owner
+    map resolves its review owner (previously wedged returning None)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="quoted-map card", assignee="reddy")
+        _stamp_submit_owner_map_raw(
+            conn, tid,
+            "'ready': 'reddy', 'review': 'avram', 'blocked-acceptance': 'casey'",
+        )
+        assert kb._review_owner_from_owner_map(conn, tid) == "avram"
+
+
+def test_ready_owner_from_owner_map_resolves_quoted_audit_comment(kanban_home):
+    """The ready-lane wrapper resolves from the same quoted audit comment."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="quoted-map card", assignee="reddy")
+        _stamp_submit_owner_map_raw(
+            conn, tid,
+            "'ready': 'reddy', 'review': 'avram', 'blocked-acceptance': 'casey'",
+        )
+        assert kb._ready_owner_from_owner_map(conn, tid) == "reddy"

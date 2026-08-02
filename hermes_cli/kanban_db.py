@@ -3964,13 +3964,21 @@ def _lane_owner_from_map_body(map_body: str, lane: str) -> Optional[str]:
     Shared by the strict (``state_owners={…}``) and prose (``Routing (owner
     map): {…}``) readers — both carry the identical ``{lane: owner, …}`` shape,
     so the pair-splitting lives in one place.
+
+    Surrounding single/double quotes are stripped from BOTH the lane key and
+    the owner value, so a Python-repr writer variance
+    (``{'ready': 'reddy', 'review': 'avram'}``) resolves identically to the
+    canonical unquoted form. Only the balanced outer pair is stripped, so an
+    owner value with an internal apostrophe (``o'brien``) is preserved.
     """
     for pair in map_body.split(","):
         if ":" not in pair:
             continue
         candidate, owner = pair.split(":", 1)
-        if candidate.strip() == lane and owner.strip():
-            return owner.strip()
+        candidate = candidate.strip().strip("'\"")
+        owner = owner.strip().strip("'\"")
+        if candidate == lane and owner:
+            return owner
     return None
 
 
