@@ -279,3 +279,101 @@ def test_generic_blocked_card_still_completes_to_done(kanban_home: Path) -> None
 
         assert ok is True, "a generic blocked card must stay completable"
         assert kb.get_task(conn, tid).status == "done"
+
+
+# ---------------------------------------------------------------------------
+# RED 7 — the research-team dual-role self-bounce
+#
+# The research cohort's owner map is ``{ready: reddy, review: avram}`` and avram
+# is BOTH the curation/research WORKER and the ``review``-lane owner. A no-PR
+# curation sweep is claimed and worked by avram; when avram's completion took the
+# generic author->review redirect, the review owner resolved back to avram, the
+# dispatcher re-claimed from ``review`` and re-spawned avram — an infinite
+# ``running -> review -> running`` self-bounce (t_f91cf0ee ran runs 1901..1908 on
+# identical, verified-complete work). This contradicts the ``research-excluded-lane``
+# rule: the research cohort publishes directly to the CI-gated knowledge base and
+# never enters the review lane. A no-PR research/curation sweep's true terminus is
+# ``done``. The fix short-circuits the redirect when the resolved review owner is
+# a research reviewer (the dual-role self-bounce), letting the card complete to
+# ``done`` — WITHOUT weakening the code (lamport) or writing (perkins) redirect,
+# which the RED 1 / RED 2 tests above pin.
+# ---------------------------------------------------------------------------
+
+
+def test_research_author_completion_reaches_done_no_self_bounce(
+    kanban_home: Path,
+) -> None:
+    """A no-PR research/curation card ``{ready: reddy, review: avram}`` completed
+    by avram (the dual-role worker == review owner) reaches ``done`` — it does
+    NOT re-enter the review lane against itself."""
+    with kb.connect() as conn:
+        tid = _author_card(
+            conn,
+            owner_map="ready: reddy, review: avram, blocked-acceptance: casey",
+            assignee="avram",
+        )
+
+        ok = kb.complete_task(conn, tid, summary="curation sweep verified complete")
+
+        assert ok is True, "the research completion must succeed to done"
+        task = kb.get_task(conn, tid)
+        assert task.status == "done", (
+            "a no-PR research/curation card must terminate at done, not self-bounce "
+            "into the review lane owned by the same worker"
+        )
+        assert task.completed_at is not None, "done must stamp a completion timestamp"
+
+
+def test_research_author_completion_emits_no_review_move(kanban_home: Path) -> None:
+    """The research completion must NOT emit a ``status_changed -> review`` — the
+    review-lane re-entry is exactly the event that drove the dispatcher re-claim
+    loop. It emits a normal ``completed`` handoff instead."""
+    with kb.connect() as conn:
+        tid = _author_card(
+            conn,
+            owner_map="ready: reddy, review: avram, blocked-acceptance: casey",
+            assignee="avram",
+        )
+
+        kb.complete_task(conn, tid, summary="curation sweep verified complete")
+
+        events = kb.list_events(conn, tid)
+        review_moves = [
+            e for e in events
+            if e.kind == "status_changed" and (e.payload or {}).get("to") == "review"
+        ]
+        assert not review_moves, (
+            "a research/curation completion must NOT re-enter the review lane — "
+            "that status_changed -> review is what re-triggers the dispatcher"
+        )
+        # The redirect refusal must also NOT fire: this is a legitimate terminal
+        # completion, not an unresolved-reviewer refusal.
+        refusals = [
+            e for e in events if e.kind == "completion_redirect_unresolved"
+        ]
+        assert not refusals, (
+            "a research completion is a clean done, not a redirect refusal"
+        )
+        completed = [e for e in events if e.kind == "completed"]
+        assert completed, "a research completion must emit a 'completed' handoff event"
+
+
+def test_research_completed_card_is_not_reclaimable(kanban_home: Path) -> None:
+    """A ``done`` research card must not be re-claimable by the dispatcher — the
+    end-to-end proof that the self-bounce loop is broken (no re-spawn)."""
+    with kb.connect() as conn:
+        tid = _author_card(
+            conn,
+            owner_map="ready: reddy, review: avram, blocked-acceptance: casey",
+            assignee="avram",
+        )
+        kb.complete_task(conn, tid, summary="curation sweep verified complete")
+        assert kb.get_task(conn, tid).status == "done"
+
+        # A ``done`` card is claimable from neither the ready lane nor the review
+        # lane — both re-claim paths are the loop's respawn mechanism.
+        assert kb.claim_task(conn, tid) is None, "a done card must not re-claim (ready)"
+        assert kb.claim_review_task(conn, tid) is None, (
+            "a done card must not re-claim (review) — the self-bounce respawn path"
+        )
+        assert kb.get_task(conn, tid).status == "done", "card must stay done"

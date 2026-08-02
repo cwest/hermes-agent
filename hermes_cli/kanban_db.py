@@ -307,6 +307,24 @@ EDITORIAL_REVIEW_SKILL = "editorial-review"
 # through to the code-review default, preserving the historical behavior.
 _WRITING_REVIEWERS = frozenset({"perkins"})
 
+# Review-lane owners (owner map ``review`` lane) that belong to the RESEARCH team.
+# The research cohort (reddy/avram, repo cwest/knowledge-base) publishes directly
+# to the CI-gated knowledge base and NEVER enters the review lane or the tri-state
+# contract — the ``research-excluded-lane`` rule (sdlc-review). But the research
+# owner map is ``{ready: reddy, review: avram}``, so ``avram`` is BOTH the
+# curation/research WORKER and the ``review``-lane owner. A no-PR curation sweep is
+# claimed and worked by avram; if avram's ``complete_task`` took the generic
+# author->review redirect, the review owner resolved back to avram, the dispatcher
+# re-claimed from ``review`` and re-spawned avram — an infinite ``running ->
+# review -> running`` self-bounce on already-finished, no-PR work. Naming the
+# research reviewer here lets ``complete_task`` honor the research-excluded-lane
+# rule in ROUTING code (not just prose): a completion whose resolved review owner
+# is in this set skips the redirect and terminates at ``done`` — the true terminus
+# of a no-PR research/curation sweep, which has no PR-merge webhook to land on.
+# This mirrors the ``_WRITING_REVIEWERS`` team-classification precedent above and
+# does NOT weaken the code (lamport) or writing (perkins) redirect.
+_RESEARCH_REVIEWERS = frozenset({"avram"})
+
 # Parses the ``state_owners={lane: owner, ...}`` owner-map fragment out of a
 # card's ``submit``-stage audit comment. This is the SAME signal the
 # ``stage-pr-review`` skill's ``resolve_reviewer`` reads — there is deliberately
@@ -6740,7 +6758,24 @@ def complete_task(
         ).fetchone()
         if _row is not None and _row["status"] in ("running", "ready"):
             _review_owner = _review_owner_from_owner_map(conn, task_id)
-            if _review_owner:
+            # research-excluded-lane: the research cohort's owner map names the
+            # SAME profile (avram) as both the curation/research WORKER and the
+            # ``review``-lane owner. Redirecting such a completion into ``review``
+            # would resolve the reviewer back to the completing worker and let the
+            # dispatcher re-claim + re-spawn it against itself — an infinite
+            # ``running -> review -> running`` self-bounce on already-finished,
+            # no-PR work (t_f91cf0ee, runs 1901..1908). The research team never
+            # enters the review lane; a no-PR research/curation sweep's true
+            # terminus is ``done`` and it has no PR-merge webhook to stop the
+            # bounce. So when the resolved review owner is a research reviewer we
+            # SKIP the redirect entirely (neither the review MOVE below nor the
+            # review-eligible refusal) and fall through to the ``-> done`` UPDATE.
+            # This honors the rule in routing code, mirroring the
+            # ``_WRITING_REVIEWERS`` team classification, WITHOUT weakening the
+            # code (lamport) / writing (perkins) redirect.
+            if _review_owner and _review_owner in _RESEARCH_REVIEWERS:
+                pass
+            elif _review_owner:
                 with write_txn(conn):
                     if expected_run_id is None:
                         cur = conn.execute(
