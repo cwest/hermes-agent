@@ -307,6 +307,19 @@ EDITORIAL_REVIEW_SKILL = "editorial-review"
 # through to the code-review default, preserving the historical behavior.
 _WRITING_REVIEWERS = frozenset({"perkins"})
 
+# Review-lane owners (owner map ``review`` lane) that belong to the RESEARCH
+# team. The research cohort publishes directly to the CI-gated knowledge base and
+# never enters the tri-state review contract (``sdlc-review``'s
+# ``research-excluded-lane`` rule). A research owner map still NAMES a ``review``
+# owner (``{ready: reddy, review: avram}``), so the author-lane redirect would
+# otherwise MOVE a no-PR curation sweep to ``review`` — where an ``sdlc-review``
+# worker finds no PR, emits no verdict, and re-completes forever (the live
+# 2026-08-02 ``t_2c92b707`` respawn loop). A research reviewer therefore
+# identifies the ONE lane the no-PR completion exemption applies to (see
+# ``_card_is_research_review_exempt``); a research card that DOES open a
+# stewardship PR still enters review normally via the PR-open webhook path.
+_RESEARCH_REVIEWERS = frozenset({"avram"})
+
 # Parses the ``state_owners={lane: owner, ...}`` owner-map fragment out of a
 # card's ``submit``-stage audit comment. This is the SAME signal the
 # ``stage-pr-review`` skill's ``resolve_reviewer`` reads — there is deliberately
@@ -6515,6 +6528,46 @@ def _card_is_review_eligible(conn: sqlite3.Connection, task_id: str) -> bool:
     return _card_has_pr_artifact(conn, task_id)
 
 
+def _card_is_research_review_exempt(
+    conn: sqlite3.Connection, task_id: str, review_owner: Optional[str]
+) -> bool:
+    """Return True when a research card's author completion is review-EXEMPT.
+
+    The research cohort publishes directly to the CI-gated knowledge base and
+    never enters the tri-state review contract (``sdlc-review``'s
+    ``research-excluded-lane`` rule). A write-time curation sweep is filed with
+    the research owner map ``{ready: reddy, review: avram}`` — which NAMES a
+    ``review`` owner — but when the sweep finds nothing actionable it completes
+    with NO PR (an ``okf-curation`` hard rule, and the write-time loop guard).
+
+    Without this exemption the author-lane redirect resolves ``review: avram``
+    and MOVEs the no-PR sweep to ``review``, where an ``sdlc-review`` worker
+    finds no PR, can emit no verdict, and re-completes → back to ``review`` →
+    respawn: an infinite loop (observed live 2026-08-02 on ``t_2c92b707``).
+
+    The exemption is DOUBLY scoped so it cannot leak past the no-PR research
+    sweep it exists for:
+
+      * by REVIEWER — the resolved ``review`` owner must be a research reviewer
+        (:data:`_RESEARCH_REVIEWERS`). A code card (review: lamport) or writing
+        card (review: perkins) is never exempt; its no-PR author completion
+        still MOVEs to review as before.
+      * by ARTIFACT — the card must carry NO PR artifact
+        (:func:`_card_has_pr_artifact` is False). A research card that DID open
+        a stewardship PR is NOT exempt: its author completion MOVEs it to review
+        normally (the PR-open webhook path is unbroken), exactly like any other
+        PR-bearing card.
+
+    A ``None`` ``review_owner`` (no resolvable reviewer) is not exempt here — that
+    case is handled by the existing review-eligibility refusal, not this
+    exemption. Returns True only when the card is a genuine no-PR research sweep
+    that must land in ``done`` in one call.
+    """
+    if not review_owner or review_owner not in _RESEARCH_REVIEWERS:
+        return False
+    return not _card_has_pr_artifact(conn, task_id)
+
+
 class HallucinatedCardsError(ValueError):
     """Raised by ``complete_task`` when ``created_cards`` contains ids
     that don't exist or weren't created by the completing worker.
@@ -6738,8 +6791,30 @@ def complete_task(
             "SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        if _row is not None and _row["status"] in ("running", "ready"):
-            _review_owner = _review_owner_from_owner_map(conn, task_id)
+        _review_owner = (
+            _review_owner_from_owner_map(conn, task_id) if _row is not None else None
+        )
+        # Research review-exemption: a research card (review owner avram) with NO
+        # PR artifact is a write-time curation sweep that found nothing actionable.
+        # The research cohort publishes directly to the CI-gated KB and never
+        # enters the tri-state review contract, so this no-PR sweep must complete
+        # straight to ``done`` — MOVING it to ``review`` (or REFUSING it via the
+        # review-eligibility arm below) spawns an sdlc-review worker that finds no
+        # PR, emits no verdict, and re-completes forever (the live 2026-08-02
+        # ``t_2c92b707`` respawn loop). The exemption is doubly scoped (research
+        # reviewer AND no PR), so a research card that DID open a stewardship PR
+        # still MOVEs to review, and code/writing cards are untouched. Skipping the
+        # WHOLE redirect block (both the MOVE and the refusal) lands the card in
+        # the ``-> done`` UPDATE at the end of this function, which is exactly what
+        # a no-PR research sweep needs.
+        _research_exempt = _card_is_research_review_exempt(
+            conn, task_id, _review_owner
+        )
+        if (
+            _row is not None
+            and _row["status"] in ("running", "ready")
+            and not _research_exempt
+        ):
             if _review_owner:
                 with write_txn(conn):
                     if expected_run_id is None:
