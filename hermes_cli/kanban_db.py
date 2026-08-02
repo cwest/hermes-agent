@@ -5698,6 +5698,25 @@ def reconcile_pass_acceptance(
     return reconciled
 
 
+_REVIEW_HANDOFF_RE = re.compile(
+    r"(awaiting|await|ready for|pending)\s+(a\s+)?(re-?)?review"
+    r"|re-?review\b"
+    r"|review-required"
+    r"|awaiting-casey-signoff",
+    re.IGNORECASE,
+)
+
+
+def _is_review_handoff(reason: "Optional[str]") -> bool:
+    """True when a dependency-wait reason is really a review handoff.
+
+    A handoff means the worker FINISHED and wants the next lane; it is not a
+    parent-task dependency.  Promoting these back to ``ready`` respawns the
+    author on completed work (the t_b6a0a903 respawn loop).
+    """
+    return bool(reason) and bool(_REVIEW_HANDOFF_RE.search(reason))
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -7975,10 +7994,17 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            # A worker that finished its lane and is asking for a HANDOFF is
+            # not waiting on a parent task.  Parking it in ``todo`` lets the
+            # ``recompute_ready`` sweep promote it to ``ready``, where the
+            # dispatcher respawns the AUTHOR on already-complete work — the
+            # card ping-pongs instead of advancing.  Route those to ``review``
+            # so the sweep leaves them alone and the reviewer picks them up.
+            _dest = "review" if _is_review_handoff(reason) else "todo"
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status        = 'todo',
+                   SET status        = ?,
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
@@ -7986,8 +8012,8 @@ def block_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (_dest, kind, task_id) if expected_run_id is None
+                else (_dest, kind, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
