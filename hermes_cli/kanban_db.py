@@ -307,6 +307,21 @@ EDITORIAL_REVIEW_SKILL = "editorial-review"
 # through to the code-review default, preserving the historical behavior.
 _WRITING_REVIEWERS = frozenset({"perkins"})
 
+# Review-lane owners (owner map ``review`` lane) that belong to the RESEARCH
+# cohort (reddy/avram, repo ``cwest/knowledge-base``). The research cohort
+# publishes directly to the CI-gated knowledge base and, by design, NEVER enters
+# the review lane or the tri-state contract (``sdlc-review``'s
+# ``research-excluded-lane``): a curation sweep that finds nothing actionable
+# completes with NO PR and must TERMINATE at ``done``, not be shunted into
+# review. So although a research card's stamped owner map names a ``review``
+# owner (``{ready: reddy, review: avram}``), that owner is not a review-LANE
+# handoff — the author-lane redirect (:func:`complete_task`) is exempt for it.
+# Keyed on the review COHORT rather than the workspace kind because a research
+# curation sweep and an engineering edit-in-place card are BOTH ``scratch``/no-PR
+# and only the cohort distinguishes them. Mirrors ``_WRITING_REVIEWERS`` and is
+# extensible to a future research reviewer without touching the redirect logic.
+_RESEARCH_REVIEWERS = frozenset({"avram"})
+
 # Parses the ``state_owners={lane: owner, ...}`` owner-map fragment out of a
 # card's ``submit``-stage audit comment. This is the SAME signal the
 # ``stage-pr-review`` skill's ``resolve_reviewer`` reads — there is deliberately
@@ -6740,7 +6755,28 @@ def complete_task(
         ).fetchone()
         if _row is not None and _row["status"] in ("running", "ready"):
             _review_owner = _review_owner_from_owner_map(conn, task_id)
-            if _review_owner:
+            # Research-cohort exemption: a card whose review owner is a research
+            # reviewer (:data:`_RESEARCH_REVIEWERS` — reddy/avram, repo
+            # ``cwest/knowledge-base``) does NOT enter the review lane. The
+            # research cohort publishes directly to the CI-gated knowledge base
+            # and is excluded from the review lane and the tri-state contract by
+            # design (``sdlc-review``'s ``research-excluded-lane``): a curation
+            # sweep that finds nothing actionable completes with NO PR and must
+            # TERMINATE at ``done``. Such a card's stamped owner map DOES name a
+            # ``review`` owner (``{ready: reddy, review: avram}``), so the coarse
+            # "owner map declares a review owner" test wrongly shunted it into
+            # ``review`` — where the dispatcher re-claimed the ``review`` card and
+            # re-spawned the sweep worker (who is BOTH author AND review owner),
+            # looping forever on already-finished work (live ``t_f91cf0ee``).
+            # Because the review owner IS resolved (just not a review-LANE
+            # handoff), skip BOTH the move-to-review branch below AND the
+            # eligibility refusal after it, so the card falls through to the
+            # ``-> done`` UPDATE — the intended ``ready -> running -> done``
+            # lifecycle. The discriminator is the review COHORT, not the workspace
+            # kind: a research curation sweep and an engineering edit-in-place
+            # card (``t_baaa247f``) are BOTH ``scratch``/no-PR and only the cohort
+            # tells them apart — an engineering scratch card still MOVEs to review.
+            if _review_owner and _review_owner not in _RESEARCH_REVIEWERS:
                 with write_txn(conn):
                     if expected_run_id is None:
                         cur = conn.execute(
@@ -6845,7 +6881,19 @@ def complete_task(
             # review-exempt cards are NOT refused and complete to ``done`` exactly
             # as before (there is no ``kind`` column; the map lives in the audit
             # trail by design).
-            elif _card_is_review_eligible(conn, task_id):
+            #
+            # A RESEARCH-cohort card (review owner in :data:`_RESEARCH_REVIEWERS`)
+            # is ALSO not refused here: its review owner DID resolve (it just is
+            # not a review-LANE handoff — the research cohort is excluded from the
+            # review lane by design, see the exemption above), so it must fall
+            # through to the ``-> done`` UPDATE rather than be trapped as an
+            # unresolved-reviewer refusal. Guarding the ``elif`` on the same
+            # research check keeps the two arms consistent — the research
+            # exemption releases the card to ``done`` on both paths.
+            elif (
+                _review_owner not in _RESEARCH_REVIEWERS
+                and _card_is_review_eligible(conn, task_id)
+            ):
                 with write_txn(conn):
                     _append_event(
                         conn, task_id, "completion_redirect_unresolved",
