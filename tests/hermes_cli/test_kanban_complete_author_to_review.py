@@ -279,3 +279,50 @@ def test_generic_blocked_card_still_completes_to_done(kanban_home: Path) -> None
 
         assert ok is True, "a generic blocked card must stay completable"
         assert kb.get_task(conn, tid).status == "done"
+
+
+# ---------------------------------------------------------------------------
+# RED 7 — a card whose owner map is the Python-repr QUOTED form still
+# completes-to-review (not completion_redirect_unresolved).
+#
+# The observed live wedge (curate-sweep card t_2c92b707): a submit-audit
+# comment carrying ``state_owners={'ready': 'reddy', 'review': 'avram'}``.
+# The reader returned None for the quoted form, so ``complete_task`` could
+# neither move the card to review (owner None) nor land it done (the
+# completion_redirect_unresolved refusal branch) — the card WEDGED. With the
+# reader dequoting both sides, the same author completion MOVES the card to
+# review + the (dequoted) review owner.
+# ---------------------------------------------------------------------------
+
+
+def test_author_completion_with_quoted_owner_map_moves_to_review(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = _author_card(
+            conn,
+            owner_map=(
+                "'ready': 'eckert', 'review': 'lamport', "
+                "'blocked-acceptance': 'casey'"
+            ),
+        )
+
+        ok = kb.complete_task(conn, tid, summary="impl done, quoted map")
+
+        assert ok is True, "completion must succeed as a move, not refuse"
+        task = kb.get_task(conn, tid)
+        assert task.status == "review", (
+            "a quoted-owner-map card must MOVE to review, not wedge / land done"
+        )
+        assert task.assignee == "lamport", "assignee is the dequoted review owner"
+        assert task.completed_at is None, "a review move is not a completion"
+
+        # And it must NOT have hit the unresolved-redirect refusal branch.
+        refusals = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "completion_redirect_unresolved"
+        ]
+        assert not refusals, (
+            "a resolvable (quoted) owner map must not emit "
+            "completion_redirect_unresolved"
+        )
