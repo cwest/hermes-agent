@@ -4799,6 +4799,17 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
+_DECISIVE_MOVE_ACTORS = frozenset({
+    # Both one-card verbs park a card deliberately on a human. `move_card` is
+    # the generic lane transition; `accept_card` is the acceptance park itself
+    # — the MOST common way a card lands on Casey. Omitting accept_card let
+    # `recompute_ready` flip an acceptance card blocked -> ready seconds after
+    # the PASS, fighting the reviewer in a loop.
+    "onecard:move_card",
+    "onecard:accept_card",
+})
+
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by a deliberate
     human-gated transition (#28712).
@@ -4872,7 +4883,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
             data = json.loads(payload)
         except (ValueError, TypeError):
             continue
-        if not isinstance(data, dict) or data.get("by") != "onecard:move_card":
+        if not isinstance(data, dict) or data.get("by") not in _DECISIVE_MOVE_ACTORS:
             continue
         return data.get("to") == "blocked"
     return False
