@@ -7062,6 +7062,123 @@ def complete_task(
     return True
 
 
+# ---------------------------------------------------------------------------
+# Refusal diagnosis for a failed ``complete_task``
+# ---------------------------------------------------------------------------
+#
+# ``complete_task`` returns a bare ``False`` for SIX structurally distinct
+# reasons, each of which the code already knows precisely at the point it
+# refuses (five of them write a dedicated audit event). Historically every
+# caller collapsed that ``False`` into one string — "unknown id or already
+# terminal" — which is actively wrong for most of them: an
+# ``awaiting-casey-signoff`` park, a missing PR, an unresolved review owner, or
+# a stale run token is neither an unknown id nor a terminal card. One misleading
+# string sent a worker chasing a fabricated board-DB split defect (t_fa343520):
+# refusal messages are read as evidence, so they must report the reason the code
+# actually recorded.
+#
+# The refusal reason is derived AUTHORITATIVELY from the audit event the guard
+# just wrote in the same connection (race-free), with a task-row fallback for
+# the two guards that do not write an event (the final ``-> done`` UPDATE and
+# the review-redirect race — both key on ``cur.rowcount != 1``). Only when the
+# task genuinely does not exist, or is genuinely already terminal, is the
+# "unknown id or already terminal" wording used — which is exactly what those
+# cases are.
+
+_COMPLETION_REFUSAL_EVENT_KINDS = (
+    "completion_refused_acceptance",
+    "completion_refused_missing_pr",
+    "completion_redirect_unresolved",
+)
+
+
+def explain_completion_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int] = None,
+) -> str:
+    """Return a specific, actionable reason a ``complete_task`` call returned
+    ``False``, and what the worker should do about it.
+
+    Call this ONLY on the ``False`` path of :func:`complete_task`. It reads the
+    reason the guards already know — the newest ``completion_refused_*`` /
+    ``completion_redirect_unresolved`` audit event when a guard wrote one, else
+    the task row — so the message names the actual cause instead of the
+    misleading "unknown id or already terminal" guess. The
+    "unknown id or already terminal" wording is reserved for the two cases where
+    it is genuinely true (no such row; the row is already ``done``/``archived``).
+    """
+    # 1) A guard that refused BEFORE the write txn wrote a dedicated audit
+    #    event. If the newest such event post-dates the last ``completed``
+    #    event, it is THIS refusal — trust it over any re-derivation.
+    row = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE task_id = ? AND kind IN "
+        "('completion_refused_acceptance', 'completion_refused_missing_pr', "
+        "'completion_redirect_unresolved', 'completed') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    latest_kind = row["kind"] if row else None
+    if latest_kind == "completion_refused_acceptance":
+        return (
+            "refused: this card is parked in the acceptance lane awaiting "
+            "Casey's sign-off (a reviewed PASS). done means Casey merged/"
+            "accepted — a worker cannot complete it. Do NOT retry; leave it for "
+            "the merge path."
+        )
+    if latest_kind == "completion_refused_missing_pr":
+        return (
+            "refused: this card builds in a git worktree and owes a reviewable "
+            "PR, but no PR artifact exists yet. Commit, push, and open the PR "
+            "(then post its URL in a comment) before completing — do not retry "
+            "kanban_complete until the PR is open."
+        )
+    if latest_kind == "completion_redirect_unresolved":
+        return (
+            "refused: this card is review-eligible but no review owner could be "
+            "resolved from its owner map, so it cannot be handed off to review "
+            "and must not land in done past a reviewer. Fix the card's routing "
+            "(owner map) / review lane rather than retrying kanban_complete."
+        )
+
+    # 2) No guard event newer than the last completion — the refusal came from
+    #    a ``cur.rowcount != 1`` in a UPDATE (the final ``-> done`` write or the
+    #    review-redirect race). Disambiguate from the task row.
+    task_row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if task_row is None:
+        return f"{task_id}: unknown id or already terminal"
+    status = task_row["status"]
+    if status in ("done", "archived"):
+        return f"{task_id}: unknown id or already terminal"
+    # The card exists and is in a LIVE lane — it is neither unknown nor
+    # terminal. The only remaining ``rowcount != 1`` cause is a run-token
+    # mismatch: the completer holds a stale run id (the card was reclaimed and
+    # re-claimed under a newer run), or the card moved lane between the guard's
+    # status read and the write. Retrying with the same stale token will keep
+    # failing — this is not a bug in the tool.
+    if (
+        expected_run_id is not None
+        and task_row["current_run_id"] is not None
+        and int(task_row["current_run_id"]) != int(expected_run_id)
+    ):
+        return (
+            f"refused: this card ({task_id}, status {status!r}) is live but was "
+            f"reclaimed — your run token (run {expected_run_id}) is stale; the "
+            f"current run is {task_row['current_run_id']}. A newer run owns the "
+            f"card, so this completion is superseded. Do not retry with the old "
+            f"token; the card is neither unknown nor terminal."
+        )
+    return (
+        f"refused: this card ({task_id}) is in status {status!r} and could not "
+        f"be completed — it likely moved lane concurrently. It is neither "
+        f"unknown nor terminal; re-read the card before retrying."
+    )
+
+
 # The lanes a reconciliation may walk a ``done`` card back into. ``done`` is
 # reserved for Casey's merge/accept; reopen returns the card to a LIVE lane so
 # the lifecycle can proceed. Excludes the terminal ``done``/``archived`` (nothing

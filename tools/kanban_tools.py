@@ -702,7 +702,9 @@ def _handle_complete(args: dict, **kw) -> str:
                 )
             if not ok:
                 return tool_error(
-                    f"could not complete {tid} (unknown id or already terminal)"
+                    kb.explain_completion_refusal(
+                        conn, tid, expected_run_id=_worker_run_id(tid)
+                    )
                 )
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
