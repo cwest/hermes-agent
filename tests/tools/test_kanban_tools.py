@@ -314,6 +314,74 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def _stage_worktree_task_for_worker(assignee: str = "test-worker") -> str:
+    """Create a claimed ``worktree`` card owned by the worker profile — the
+    shape that owes a reviewable PR — and return its id. Used to exercise the
+    verified-no-op declaration threaded through ``_handle_complete``."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="audit sweep", assignee=assignee,
+            workspace_kind="worktree", workspace_path="/Users/x/src/repo",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    return tid
+
+
+def test_complete_threads_verified_no_op_to_done(monkeypatch, worker_env):
+    """``verified_no_op`` + ``no_pr_reason`` on the tool wrapper reach the
+    kernel: a worktree card with no PR closes honestly to ``done`` and records
+    the distinguishable ``completion_no_pr_verified`` event."""
+    from tools import kanban_tools as kt
+    tid = _stage_worktree_task_for_worker()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+
+    out = kt._handle_complete({
+        "summary": "audited; already conformant",
+        "verified_no_op": True,
+        "no_pr_reason": "corpus already conformant; no drift found",
+    })
+    assert json.loads(out)["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "done"
+        events = kb.list_events(conn, tid)
+        verified = [e for e in events if e.kind == "completion_no_pr_verified"]
+        assert verified, "the no-op declaration must reach the kernel event"
+        assert verified[0].payload.get("no_pr_reason") == (
+            "corpus already conformant; no drift found"
+        )
+    finally:
+        conn.close()
+
+
+def test_complete_without_declaration_still_refused_via_tool(monkeypatch, worker_env):
+    """Without the declaration the tool wrapper still hits the missing-PR guard:
+    a worktree card with no PR is refused (tool returns an error, card stays
+    running) — the wrapper does not weaken the guard."""
+    from tools import kanban_tools as kt
+    tid = _stage_worktree_task_for_worker()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+
+    out = kt._handle_complete({"summary": "wrote files, no PR"})
+    assert json.loads(out).get("error"), "an undeclared worktree card must be refused"
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+        events = kb.list_events(conn, tid)
+        assert [e for e in events if e.kind == "completion_refused_missing_pr"]
+        assert not [e for e in events if e.kind == "completion_no_pr_verified"]
+    finally:
+        conn.close()
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt
