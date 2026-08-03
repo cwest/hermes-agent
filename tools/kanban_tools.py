@@ -565,6 +565,10 @@ def _handle_complete(args: dict, **kw) -> str:
             pass
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
+    verified_no_op = bool(args.get("verified_no_op"))
+    no_pr_reason = args.get("no_pr_reason")
+    if no_pr_reason is not None:
+        no_pr_reason = redact_sensitive_text(str(no_pr_reason), force=True)
     if created_cards is not None:
         if isinstance(created_cards, str):
             # Accept a single id as a string for convenience.
@@ -672,6 +676,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    verified_no_op=verified_no_op,
+                    no_pr_reason=no_pr_reason,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1756,6 +1762,35 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workspace are copied to durable task attachments before "
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
+                ),
+            },
+            "verified_no_op": {
+                "type": "boolean",
+                "description": (
+                    "Declare a VERIFIED NO-OP close for a card that builds in a "
+                    "git worktree but legitimately produces NO pull request — an "
+                    "audit / curation card whose contract is \"open a PR ONLY if "
+                    "a change is warranted; a verified no-op is a correct and "
+                    "complete outcome,\" run against an already-clean corpus. "
+                    "Normally such a card is refused (it owes a PR); set this to "
+                    "true AND supply ``no_pr_reason`` to close it honestly to "
+                    "``done`` instead. This is NOT a merge and NOT an acceptance "
+                    "bypass — use it ONLY when you verified there is genuinely "
+                    "nothing to change. Ignored unless ``no_pr_reason`` is a "
+                    "non-empty string."
+                ),
+            },
+            "no_pr_reason": {
+                "type": "string",
+                "description": (
+                    "Required alongside ``verified_no_op=true``: a one-to-two "
+                    "sentence, legible reason the card correctly produced no PR "
+                    "(e.g. \"corpus already conformant; no drift found across "
+                    "239 nodes\"). Recorded on a distinguishable "
+                    "``completion_no_pr_verified`` audit event so the no-op close "
+                    "is as traceable as a merged PR. A blank/whitespace-only "
+                    "reason does not unlock the no-op terminal — the card is "
+                    "refused as if undeclared."
                 ),
             },
             "board": _board_schema_prop(),

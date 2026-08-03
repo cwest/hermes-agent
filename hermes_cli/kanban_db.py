@@ -6570,6 +6570,8 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     allow_acceptance_complete: bool = False,
+    verified_no_op: bool = False,
+    no_pr_reason: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -6625,8 +6627,53 @@ def complete_task(
     acceptance and missing-PR guards. Non-pipeline cards (scratch / dir /
     ``~/.hermes`` edit-in-place) with no review owner complete to ``done``
     unchanged.
+
+    ``verified_no_op`` + ``no_pr_reason`` give a PR-requiring card a sanctioned,
+    HONEST terminal for a VERIFIED NO-OP. An audit / curation card whose contract
+    is "open a PR ONLY if a change is warranted; a verified no-op close is a
+    correct and complete outcome" is filed with a ``worktree`` workspace (the
+    auditor needs a real checkout to run conformance tooling in) yet produces NO
+    PR when the corpus is already clean. Without this it hit the missing-PR guard
+    with no reachable lane — ``-> done`` refused, ``-> review`` re-claimed — a
+    live respawn loop (``t_fa343520``, four runs). When the completing worker
+    DECLARES the no-op (``verified_no_op=True`` with a non-empty ``no_pr_reason``)
+    the missing-PR guard accepts the declaration in place of the PR artifact and
+    the card TERMINATES at ``done``, emitting a distinguishable
+    ``completion_no_pr_verified`` event carrying the declared reason.
+
+    Why ``done`` is the correct terminal (the part most likely to be wrong):
+    ``done`` means "Casey merged/accepted." A verified no-op IS the accepted
+    outcome — the worker asserts, on the card's own contract, that the correct
+    change is the null change; there is no diff to merge and nothing to review, so
+    the accepted null-diff belongs in ``done`` exactly as a merged PR does. This
+    is the SAME terminal the research-cohort exemption already reaches for a
+    curation sweep that finds nothing actionable (``ready -> running -> done``
+    with no PR); the declaration generalizes that honest terminal to any worker
+    on a PR-requiring card, gated on an EXPLICIT declaration so it can never be a
+    silent bypass. It is emphatically NOT the ``allow_acceptance_complete`` path
+    (which fakes a human merge that never happened) and it does NOT enter the
+    review lane (there is nothing to review — that lane is exactly where the
+    respawn loop was observed). The declaration is the ONLY thing that unlocks the
+    terminal: a ``worktree`` card with no PR and no valid declaration is refused
+    exactly as before (``completion_refused_missing_pr``), keeping the guard
+    closed for its designed case. A blank / whitespace-only ``no_pr_reason`` does
+    NOT unlock — the no-op must be legible or it is treated as undeclared.
     """
     now = int(time.time())
+
+    # Normalize the verified-no-op declaration ONCE. It is honored only when the
+    # worker BOTH sets ``verified_no_op`` AND supplies a non-blank
+    # ``no_pr_reason`` — a legible reason is mandatory so the no-op close is
+    # auditable, never a silent bypass. A bare flag with no reason (or a
+    # whitespace-only reason) is treated as undeclared, so the missing-PR guard
+    # refuses it exactly as before. The merge override takes precedence: an
+    # acceptance never masquerades as a worker-declared no-op.
+    _no_op_reason = (no_pr_reason or "").strip()
+    _declared_no_op = (
+        bool(verified_no_op)
+        and bool(_no_op_reason)
+        and not allow_acceptance_complete
+    )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -6710,6 +6757,18 @@ def complete_task(
     # PR-requiring card in the author lane with no PR must be REFUSED, not
     # silently shunted into review — the missing-PR refusal is the stricter gate
     # and takes precedence over the redirect.
+    #
+    # ESCAPE: a VERIFIED NO-OP declared by the worker (``verified_no_op=True`` +
+    # a non-blank ``no_pr_reason``, normalized above into ``_declared_no_op``) is
+    # the sanctioned, honest terminal for a PR-requiring card whose contract
+    # permits "no change warranted." Instead of refusing, we record a
+    # distinguishable ``completion_no_pr_verified`` event carrying the declared
+    # reason and DO NOT return — the card falls through to the ``-> done`` UPDATE
+    # (skipping the author-lane→review redirect below via the same
+    # ``_declared_no_op`` guard). See the function docstring for why ``done`` is
+    # the correct terminal for an accepted null-diff. The declaration is the ONLY
+    # thing that changes this branch's behavior; an undeclared card is refused
+    # exactly as before, so the guard stays closed for its designed case.
     if not allow_acceptance_complete:
         _ws_row = conn.execute(
             "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
@@ -6718,20 +6777,38 @@ def complete_task(
         if _ws_row is not None and _card_requires_pr(
             _ws_row["workspace_kind"], _ws_row["workspace_path"]
         ) and not _card_has_pr_artifact(conn, task_id):
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "completion_refused_missing_pr",
-                    {
-                        "workspace_kind": _ws_row["workspace_kind"],
-                        "workspace_path": _ws_row["workspace_path"],
-                        "summary_preview": (
-                            (summary or result or "").strip().splitlines()[0][:200]
-                            if (summary or result)
-                            else None
-                        ),
-                    },
-                )
-            return False
+            if _declared_no_op:
+                # Honest verified-no-op terminal: record the auditable event and
+                # fall through to ``-> done``. Not a refusal, not an acceptance.
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_no_pr_verified",
+                        {
+                            "workspace_kind": _ws_row["workspace_kind"],
+                            "workspace_path": _ws_row["workspace_path"],
+                            "no_pr_reason": _no_op_reason,
+                            "summary_preview": (
+                                (summary or result or "").strip().splitlines()[0][:200]
+                                if (summary or result)
+                                else None
+                            ),
+                        },
+                    )
+            else:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_refused_missing_pr",
+                        {
+                            "workspace_kind": _ws_row["workspace_kind"],
+                            "workspace_path": _ws_row["workspace_path"],
+                            "summary_preview": (
+                                (summary or result or "").strip().splitlines()[0][:200]
+                                if (summary or result)
+                                else None
+                            ),
+                        },
+                    )
+                return False
 
     # Author-lane redirect: an AUTHOR finishing their lane MOVES the card to the
     # REVIEW lane, it does NOT go straight to ``done``. ``done`` means "Casey
@@ -6743,6 +6820,10 @@ def complete_task(
     #
     # The redirect fires only when ALL hold:
     #   * the merge override is NOT set (Casey's merge is the one legit ``->done``);
+    #   * a VERIFIED NO-OP was NOT declared — a declared no-op terminates at
+    #     ``done`` (its ``completion_no_pr_verified`` event already landed above),
+    #     never in review: there is no PR and no diff to review, and the review
+    #     lane is exactly where the observed respawn loop happened;
     #   * the card is in the author lane — ``running`` or ``ready`` — so the
     #     acceptance refusal above and the manual-complete-a-stuck-``blocked``-card
     #     flow are both untouched;
@@ -6756,7 +6837,7 @@ def complete_task(
     # 'blocked')``) does not match — a clean no-op (returns False). A rework
     # re-completion from ``ready`` after a review bounce correctly moves back to
     # review for re-review.
-    if not allow_acceptance_complete:
+    if not allow_acceptance_complete and not _declared_no_op:
         _row = conn.execute(
             "SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
             (task_id,),
