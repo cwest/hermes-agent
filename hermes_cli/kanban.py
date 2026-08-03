@@ -2256,7 +2256,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                print(
+                    "cannot complete "
+                    + kb.explain_completion_refusal(
+                        conn, tid, expected_run_id=_worker_run_id_for(tid)
+                    ),
+                    file=sys.stderr,
+                )
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1

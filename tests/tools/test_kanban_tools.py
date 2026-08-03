@@ -3248,3 +3248,204 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# kanban_complete refusal messages report the ACTUAL cause, not a misleading
+# "unknown id or already terminal" guess.
+#
+# complete_task returns a bare False for several distinct reasons, and the tool
+# used to render every one of them as
+#     could not complete <tid> (unknown id or already terminal)
+# That string is wrong for most of them: the card is neither unknown nor
+# terminal -- a guard refused and already wrote a precise audit event naming
+# why. One misleading string sent a worker chasing a fabricated board-DB bug
+# (the t_fa343520 incident). These tests pin that a refused completion reports
+# the guard's own cause, and that the "unknown id / already terminal" wording is
+# reserved for the cases where it is genuinely true.
+# ---------------------------------------------------------------------------
+
+
+def _make_worker_card(monkeypatch, **create_kwargs):
+    """Create + claim a card, then scope this process to it as its worker.
+
+    Returns (kb, tid). Mirrors the worker_env fixture's isolation but lets each
+    test stage a card with a specific workspace kind / assignee so it trips a
+    specific complete_task guard.
+    """
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, assignee="test-worker", **create_kwargs)
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return kb, tid
+
+
+def test_complete_missing_pr_refusal_reports_missing_pr_cause(worker_env, monkeypatch):
+    """A worktree card with no PR is refused by the missing-PR guard. The tool
+    must report the missing-PR cause -- NOT "unknown id or already terminal"."""
+    from tools import kanban_tools as kt
+
+    kb, tid = _make_worker_card(
+        monkeypatch,
+        title="feature work",
+        workspace_kind="worktree",
+        workspace_path="/Users/x/src/repo",
+    )
+
+    out = kt._handle_complete({"summary": "wrote files, never opened a PR"})
+    d = json.loads(out)
+    assert d.get("ok") is not True, out
+    err = d.get("error", "")
+    assert "unknown id or already terminal" not in err, (
+        f"missing-PR refusal must not report the unknown/terminal guess: {err!r}"
+    )
+    assert "PR" in err, f"the cause must name the missing PR: {err!r}"
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_acceptance_refusal_reports_acceptance_cause(worker_env, monkeypatch):
+    """An acceptance-lane card (parked for Casey's sign-off) refused by the
+    acceptance guard must report its OWN distinct cause, not the missing-PR cause
+    and not the unknown/terminal guess."""
+    from tools import kanban_tools as kt
+
+    kb, tid = _make_worker_card(monkeypatch, title="feature work")
+    signoff_reason = (
+        "awaiting-casey-signoff: reviewed PASS -- "
+        "https://github.com/cwest/hermes-agent/pull/71; threads resolved; "
+        "240 tests green. Ready to merge."
+    )
+    conn = kb.connect()
+    try:
+        assert kb.block_task(
+            conn, tid, reason=signoff_reason,
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+    finally:
+        conn.close()
+
+    out = kt._handle_complete({"summary": "worker tried to complete"})
+    d = json.loads(out)
+    assert d.get("ok") is not True, out
+    err = d.get("error", "")
+    assert "unknown id or already terminal" not in err, err
+    low = err.lower()
+    assert "accept" in low or "sign-off" in low or "signoff" in low or "merge" in low, (
+        f"the acceptance-lane cause must be named: {err!r}"
+    )
+
+
+def test_complete_unresolved_redirect_reports_review_cause(worker_env, monkeypatch):
+    """A review-eligible card whose owner map names no resolvable review owner is
+    refused by the redirect-unresolved guard. Its message must name the review
+    routing problem, not the unknown/terminal guess."""
+    from tools import kanban_tools as kt
+
+    kb, tid = _make_worker_card(
+        monkeypatch,
+        title="feature work",
+        workspace_kind="worktree",
+        workspace_path="/Users/x/src/repo",
+    )
+    conn = kb.connect()
+    try:
+        kb.add_comment(
+            conn, tid, author="test-worker",
+            body="Draft PR opened: https://github.com/cwest/hermes-agent/pull/71 @ head abc1234.",
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_complete({"summary": "ready for review, no owner map"})
+    d = json.loads(out)
+    assert d.get("ok") is not True, out
+    err = d.get("error", "")
+    assert "unknown id or already terminal" not in err, err
+    assert "review" in err.lower(), f"the review-routing cause must be named: {err!r}"
+
+
+def test_complete_stale_run_id_reports_stale_run_cause(worker_env, monkeypatch):
+    """A live, running card refused only because the worker holds a STALE run
+    token (the card was reclaimed + re-claimed under a newer run) must NOT be
+    reported as "unknown id or already terminal" -- the card is neither. This is
+    the exact class that sent a worker chasing a phantom board-DB bug."""
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    conn = kb.connect()
+    try:
+        run1 = kb.latest_run(conn, worker_env)
+        kb._set_worker_pid(conn, worker_env, 98765)
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+        assert kb.detect_crashed_workers(conn) == [worker_env]
+        kb.claim_task(conn, worker_env)
+        run2 = kb.latest_run(conn, worker_env)
+        assert run2.id != run1.id
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run1.id))
+    out = kt._handle_complete({"summary": "late stale completion"})
+    d = json.loads(out)
+    assert d.get("ok") is not True, out
+    err = d.get("error", "")
+    assert "unknown id or already terminal" not in err, (
+        f"a live running card refused on a stale run token is neither unknown "
+        f"nor terminal: {err!r}"
+    )
+    low = err.lower()
+    assert "run" in low or "reclaim" in low or "stale" in low or "superseded" in low, (
+        f"the stale-run cause must be named: {err!r}"
+    )
+
+
+def test_complete_unknown_id_still_reports_unknown(worker_env, monkeypatch):
+    """A genuinely unknown id still reports the unknown/terminal wording -- that
+    wording is reserved for the cases where it is actually true. An orchestrator
+    context (no HERMES_KANBAN_TASK) is used so the ownership guard doesn't fire
+    first."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({"task_id": "t_doesnotexist", "summary": "x"})
+    d = json.loads(out)
+    assert d.get("ok") is not True, out
+    err = d.get("error", "")
+    assert "unknown id or already terminal" in err, (
+        f"a genuinely unknown id must still report the unknown/terminal wording: {err!r}"
+    )
+
+
+def test_complete_already_terminal_still_reports_terminal(worker_env, monkeypatch):
+    """An already-done card still reports the unknown/terminal wording."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="one-off", assignee="orch")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.commit()
+        assert kb.complete_task(conn, tid, summary="first, real completion") is True
+        assert kb.get_task(conn, tid).status == "done"
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": tid, "summary": "second, should refuse"})
+    d = json.loads(out)
+    assert d.get("ok") is not True, out
+    err = d.get("error", "")
+    assert "already terminal" in err, (
+        f"an already-done card must still report the terminal wording: {err!r}"
+    )
