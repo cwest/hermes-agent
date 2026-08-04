@@ -29,7 +29,22 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   message      -- inbound message text (truncated to 500 chars)
 
 ``agent:end`` adds:
-  response     -- agent response text (truncated to 500 chars)
+  response       -- agent response text (truncated to 500 chars; kept for
+                    backward compatibility)
+  response_full  -- the entire agent response text, untruncated, so a decision
+                    hook can inspect the whole reply (a violation buried past
+                    char 500 is invisible in ``response``)
+
+``agent:end`` is dispatched via :meth:`emit_collect`, so a handler MAY return a
+decision dict to control delivery (mirroring the ``command:*`` protocol):
+  {"decision": "deny", "message": "..."}    -- suppress the reply; the message
+                                               is surfaced back into the loop so
+                                               the agent must revise.
+  {"decision": "rewrite", "response": "..."} -- substitute the reply text.
+  None / anything else                       -- no-op (record-only handlers keep
+                                               working exactly as before).
+A handler that raises, times out, or returns garbage falls through to sending
+the reply unchanged — a broken predicate can never silence the agent.
 
 Handlers posting a follow-up into the same Telegram forum-topic should
 include ``message_thread_id=int(thread_id)`` when ``chat_type == "forum"``

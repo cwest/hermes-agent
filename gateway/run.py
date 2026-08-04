@@ -560,6 +560,79 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
+# Cap for the ``response`` field in the agent:end hook context. The truncated
+# form is kept for backward compatibility (other consumers may rely on it);
+# the untruncated reply is exposed separately as ``response_full`` so a
+# decision hook can inspect the whole reply, not just the first 500 chars.
+_AGENT_END_RESPONSE_CAP = 500
+
+
+def _agent_end_hook_context(base_ctx: Dict[str, Any], response: Optional[str]) -> Dict[str, Any]:
+    """Build the ``agent:end`` hook context.
+
+    ``response`` stays capped at :data:`_AGENT_END_RESPONSE_CAP` chars (the
+    historical field other consumers may depend on). ``response_full`` carries
+    the entire reply so a decision hook can catch a violation anywhere in a long
+    reply — not only one that happens to fall in the last 500 chars.
+    """
+    full = response or ""
+    return {
+        **base_ctx,
+        "response": full[:_AGENT_END_RESPONSE_CAP],
+        "response_full": full,
+    }
+
+
+def _apply_agent_end_hook_decisions(
+    response_full: str,
+    hook_results: List[Any],
+) -> "tuple[str, Optional[str]]":
+    """Resolve ``agent:end`` handler return values into a delivery decision.
+
+    Mirrors the proven ``command:*`` decision protocol. Each element of
+    ``hook_results`` is a handler return value; only ``dict``s with a
+    recognized ``decision`` act, and the FIRST actionable decision wins:
+
+      * ``deny``    -> the original reply is suppressed; the handler's
+                       ``message`` is surfaced back into the loop so the agent
+                       must revise. A deny with no usable message falls back to
+                       a generic block notice (never an empty reply).
+      * ``rewrite`` -> the handler's ``response`` is substituted. A rewrite with
+                       no usable replacement text is a no-op (must never blank
+                       the reply).
+      * anything else / ``allow`` / missing ``decision`` / non-dict -> no-op.
+
+    Returns ``(final_response, decision)`` where ``decision`` is ``"deny"``,
+    ``"rewrite"``, or ``None`` (pass the original reply through unchanged).
+
+    Wedge-safety: this function never raises for a bad handler payload and never
+    returns an empty ``final_response`` for a no-op. A broken predicate must not
+    be able to silence the agent — the caller wraps the whole hook dispatch in
+    try/except as a second layer.
+    """
+    for hook_result in hook_results or []:
+        if not isinstance(hook_result, dict):
+            continue
+        decision = str(hook_result.get("decision", "")).strip().lower()
+        if not decision or decision == "allow":
+            continue
+        if decision == "deny":
+            message = hook_result.get("message")
+            if isinstance(message, str) and message.strip():
+                return message, "deny"
+            return (
+                "That reply was blocked by a policy hook. Revise it and try again.",
+                "deny",
+            )
+        if decision == "rewrite":
+            new_response = hook_result.get("response")
+            if isinstance(new_response, str) and new_response.strip():
+                return new_response, "rewrite"
+            # No usable replacement — do not blank the reply; keep looking.
+            continue
+    return response_full, None
+
+
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
@@ -14186,11 +14259,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
 
-            # Emit agent:end hook
-            await self.hooks.emit("agent:end", {
-                **hook_ctx,
-                "response": (response or "")[:500],
-            })
+            # Emit agent:end hook. Unlike the fire-and-forget emit() this used
+            # to be, this uses emit_collect() so a handler can BLOCK or REWRITE
+            # the reply — mirroring the command:* decision protocol. The full
+            # (untruncated) reply is exposed as response_full so a violation
+            # anywhere in a long reply is visible, not only in the first 500
+            # chars. The entire dispatch is wrapped so a broken/raising handler
+            # can never wedge the turn: on any failure we fall through to
+            # sending the reply unchanged.
+            try:
+                _agent_end_ctx = _agent_end_hook_context(hook_ctx, response)
+                _agent_end_results = await self.hooks.emit_collect(
+                    "agent:end", _agent_end_ctx
+                )
+                _final_resp, _agent_end_decision = _apply_agent_end_hook_decisions(
+                    _agent_end_ctx["response_full"], _agent_end_results
+                )
+                if _agent_end_decision in ("deny", "rewrite"):
+                    logger.info(
+                        "agent:end hook %s the reply for session %s",
+                        _agent_end_decision,
+                        session_entry.session_id if session_entry else "?",
+                    )
+                    response = _final_resp
+            except Exception as _agent_end_err:
+                # A decision hook must never be able to silence the agent.
+                logger.debug(
+                    "agent:end hook dispatch failed (non-fatal), sending reply "
+                    "unchanged: %s",
+                    _agent_end_err,
+                )
             
             # Check for pending process watchers (check_interval on background processes)
             try:
