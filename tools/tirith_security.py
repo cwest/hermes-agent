@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -921,9 +922,13 @@ def _is_allowlisted_tld_finding(finding: dict, allowlist: set) -> bool:
             continue
         lowered = str(val).lower()
         for tld in allowlist:
-            # Match ".dev" as a bounded token so ".developer" or a substring
-            # inside another word does not spuriously satisfy the allowlist.
-            if f".{tld}" in lowered:
+            # Match ".dev" only as a whole label: the TLD must be preceded by a
+            # dot and followed by a non-label character (end of string, quote,
+            # whitespace, slash, comma, …).  A plain substring test would
+            # suppress ".developer", ".dev-portal", or a free-text message
+            # mentioning ".devil.com" — the homograph/typosquat shapes this
+            # heuristic exists to catch.
+            if re.search(rf"\.{re.escape(tld)}(?![a-z0-9-])", lowered):
                 return True
     return False
 

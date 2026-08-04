@@ -1593,6 +1593,34 @@ class TestIsAllowlistedTldFinding:
     def test_empty_allowlist_matches_nothing(self):
         assert not self.fn({"rule_id": "lookalike_tld", "value": ".dev"}, set())
 
+    # --- label-boundary semantics: a substring is NOT a TLD match -----------
+
+    def test_longer_label_is_not_a_match(self):
+        """`.developer` must not satisfy the `.dev` allowlist entry."""
+        assert not self.fn(
+            {"rule_id": "lookalike_tld", "value": ".developer"}, self.allow
+        )
+
+    def test_hyphenated_label_is_not_a_match(self):
+        assert not self.fn(
+            {"rule_id": "lookalike_tld", "value": ".dev-portal"}, self.allow
+        )
+
+    def test_free_text_message_mentioning_a_lookalike_domain(self):
+        """A homograph domain whose label merely STARTS with an allowlisted
+        TLD must keep its warn — this is the shape the heuristic exists for."""
+        assert not self.fn(
+            {"rule_id": "lookalike_tld",
+             "message": "Domain 'paypal.devil.com' resembles a known brand"},
+            self.allow,
+        )
+
+    def test_tld_followed_by_a_delimiter_still_matches(self):
+        for val in (".dev/", ".dev'", "'.app' TLD", "uses .io, which"):
+            assert self.fn(
+                {"rule_id": "lookalike_tld", "message": val}, self.allow
+            ), val
+
 
 class TestSecurityConfigAllowlist:
     """_load_security_config exposes a lookalike_tld_allowlist with sensible
