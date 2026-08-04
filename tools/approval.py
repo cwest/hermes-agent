@@ -2786,25 +2786,40 @@ def _run_approval_gate(
             deny_reason = decision.get("reason")
 
             if not resolved or choice is None or choice == "deny":
+                # Same timeout-vs-deny split as the command gate: a timeout is
+                # recoverable (report + continue, do not wedge), an explicit
+                # deny is terminal. Silence is not consent in either case.
                 if not resolved:
-                    reason = "timed out without user response"
-                    timeout_addendum = " Silence is not consent."
-                else:
-                    reason = "denied by user"
-                    timeout_addendum = ""
+                    return {
+                        "approved": False,
+                        "message": (
+                            "BLOCKED: Action not approved — the user did not "
+                            "respond in time. The action was NOT performed, and "
+                            "silence is not consent, so do not auto-perform it "
+                            "or silently retry it in a loop. This is a timeout, "
+                            "not a refusal: report the blocked action and why to "
+                            "the user, then continue with other work. If the "
+                            "user subsequently approves, you may re-attempt it."
+                        ),
+                        "pattern_key": pattern_key,
+                        "description": description,
+                        "outcome": "timeout",
+                        "user_consent": False,
+                    }
                 reason_addendum = ""
-                if resolved and deny_reason:
+                if deny_reason:
                     reason_addendum = f' Reason given by the user: "{deny_reason}".'
                 return {
                     "approved": False,
                     "message": (
-                        f"BLOCKED: Action {reason}.{reason_addendum} The user "
-                        f"has NOT consented to this action. Do NOT retry it, "
-                        f"do NOT rephrase it, and do NOT attempt the same "
-                        f"outcome via a different path.{timeout_addendum}"
+                        f"BLOCKED: Action denied by user.{reason_addendum} The "
+                        f"user has NOT consented to this action. Do NOT retry "
+                        f"it, do NOT rephrase it, and do NOT attempt the same "
+                        f"outcome via a different path."
                     ),
                     "pattern_key": pattern_key,
                     "description": description,
+                    "outcome": "denied",
                     "user_consent": False,
                 }
 
@@ -3488,39 +3503,59 @@ def check_all_command_guards(command: str, env_type: str,
             deny_reason = decision.get("reason")
 
             if not resolved or choice is None or choice == "deny":
-                # Consent contract: silence is NOT consent, and an explicit
-                # deny is also a hard halt — both produce a BLOCKED outcome
-                # that names the agent's most common evasion paths (retry,
-                # rephrase, achieve the same outcome via a different command).
-                # See issue #24912 for the original incident.
+                # A TIMEOUT and an explicit DENY are different events and must
+                # read differently. Silence is not consent in either case (the
+                # command is never auto-run), but:
+                #   - DENY is terminal: the user exercised judgment, so the
+                #     strong prohibition (do not retry / rephrase / achieve the
+                #     same outcome via a different command) is preserved.
+                #   - TIMEOUT is recoverable: no answer yet is not "forbidden
+                #     forever". Rendering it as a permanent prohibition wedges
+                #     the session (a read-only curl that times out at the prompt
+                #     takes down the whole workflow). The timeout message must
+                #     NOT forbid a different command; the agent must remain able
+                #     to report the block and continue with other work, and
+                #     re-attempt if the user later approves. See #24912 and the
+                #     timeout-wedge fix.
                 if not resolved:
-                    reason = "timed out without user response"
-                    timeout_addendum = " Silence is not consent."
-                    outcome = "timeout"
-                else:
-                    reason = "denied by user"
-                    timeout_addendum = ""
-                    outcome = "denied"
-                # An explicit deny may carry a free-text reason
+                    return {
+                        "approved": False,
+                        "message": (
+                            "BLOCKED: Command not approved — the user did not "
+                            "respond in time. The command was NOT run, and "
+                            "silence is not consent, so do not auto-run it or "
+                            "silently retry the identical command in a loop. "
+                            "This is a timeout, not a refusal: report the "
+                            "blocked command and why to the user, then continue "
+                            "with other work. If the user subsequently approves, "
+                            "you may re-attempt it."
+                        ),
+                        "pattern_key": primary_key,
+                        "description": combined_desc,
+                        "outcome": "timeout",
+                        "user_consent": False,
+                        "deny_reason": deny_reason,
+                    }
+                # Explicit deny — terminal. May carry a free-text reason
                 # (``/deny <reason>``) so the agent can adapt rather than only
                 # hearing "denied". Relayed verbatim; generic attribution.
                 reason_addendum = ""
-                if outcome == "denied" and deny_reason:
+                if deny_reason:
                     reason_addendum = f' Reason given by the user: "{deny_reason}".'
                 return {
                     "approved": False,
                     "message": (
-                        f"BLOCKED: Command {reason}.{reason_addendum} The user "
-                        f"has NOT consented to this action. Do NOT retry this "
-                        f"command, do NOT rephrase it, and do NOT attempt the "
-                        f"same outcome via a different command. Stop the "
+                        f"BLOCKED: Command denied by user.{reason_addendum} The "
+                        f"user has NOT consented to this action. Do NOT retry "
+                        f"this command, do NOT rephrase it, and do NOT attempt "
+                        f"the same outcome via a different command. Stop the "
                         f"current workflow and wait for the user to respond "
                         f"before taking any further destructive or "
-                        f"irreversible action.{timeout_addendum}"
+                        f"irreversible action."
                     ),
                     "pattern_key": primary_key,
                     "description": combined_desc,
-                    "outcome": outcome,
+                    "outcome": "denied",
                     "user_consent": False,
                     "deny_reason": deny_reason,
                 }
