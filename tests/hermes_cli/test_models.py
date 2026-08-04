@@ -58,7 +58,28 @@ class TestOpenRouterModels:
 
 
 class TestFetchOpenRouterModels:
+    # Repo-controlled placeholder ids used purely to exercise the fetch/filter
+    # plumbing. They are NOT real third-party model ids and their presence is
+    # entirely within this test's control: the curated `preferred_ids` list is
+    # pinned to exactly these three below, so the assertions stay stable no
+    # matter what the live OpenRouter catalog or the remote manifest currently
+    # contains. See AGENTS.md: "Behavior contracts over snapshots."
+    _PAID_ID = "test-vendor/paid-tool-model"
+    _CHEAP_ID = "test-vendor/cheap-tool-model"
+    _FREE_ID = "test-vendor/free-tool-model:free"
+
     def test_live_fetch_recomputes_free_tags(self, monkeypatch):
+        """Free/paid tags are recomputed from the LIVE pricing, per model.
+
+        Invariant under test: for every curated id the live payload also
+        carries, the returned tag reflects that entry's live pricing —
+        zero-priced → "free", non-zero → paid (empty tag). This is a contract
+        about how pricing maps to the tag, not a frozen snapshot of a specific
+        catalog; the ids are repo-controlled placeholders and `preferred_ids`
+        is pinned to them, so a real catalog change cannot red this test.
+        """
+        paid_id, cheap_id, free_id = self._PAID_ID, self._CHEAP_ID, self._FREE_ID
+
         class _Resp:
             def __enter__(self):
                 return self
@@ -67,17 +88,38 @@ class TestFetchOpenRouterModels:
                 return False
 
             def read(self):
-                return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"}}]}'
+                return (
+                    b'{"data":['
+                    b'{"id":"' + paid_id.encode() + b'","pricing":{"prompt":"0.000015","completion":"0.000075"}},'
+                    b'{"id":"' + cheap_id.encode() + b'","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},'
+                    b'{"id":"' + free_id.encode() + b'","pricing":{"prompt":"0","completion":"0"}}'
+                    b']}'
+                )
 
+        # Pin the curated list to exactly these repo-controlled ids so the
+        # result is independent of the live catalog / remote manifest.
+        monkeypatch.setattr(
+            _models_mod,
+            "OPENROUTER_MODELS",
+            [(paid_id, ""), (cheap_id, ""), (free_id, "")],
+        )
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
+        with (
+            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=[]),
+            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()),
+        ):
             models = fetch_openrouter_models(force_refresh=True)
 
-        assert models == [
-            ("anthropic/claude-opus-4.8", "recommended"),
-            ("qwen/qwen3.7-max", ""),
-            ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
-        ]
+        tags = dict(models)
+        # Every curated id the live payload covers is retained (none dropped —
+        # none advertise an explicit no-tools supported_parameters list).
+        assert set(tags) == {paid_id, cheap_id, free_id}
+        # Tags are recomputed from LIVE pricing: zero-priced → "free".
+        assert tags[free_id] == "free"
+        # Non-zero pricing → not free. The first curated entry additionally
+        # carries the "recommended" badge; the others are plain paid ("").
+        assert tags[cheap_id] == ""
+        assert models[0][0] == paid_id and models[0][1] == "recommended"
 
 
     def test_falls_back_to_static_snapshot_on_fetch_failure(self, monkeypatch):
@@ -143,13 +185,22 @@ class TestFetchOpenRouterModels:
         assert "google/gemini-3-pro-image-preview" not in ids
 
     def test_permissive_when_supported_parameters_missing(self, monkeypatch):
-        """Models missing the supported_parameters field keep appearing in the picker.
+        """Missing supported_parameters → kept; explicit no-tools list → dropped.
 
         Some OpenRouter-compatible gateways (Nous Portal, private mirrors, older
         catalog snapshots) don't populate supported_parameters. Treating missing
-        as 'unknown → allow' prevents the picker from silently emptying on
-        those gateways.
+        as 'unknown → allow' prevents the picker from silently emptying on those
+        gateways. This asserts the relationship between an entry's
+        supported_parameters shape and its retention — a behavior contract, not
+        a snapshot: the ids are repo-controlled placeholders and `preferred_ids`
+        is pinned to them, so a real catalog change cannot red it. The negative
+        control (explicit list WITHOUT tools is excluded) guards the
+        Kilo-Org/kilocode#9068 behavior from being weakened.
         """
+        missing_id = self._PAID_ID       # no supported_parameters field at all
+        cheap_id = self._CHEAP_ID        # no supported_parameters field at all
+        no_tools_id = "test-vendor/no-tools-model"  # explicit list omitting tools
+
         class _Resp:
             def __enter__(self):
                 return self
@@ -158,21 +209,37 @@ class TestFetchOpenRouterModels:
                 return False
 
             def read(self):
-                # No supported_parameters field at all on either entry.
                 return (
                     b'{"data":['
-                    b'{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},'
-                    b'{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}}'
+                    b'{"id":"' + missing_id.encode() + b'","pricing":{"prompt":"0.000015","completion":"0.000075"}},'
+                    b'{"id":"' + cheap_id.encode() + b'","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},'
+                    b'{"id":"' + no_tools_id.encode() + b'","pricing":{"prompt":"0.00001","completion":"0.00003"},'
+                    b'"supported_parameters":["temperature","response_format"]}'
                     b']}'
                 )
 
+        # Pin the curated list to exactly these repo-controlled ids so the
+        # result is independent of the live catalog / remote manifest.
+        monkeypatch.setattr(
+            _models_mod,
+            "OPENROUTER_MODELS",
+            [(missing_id, ""), (cheap_id, ""), (no_tools_id, "")],
+        )
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
+        with (
+            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=[]),
+            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()),
+        ):
             models = fetch_openrouter_models(force_refresh=True)
 
         ids = [mid for mid, _ in models]
-        assert "anthropic/claude-opus-4.8" in ids
-        assert "qwen/qwen3.7-max" in ids
+        # Permissive: entries with no supported_parameters field are retained.
+        assert missing_id in ids
+        assert cheap_id in ids
+        # Negative control: an explicit supported_parameters list WITHOUT
+        # "tools" is still excluded (Kilo-Org/kilocode#9068 must not weaken).
+        assert no_tools_id not in ids
+
 
 
 class TestOpenRouterToolSupportHelper:
