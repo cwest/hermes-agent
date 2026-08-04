@@ -7130,10 +7130,30 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
 
+    # The completable set for the ``-> done`` UPDATE. A generic completer may
+    # only finish an author/lifecycle lane (``running``/``ready``/``blocked``);
+    # ``review`` is deliberately EXCLUDED so a worker cannot self-complete out of
+    # the review lane past its reviewer (the reviewer-bypass the redirect above
+    # exists to prevent). The ONE exception is the verified-merge path
+    # (``allow_acceptance_complete=True``, taken only by Casey's merge webhook /
+    # the close-pr-card accept seam): a merged PR is GitHub's ground-truth proof
+    # of acceptance, and its card legitimately sits in ``review`` when the PR is
+    # merged — ``done`` is correct and reachable by no other route. Without
+    # ``review`` here, that merge path matched zero rows and stranded a merged
+    # card in ``review`` (live ``t_0d86b126``, PR #180). This does NOT reopen the
+    # bypass: the redirect-to-review branch above already handles the author lane,
+    # and a non-override completion of a ``review`` card still falls through to a
+    # zero-row UPDATE and is refused.
+    if allow_acceptance_complete:
+        _completable_statuses = ("running", "ready", "blocked", "review")
+    else:
+        _completable_statuses = ("running", "ready", "blocked")
+    _status_placeholders = ", ".join("?" for _ in _completable_statuses)
+
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -7144,13 +7164,13 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ({_status_placeholders})
                 """,
-                (result, now, task_id),
+                (result, now, task_id, *_completable_statuses),
             )
         else:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -7161,10 +7181,10 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ({_status_placeholders})
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (result, now, task_id, *_completable_statuses, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -7380,10 +7400,23 @@ def explain_completion_refusal(
             f"card, so this completion is superseded. Do not retry with the old "
             f"token; the card is neither unknown nor terminal."
         )
+    # The card exists, is in a LIVE lane, and the run token (if any) matches —
+    # so the ``-> done`` UPDATE matched zero rows because ``status`` is simply
+    # not in the completable set. Name the actual status and the allowed set
+    # rather than asserting a concurrent lane move that did not happen (a wrong
+    # diagnosis reads as evidence and costs real debugging time — live
+    # ``t_0d86b126``, a merged-PR card stranded in ``review``). ``review`` is
+    # completable ONLY on the verified-merge path (the ``close-pr-card`` accept
+    # seam / Casey's merge webhook, ``allow_acceptance_complete=True``), never by
+    # a worker finishing its own lane — so a worker seeing this on a ``review``
+    # card should leave it for the merge path, not retry.
     return (
-        f"refused: this card ({task_id}) is in status {status!r} and could not "
-        f"be completed — it likely moved lane concurrently. It is neither "
-        f"unknown nor terminal; re-read the card before retrying."
+        f"refused: this card ({task_id}) is in status {status!r}, which is not in "
+        f"the completable set ('running', 'ready', 'blocked'), so the completion "
+        f"UPDATE matched no rows. It is neither unknown nor terminal. A 'review' "
+        f"card reaches 'done' ONLY via the verified-merge path (Casey's merge / "
+        f"the close-pr-card accept seam), not by a worker completing its own "
+        f"lane — do not retry a plain complete; route it through the correct path."
     )
 
 
