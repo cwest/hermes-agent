@@ -5710,6 +5710,133 @@ def reconcile_pass_acceptance(
     return reconciled
 
 
+def _card_newest_pr_url(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the newest GitHub PR URL linked in the card's comments, or None.
+
+    Reuses the PR->card linkage idiom (:data:`_RESPAWN_GUARD_PR_URL_RE`, the same
+    pattern :func:`_card_has_pr_artifact` and the ``active_pr`` respawn guard
+    trust). Scans comments newest-first so the most recent PR reference wins when
+    a card carries more than one (e.g. a superseded draft then the merged PR).
+    """
+    for row in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ).fetchall():
+        if not row["body"]:
+            continue
+        m = _RESPAWN_GUARD_PR_URL_RE.search(row["body"])
+        if m:
+            return m.group(0)
+    return None
+
+
+def reconcile_merged_acceptance(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str = "onecard",
+) -> bool:
+    """Walk a MERGED-PR acceptance card to ``done`` — the missed-webhook recovery.
+
+    A card parked in the acceptance lane (``status='blocked'`` with a sticky
+    ``awaiting-casey-signoff`` reason) whose linked PR was ALREADY merged by Casey
+    has no working path to ``done`` when the ``github-pr-closed`` webhook is lost:
+    ``complete_task`` correctly REFUSES it (the acceptance guard cannot tell "not
+    merged yet" from "merged, webhook dropped"), and ``unblock`` + ``complete``
+    shunts it to ``review`` against a merged PR — strictly worse. This is the
+    missing reconcile (live ``t_fecc790d``).
+
+    It is a reconciliation of a MISSED event, NOT a new way to bypass sign-off:
+    ``done`` still means "Casey merged." The proof is GitHub GROUND TRUTH, never
+    caller assertion — a "trust me, it merged" flag would re-open exactly the hole
+    the acceptance guard exists to close. The reconcile PROVES the merge before
+    moving the card, requiring ALL of:
+
+      * the card is in the acceptance lane — ``status='blocked'`` whose latest
+        sticky block reason starts with ``awaiting-casey-signoff`` (so this is
+        NOT a generic self-complete of any blocked card; a generic
+        ``needs_input`` / ``review-changes-requested`` block is refused);
+      * a resolvable GitHub PR URL is linked on the card
+        (:func:`_card_newest_pr_url`); no PR -> refuse (nothing to prove a merge
+        against);
+      * the live PR is ``state == "merged"`` with a NON-NULL ``mergeCommit.oid``
+        (:func:`_resolve_pr_merge_commit`). An OPEN PR, a merged state with no
+        resolvable merge oid, or any unresolvable/transient ``gh`` answer
+        (``"unknown"`` / ``"not_found"`` / ``"closed"``) fails CLOSED -> refuse.
+
+    On proof it completes the card through the ONE sanctioned merge completer —
+    :func:`complete_task` with ``allow_acceptance_complete=True`` (the exact path
+    Casey's live webhook merge takes) — so the single terminal contract holds:
+    ``done`` is reached only by a proven merge. It additionally records a
+    distinguishable ``completion_reconciled_merge`` audit event carrying the
+    proven ``merge_commit`` + ``pr_url`` and a ``missed_webhook`` marker, so a
+    done-by-reconcile is as traceable as a done-by-webhook.
+
+    Returns True on a successful reconcile, False on any refusal (a clean no-op —
+    the card is left untouched in the acceptance lane). Refusals are silent by
+    design: the caller inspects the return and the card state.
+    """
+    # 1) Acceptance-lane gate: only an ``awaiting-casey-signoff`` park is a
+    #    reconcile target. This is NOT a generic "complete any blocked card"
+    #    path — the whole point is that the acceptance guard refuses a worker,
+    #    and this reconciles ONLY the specific missed-webhook case.
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["status"] != "blocked":
+        return False
+    reason = _latest_sticky_block_reason(conn, task_id)
+    if not reason or not reason.lstrip().startswith(
+        _ACCEPTANCE_SIGNOFF_REASON_PREFIX
+    ):
+        return False
+
+    # 2) A resolvable linked PR is mandatory — there is nothing to prove a merge
+    #    against otherwise. No PR -> refuse without consulting gh.
+    pr_url = _card_newest_pr_url(conn, task_id)
+    if not pr_url:
+        return False
+
+    # 3) GitHub ground truth. Require ``merged`` AND a non-null mergeCommit.oid.
+    #    Everything else — OPEN, closed-not-merged, not_found, unknown/transient,
+    #    or merged-without-a-resolvable-oid — fails CLOSED (refuse). This is the
+    #    load-bearing gate: the merge must be PROVEN, not asserted.
+    state, merge_oid = _resolve_pr_merge_commit(pr_url)
+    if state != "merged" or not merge_oid:
+        return False
+
+    # 4) Proven merge. Complete through the ONE sanctioned merge completer so the
+    #    single terminal contract holds (``done`` == a proven merge). Record the
+    #    distinguishable reconcile audit event FIRST, in the same connection, so
+    #    it is durable even if the (idempotent) completion below no-ops on a race.
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "completion_reconciled_merge",
+            {
+                "pr_url": pr_url,
+                "merge_commit": merge_oid,
+                "reason": reason,
+                "missed_webhook": True,
+                "by": f"{actor}:reconcile-merged-acceptance",
+            },
+        )
+    completed = complete_task(
+        conn, task_id,
+        summary=(
+            f"reconciled to done: PR {pr_url} verifiably merged "
+            f"(merge commit {merge_oid}); github-pr-closed webhook was missed."
+        ),
+        metadata={
+            "reconcile": "merged_acceptance",
+            "pr_url": pr_url,
+            "merge_commit": merge_oid,
+            "missed_webhook": True,
+        },
+        allow_acceptance_complete=True,
+    )
+    return bool(completed)
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -10010,6 +10137,74 @@ def _resolve_pr_head_and_draft(
         if isinstance(tip, dict):
             head_epoch = _to_epoch(tip.get("committedDate"))
     return (head.strip().lower(), draft, head_epoch)
+
+
+def _resolve_pr_merge_commit(
+    pr_url: str,
+) -> tuple[str, Optional[str]]:
+    """Return ``(state, merge_commit_oid)`` for ``pr_url`` from GitHub ground truth.
+
+    ``state`` is one of ``"open"``, ``"closed"``, ``"merged"``, ``"not_found"``,
+    or ``"unknown"`` (mirrors :func:`_resolve_pr_state`); ``merge_commit_oid`` is
+    the lowercased 40-char ``mergeCommit.oid`` when the PR is merged, else None.
+    Backed by ``gh pr view <url> --json state,mergeCommit``.
+
+    This is the ground-truth reader :func:`reconcile_merged_acceptance` trusts to
+    PROVE a missed-webhook merge before walking an acceptance card to ``done``.
+    It fails CLOSED for that gate: any subprocess failure — ``gh`` missing, not
+    authenticated, network error, timeout, unparseable output, or a missing
+    field — resolves to ``("unknown", None)`` so the reconcile SKIPS the
+    promotion rather than force-accepting on an unverifiable answer. A definitive
+    "PR does not exist" (GitHub's ``Could not resolve to a PullRequest``
+    signature) resolves to ``("not_found", None)``.
+
+    Isolated as a module-level function (not inlined) so the reconcile can be
+    tested without a live network call by monkeypatching this hook, and so the
+    ``gh`` dependency lives in one auditable place (mirrors
+    :func:`_resolve_pr_state` / :func:`_resolve_pr_head_and_draft`).
+    """
+    fail: tuple[str, Optional[str]] = ("unknown", None)
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_url, "--json", "state,mergeCommit"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception:
+        return fail
+    if result.returncode != 0:
+        # A definitive "this PR does not exist" is terminal, not transient —
+        # never created or already deleted. Distinguish it from a transient gh
+        # failure (which stays fail-closed as "unknown") by the GraphQL
+        # not-found signature on stderr, matching :func:`_resolve_pr_state`.
+        if _PR_NOT_FOUND_STDERR_RE.search(result.stderr or ""):
+            return ("not_found", None)
+        return fail
+    try:
+        data = json.loads(result.stdout or "{}")
+    except ValueError:
+        return fail
+    if not isinstance(data, dict):
+        return fail
+    state = data.get("state")
+    if not isinstance(state, str):
+        return fail
+    normalized = state.strip().lower()
+    if normalized not in ("open", "closed", "merged"):
+        return fail
+    if normalized != "merged":
+        return (normalized, None)
+    # Merged: the mergeCommit.oid is the proof the reconcile records. A merged
+    # state with a missing/blank oid is unverifiable — return no oid so the
+    # reconcile refuses (fail closed) rather than complete on a merge it cannot
+    # name.
+    merge = data.get("mergeCommit")
+    oid = merge.get("oid") if isinstance(merge, dict) else None
+    if not isinstance(oid, str) or not oid.strip():
+        return ("merged", None)
+    return ("merged", oid.strip().lower())
 
 
 @dataclass
