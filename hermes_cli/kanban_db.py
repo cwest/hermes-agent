@@ -9649,6 +9649,24 @@ def _resolve_worktree_workspace(
         )
     requested_resolved = requested.resolve(strict=False)
 
+    # Refuse a worktree card explicitly aimed at an EDIT-IN-PLACE repo root. Such
+    # a root (``~/.hermes`` — the live install) is the deploy target itself, not a
+    # repo you cut a branch/PR from: asking for an isolated worktree on it is a
+    # caller error (the card should be ``workspace_kind='dir'``, which returns the
+    # checkout in place — see ``_resolve_dir_workspace``). Surface it loudly rather
+    # than silently coercing to the in-place path, so the filing mistake is caught
+    # instead of masked. The declaration is shared with the dir resolver, so the
+    # two agree on which roots are edit-in-place.
+    from hermes_cli.edit_in_place_repos import is_edit_in_place_root
+
+    if is_edit_in_place_root(requested_resolved):
+        raise ValueError(
+            f"task {task.id} has workspace_kind=worktree aimed at edit-in-place "
+            f"repo root {task.workspace_path!r}: that checkout is the deploy "
+            f"target itself and must be edited in place, not from an isolated "
+            f"worktree/branch. File this card with workspace_kind='dir' instead."
+        )
+
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
@@ -9723,6 +9741,23 @@ def _resolve_dir_workspace(task: Task) -> Path:
     repo_root = _git_toplevel(p)
     if repo_root is None or p.resolve(strict=False) != repo_root:
         return p
+
+    # Carve-out: an EDIT-IN-PLACE repo root is the deploy target itself, not a
+    # shared clone to isolate from. ``~/.hermes`` is the working tree of
+    # ``cwest/hermes-config`` — the live running install, edited in place, with
+    # an hourly ``backup_commit`` cron owning commit+push to ``main`` and no PR
+    # flow at all. Redirecting it to a ``wt/<id>`` worktree makes the worker
+    # commit to a branch and open an unwanted PR, and leaves a stray worktree +
+    # branch in the live install. Return the path unchanged: no worktree, no
+    # branch, and the default-branch/upstream guard below does NOT run (it is
+    # meaningless for a checkout that is itself the deploy target). The set of
+    # edit-in-place roots is DECLARED (``hermes_cli.edit_in_place_repos``), not
+    # inferred from a heuristic. Every non-edit-in-place repo root keeps the
+    # redirect-and-guard behavior below exactly.
+    from hermes_cli.edit_in_place_repos import is_edit_in_place_root
+
+    if is_edit_in_place_root(repo_root):
+        return repo_root
 
     # A linked worktree's own root IS its git toplevel, so it reaches here too —
     # but a worktree correctly sitting on its own topic branch is the whole point
