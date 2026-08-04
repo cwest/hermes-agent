@@ -2822,6 +2822,14 @@ DEFAULT_CONFIG = {
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        # gTLDs the lookalike_tld heuristic reliably false-positives on.  A warn
+        # verdict consisting SOLELY of lookalike_tld findings for these TLDs is
+        # downgraded to allow; any other finding preserves the warn.  This list
+        # REPLACES the built-in default — extend it, don't shrink it.
+        "lookalike_tld_allowlist": [
+            "app", "dev", "io", "sh", "page", "zip", "mov",
+            "new", "gle", "foo", "day", "run", "bar",
+        ],
         "website_blocklist": {
             "enabled": False,
             "domains": [],

