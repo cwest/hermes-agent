@@ -583,7 +583,11 @@ class TestBlockingApprovalE2E:
 
         assert result_holder[0]["approved"] is False
         assert result_holder[0]["outcome"] == "timeout"
-        assert "timed out" in result_holder[0]["message"]
+        # The timeout message must signal a non-response and stay recoverable —
+        # it must NOT carry the permanent-prohibition wording that a deny does.
+        _msg = result_holder[0]["message"]
+        assert "did not respond in time" in _msg
+        assert "different command" not in _msg.lower()
         unregister_gateway_notify(session_key)
 
     def test_parallel_subagent_approvals(self):

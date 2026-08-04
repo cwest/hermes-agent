@@ -2225,21 +2225,31 @@ class TestEtcPatternsUnaffectedByRefactor:
 
 
 # =========================================================================
-# Gateway approval timeout = deny, NOT consent (#24912)
+# Gateway approval: silence is not consent, but a TIMEOUT is recoverable
+# while an explicit DENY is terminal (#24912 + the timeout-wedge fix)
 #
-# A Slack user walked away mid-conversation; the agent requested approval
-# to run `rm -rf .git`; the prompt timed out; the agent ran the command
-# anyway. Reported by @tofalck on 2026-05-13, corroborated by
-# @angry-programmer on Telegram. Silence is not consent.
+# History: a Slack user walked away mid-conversation; the agent requested
+# approval to run `rm -rf .git`; the prompt timed out; the agent ran the
+# command anyway. Reported by @tofalck on 2026-05-13. That fixed the
+# auto-run: a timeout must NOT be consent.
 #
-# These tests pin:
-#   1. Gateway timeout → approved=False, with a message strong enough that
-#      a downstream agent reading "BLOCKED: ... Silence is not consent."
-#      treats it as a hard halt, not an invitation to rephrase.
-#   2. The structured outcome / user_consent fields are present so
-#      plugins, hooks, and audit pipelines can act on the timeout without
-#      string-parsing the message.
-#   3. Explicit /deny carries the same shape (treat-as-not-consented).
+# The follow-up defect: the timeout message then copied the DENY message
+# verbatim — "do NOT attempt the same outcome via a different command" —
+# which turned a momentary absence (asleep, in a meeting) into a
+# permanently wedged session. A read-only curl that timed out at the prompt
+# took down the whole workflow with no recovery path.
+#
+# The corrected contract these tests pin:
+#   1. TIMEOUT → approved=False, action NOT performed, silence is NOT
+#      consent, but the message is RECOVERABLE: it must NOT forbid achieving
+#      the outcome "via a different command", and it must leave the agent
+#      free to report the blocked action and continue with other work.
+#   2. DENY stays TERMINAL: the strong prohibition (do not retry / rephrase /
+#      achieve the same outcome another way) is preserved — that is the user
+#      exercising judgment.
+#   3. The timeout and deny messages MUST differ.
+#   4. Structured outcome / user_consent fields distinguish the two so
+#      plugins/hooks/audit pipelines don't string-parse the message.
 # =========================================================================
 
 
@@ -2307,11 +2317,14 @@ class TestApprovalTimeoutIsNotConsent:
         # The notify_cb DID fire — we did try to ask the user.
         assert len(notified) == 1
 
-    def test_timeout_message_is_emphatic_against_retry_and_rephrase(self, monkeypatch):
-        """The BLOCKED message must explicitly tell the agent not to rephrase.
+    def test_timeout_message_is_recoverable_not_a_permanent_prohibition(self, monkeypatch):
+        """A timeout must NOT wedge the session.
 
-        Without this, the agent treats 'Do NOT retry this command' as
-        permission to try a different command achieving the same outcome.
+        Silence is still not consent (the command was NOT run), but the
+        message must not forbid the recovery paths an agent needs: it must
+        NOT tell the agent to avoid achieving the outcome "via a different
+        command", and it must leave the agent free to report the block and
+        continue with other work.
         """
         from tools import approval as mod
         self._force_short_timeout(monkeypatch, seconds=1)
@@ -2320,18 +2333,25 @@ class TestApprovalTimeoutIsNotConsent:
         result = mod.check_all_command_guards("rm -rf .git", "local")
 
         msg = result["message"]
-        # Explicit halt signals — these are the model-facing contract.
+        # Still a block, still not consent — the command was not performed.
         assert "BLOCKED" in msg
-        assert "NOT consented" in msg
-        assert "Silence is not consent" in msg
-        # Both forms of evasion must be named:
-        assert "do NOT retry" in msg.lower() or "Do NOT retry" in msg
-        assert "rephrase" in msg.lower()
-        assert "different command" in msg.lower()
+        assert result["approved"] is False
+        assert result.get("outcome") == "timeout"
+        assert "not respond" in msg.lower() or "did not respond" in msg.lower() \
+            or "timed out" in msg.lower()
+        # The wedge phrase MUST be gone — this is the whole fix.
+        assert "different command" not in msg.lower()
+        assert "different path" not in msg.lower()
+        assert "do not attempt the same outcome" not in msg.lower()
+        # It must NOT order the agent to stop the whole workflow.
+        assert "stop the current workflow" not in msg.lower()
+        # It must signal recoverability: report + continue.
+        assert "report" in msg.lower()
+        assert "other work" in msg.lower() or "continue" in msg.lower()
 
-    def test_explicit_deny_carries_same_no_consent_shape(self, monkeypatch):
-        """An explicit /deny must produce the same shape as timeout —
-        the agent should treat both identically."""
+    def test_explicit_deny_stays_terminal(self, monkeypatch):
+        """An explicit /deny remains a hard, terminal prohibition — the user
+        exercised judgment, and the strong language is preserved."""
         from tools import approval as mod
 
         self._force_short_timeout(monkeypatch, seconds=60)
@@ -2359,9 +2379,45 @@ class TestApprovalTimeoutIsNotConsent:
         assert r["approved"] is False
         assert r.get("user_consent") is False
         assert r.get("outcome") == "denied"
-        assert "Silence is not consent" not in r["message"]  # this one IS denied, not timed-out
-        assert "NOT consented" in r["message"]
-        assert "rephrase" in r["message"].lower()
+        msg = r["message"]
+        assert "Silence is not consent" not in msg  # this one IS denied, not timed-out
+        assert "NOT consented" in msg
+        assert "rephrase" in msg.lower()
+        # Deny keeps the terminal prohibition that timeout must NOT carry.
+        assert "different command" in msg.lower()
+
+    def test_timeout_and_deny_messages_differ(self, monkeypatch):
+        """The two events must read differently — a timeout is not a decision,
+        a deny is. This is the core of the fix."""
+        from tools import approval as mod
+
+        # --- timeout branch ---
+        self._force_short_timeout(monkeypatch, seconds=1)
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)
+        timeout_result = mod.check_all_command_guards("rm -rf .git", "local")
+        timeout_msg = timeout_result["message"]
+
+        # --- deny branch ---
+        mod._gateway_queues.clear()
+        self._force_short_timeout(monkeypatch, seconds=60)
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)
+        deny_holder = {}
+        def _check():
+            deny_holder["r"] = mod.check_all_command_guards("rm -rf .git", "local")
+        t = threading.Thread(target=_check)
+        t.start()
+        for _ in range(50):
+            if mod._gateway_queues.get(self.SESSION_KEY):
+                break
+            time.sleep(0.02)
+        mod.resolve_gateway_approval(self.SESSION_KEY, "deny")
+        t.join(timeout=5)
+        deny_msg = deny_holder["r"]["message"]
+
+        assert timeout_msg != deny_msg
+        # The distinguishing prohibition is present in deny, absent in timeout.
+        assert "different command" in deny_msg.lower()
+        assert "different command" not in timeout_msg.lower()
 
     def test_timeout_emits_post_hook_with_timeout_outcome(self, monkeypatch):
         """Plugins must be able to distinguish timeout from explicit deny.

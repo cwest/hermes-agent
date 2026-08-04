@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -43,6 +44,18 @@ _REPO = "sheeki03/tirith"
 # Cosign provenance verification — pinned to the specific release workflow
 _COSIGN_IDENTITY_REGEXP = f"^https://github.com/{_REPO}/\\.github/workflows/release\\.yml@refs/tags/v"
 _COSIGN_ISSUER = "https://token.actions.githubusercontent.com"
+
+# Built-in allowlist of ICANN-delegated gTLDs that are legitimately used by
+# production services and that the lookalike_tld heuristic reliably
+# false-positives on (the "can be confused with a file extension" class).
+# A warn verdict consisting SOLELY of lookalike_tld findings for these TLDs is
+# downgraded to allow; any other finding, or a lookalike for a TLD outside this
+# set, preserves the warn. Overridable via security.lookalike_tld_allowlist in
+# config.yaml (a user's list REPLACES this default — extend, don't shrink).
+_DEFAULT_LOOKALIKE_TLD_ALLOWLIST = (
+    "app", "dev", "io", "sh", "page", "zip", "mov",
+    "new", "gle", "foo", "day", "run", "bar",
+)
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -84,6 +97,9 @@ def _load_security_config() -> dict:
         "tirith_path": os.getenv("TIRITH_BIN", cfg.get("tirith_path", defaults["tirith_path"])),
         "tirith_timeout": _env_int("TIRITH_TIMEOUT", cfg.get("tirith_timeout", defaults["tirith_timeout"])),
         "tirith_fail_open": _env_bool("TIRITH_FAIL_OPEN", cfg.get("tirith_fail_open", defaults["tirith_fail_open"])),
+        "lookalike_tld_allowlist": cfg.get(
+            "lookalike_tld_allowlist", _DEFAULT_LOOKALIKE_TLD_ALLOWLIST
+        ),
     }
 
 
@@ -839,13 +855,23 @@ def check_command_security(command: str) -> dict:
         elif action == "warn":
             summary = "security warning detected (details unavailable)"
 
-    # Suppress warn verdicts that consist solely of a lookalike_tld finding for
-    # the .app TLD.  .app is a legitimate gTLD used by many production services
-    # and the "can be confused with file extensions" heuristic generates false
-    # positives for normal API calls.  Any other finding (including other
-    # lookalike_tld entries for non-.app TLDs) preserves the warn action.
+    # Suppress warn verdicts that consist solely of lookalike_tld findings for
+    # an allowlisted gTLD.  These TLDs (.app, .dev, .io, …) are legitimate,
+    # ICANN-delegated, and used by many production services; the "can be
+    # confused with a file extension" heuristic generates false positives for
+    # normal API calls against them.  Any other finding (including a
+    # lookalike_tld entry for a TLD outside the allowlist) preserves the warn.
     if action == "warn" and findings:
-        non_suppressible = [f for f in findings if not _is_app_tld_finding(f)]
+        raw_allowlist = cfg.get("lookalike_tld_allowlist")
+        if raw_allowlist is None:
+            # Config did not carry the key (e.g. a partial test override or a
+            # very old config.yaml) — fall back to the built-in default rather
+            # than disabling suppression, since these TLDs are always known-good.
+            raw_allowlist = _DEFAULT_LOOKALIKE_TLD_ALLOWLIST
+        allowlist = _normalize_tld_allowlist(raw_allowlist)
+        non_suppressible = [
+            f for f in findings if not _is_allowlisted_tld_finding(f, allowlist)
+        ]
         if not non_suppressible:
             action = "allow"
             findings = []
@@ -854,18 +880,64 @@ def check_command_security(command: str) -> dict:
     return {"action": action, "findings": findings, "summary": summary}
 
 
-def _is_app_tld_finding(finding: dict) -> bool:
-    """Return True if this finding is a lookalike_tld warning for the .app TLD only.
+def _normalize_tld_allowlist(raw) -> set:
+    """Return a set of lowercase, dot-stripped TLD labels from a config value.
+
+    Accepts the built-in tuple default or a user-supplied list; tolerates
+    entries with or without a leading dot and mixed case.  Returns an empty
+    set for a missing/malformed value (suppression then applies to nothing).
+    """
+    if not raw:
+        return set()
+    if isinstance(raw, (str, bytes)):
+        raw = [raw]
+    out = set()
+    for entry in raw:
+        try:
+            label = str(entry).strip().lower().lstrip(".")
+        except Exception:
+            continue
+        if label:
+            out.add(label)
+    return out
+
+
+def _is_allowlisted_tld_finding(finding: dict, allowlist: set) -> bool:
+    """Return True if this finding is a lookalike_tld warning for a TLD in the
+    allowlist.
 
     Checks the rule_id and inspects common value/detail field names that
-    Tirith may use to carry the TLD string.
+    Tirith may use to carry the TLD string.  ``allowlist`` is a set of
+    lowercase, dot-stripped TLD labels (see ``_normalize_tld_allowlist``).
     """
     if not isinstance(finding, dict):
         return False
     if finding.get("rule_id") != "lookalike_tld":
         return False
+    if not allowlist:
+        return False
     for field in ("value", "tld", "detail", "description", "message"):
         val = finding.get(field)
-        if val is not None and ".app" in str(val).lower():
-            return True
+        if val is None:
+            continue
+        lowered = str(val).lower()
+        for tld in allowlist:
+            # Match ".dev" only as a whole label: the TLD must be preceded by a
+            # dot and followed by a non-label character (end of string, quote,
+            # whitespace, slash, comma, …).  A plain substring test would
+            # suppress ".developer", ".dev-portal", or a free-text message
+            # mentioning ".devil.com" — the homograph/typosquat shapes this
+            # heuristic exists to catch.
+            if re.search(rf"\.{re.escape(tld)}(?![a-z0-9-])", lowered):
+                return True
     return False
+
+
+def _is_app_tld_finding(finding: dict) -> bool:
+    """Back-compat wrapper: True if this finding is a lookalike_tld warning for
+    the .app TLD.
+
+    Retained so existing callers/tests keep working; new code should call
+    ``_is_allowlisted_tld_finding`` with a config-driven allowlist.
+    """
+    return _is_allowlisted_tld_finding(finding, {"app"})
