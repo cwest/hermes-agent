@@ -295,11 +295,21 @@ def test_dir_fork_clone_on_tracked_non_main_branch_dispatches(kanban_home, tmp_p
     assert _current_branch(repo) == "cwest/integration"
 
 
-def test_dir_clone_detached_head_fails_loudly(kanban_home, tmp_path):
-    """A clone with a detached HEAD can't ff-only, so it must refuse."""
+def test_dir_clone_detached_at_ancestor_of_upstream_self_heals(kanban_home, tmp_path):
+    """Clean tree + detached HEAD already contained upstream → auto-reattach.
+
+    This is the review-leg polluter case: a prior lane worker checked the shared
+    deploy clone out to a commit that is an ancestor of (here, equal to) the
+    tracked deploy branch and exited without restoring the branch. Reattaching to
+    the deploy branch and fast-forwarding is provably lossless — nothing is
+    stranded — so the resolver must self-heal instead of hard-failing the spawn.
+    """
     repo = _make_repo(tmp_path)
     head_sha = _git(repo, "rev-parse", "HEAD").strip()
     _git(repo, "checkout", "--detach", head_sha)
+    # Precondition: really detached, clean, and contained in the upstream.
+    assert _current_branch(repo) == "HEAD"
+    assert _git(repo, "status", "--porcelain").strip() == ""
 
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -308,8 +318,130 @@ def test_dir_clone_detached_head_fails_loudly(kanban_home, tmp_path):
         )
         task = kb.get_task(conn, tid)
 
-    with pytest.raises(RuntimeError, match="cannot .*fast-forward|does not track an upstream|detached"):
+    # Must NOT raise — the recoverable detach self-heals.
+    workspace = kb.resolve_workspace(task)
+    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    # The shared clone is reattached to its deploy branch at the upstream SHA.
+    assert _current_branch(repo) == "main"
+    assert (
+        _git(repo, "rev-parse", "HEAD").strip()
+        == _git(repo, "rev-parse", "origin/main").strip()
+    )
+    assert _git(repo, "status", "--porcelain").strip() == ""
+
+
+def test_dir_clone_detached_at_ancestor_ff_advances_to_upstream(kanban_home, tmp_path):
+    """Detached BEHIND the upstream (a strict ancestor) → reattach + fast-forward.
+
+    The detached commit is a real ancestor of the deploy branch's upstream, not
+    just equal to it. Reattaching and ``merge --ff-only`` must advance the clone
+    to the upstream tip, stranding nothing.
+    """
+    repo = _make_repo(tmp_path)
+    old_sha = _git(repo, "rev-parse", "HEAD").strip()
+    # Advance the upstream past the detach point.
+    (repo / "README.md").write_text("advanced\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "advance")
+    _git(repo, "push", "origin", "main")
+    upstream_sha = _git(repo, "rev-parse", "origin/main").strip()
+    assert upstream_sha != old_sha
+    # A prior worker detached at the older commit and never restored the branch.
+    _git(repo, "checkout", "--detach", old_sha)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="office feature",
+            workspace_kind="dir", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace = kb.resolve_workspace(task)
+    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    # Reattached to main AND fast-forwarded to the upstream tip.
+    assert _current_branch(repo) == "main"
+    assert _git(repo, "rev-parse", "HEAD").strip() == upstream_sha
+
+
+def test_dir_clone_detached_at_commit_not_upstream_fails_loudly(kanban_home, tmp_path):
+    """Clean tree + detached HEAD carrying a commit NOT contained upstream → RAISE.
+
+    Reattaching here would strand the detached commit, so the reattach is not
+    lossless and must be refused. The guard keeps failing loudly.
+    """
+    repo = _make_repo(tmp_path)
+    # Detach and commit — the detached commit is now reachable from nothing that
+    # the upstream contains, so it would be stranded by a reattach.
+    _git(repo, "checkout", "--detach", "HEAD")
+    (repo / "orphan.txt").write_text("stranded\n", encoding="utf-8")
+    _git(repo, "add", "orphan.txt")
+    _git(repo, "commit", "-m", "orphan work off a detached HEAD")
+    assert _current_branch(repo) == "HEAD"
+    assert _git(repo, "status", "--porcelain").strip() == ""
+    orphan_sha = _git(repo, "rev-parse", "HEAD").strip()
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="office feature",
+            workspace_kind="dir", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+
+    with pytest.raises(RuntimeError, match="not contained|would strand|cannot .*fast-forward"):
         kb.resolve_workspace(task)
+    # Nothing was reattached — the orphan commit is preserved at HEAD.
+    assert _current_branch(repo) == "HEAD"
+    assert _git(repo, "rev-parse", "HEAD").strip() == orphan_sha
+
+
+def test_dir_clone_dirty_detached_head_fails_loudly(kanban_home, tmp_path):
+    """Dirty tree + detached HEAD → RAISE, and the message says the tree is dirty.
+
+    A dirty tree must never be auto-recovered — reattaching could discard or
+    entangle uncommitted work. The refusal must name the dirtiness explicitly.
+    """
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "--detach", "HEAD")
+    # Leave uncommitted work in the tree.
+    (repo / "wip.txt").write_text("uncommitted\n", encoding="utf-8")
+    assert _git(repo, "status", "--porcelain").strip() != ""
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="office feature",
+            workspace_kind="dir", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+
+    with pytest.raises(RuntimeError, match="(?i)dirty|uncommitted"):
+        kb.resolve_workspace(task)
+    # The dirty tree is left exactly as-is — nothing recovered.
+    assert (repo / "wip.txt").read_text(encoding="utf-8") == "uncommitted\n"
+    assert _current_branch(repo) == "HEAD"
+
+
+def test_dir_clone_named_local_only_branch_still_fails(kanban_home, tmp_path):
+    """A named local-only branch with no upstream still RAISES (unchanged).
+
+    A named branch is a deliberate state — not the accidental detach the
+    self-heal targets. It must never be auto-reattached; the guard keeps
+    refusing exactly as before.
+    """
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "-b", "topic/leftover")
+    assert _current_branch(repo) == "topic/leftover"
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="office feature",
+            workspace_kind="dir", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+
+    with pytest.raises(RuntimeError, match="does not track an upstream|cannot .*fast-forward"):
+        kb.resolve_workspace(task)
+    # The named branch is untouched — never auto-reattached.
+    assert _current_branch(repo) == "topic/leftover"
 
 
 def test_dir_linked_worktree_on_topic_branch_dispatches(kanban_home, tmp_path):

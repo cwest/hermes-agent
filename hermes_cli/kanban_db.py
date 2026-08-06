@@ -9524,6 +9524,169 @@ def _git_has_upstream(path: Path) -> bool:
     return result.returncode == 0 and bool((result.stdout or "").strip())
 
 
+def _git_is_dirty(path: Path) -> bool:
+    """True when the working tree has uncommitted or untracked changes.
+
+    ``git status --porcelain`` prints nothing for a pristine tree, so a
+    non-empty result (staged, unstaged, OR untracked) means dirty. A dirty
+    tree is never auto-recovered — reattaching could discard or entangle
+    uncommitted work — so this gates the conservative reattach below.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        # Cannot prove the tree is clean → treat as dirty (refuse to recover).
+        return True
+    if result.returncode != 0:
+        return True
+    return bool((result.stdout or "").strip())
+
+
+def _git_deploy_branch_with_upstream(path: Path) -> Optional[tuple[str, str]]:
+    """Resolve the clone's deploy branch and its upstream, or ``None``.
+
+    A shared deploy clone sits on a default branch that tracks an upstream
+    (``main`` → ``origin/main``, or a fork's ``cwest/integration`` →
+    ``origin/cwest/integration``). When the clone is detached we cannot read
+    that from HEAD, so we recover it from the local branches that track an
+    upstream:
+
+    * Prefer the remote's default branch when ``refs/remotes/origin/HEAD`` is
+      set (``origin/main`` → local ``main``) and that local branch tracks an
+      upstream — this is the exact branch the human recovery
+      (``git checkout main``) targets.
+    * Otherwise fall back to the sole local branch that tracks an upstream. A
+      genuine deploy clone has exactly one (it lives on its deploy branch); if
+      zero or more than one track an upstream the target is ambiguous, so we
+      return ``None`` and the caller refuses.
+
+    Returns ``(local_branch, upstream_ref)`` or ``None``.
+    """
+    tracking = _git_local_branches_with_upstream(path)
+    if not tracking:
+        return None
+
+    # Prefer the remote default branch (origin/HEAD → local branch), when it
+    # exists and itself tracks an upstream.
+    default_local = _git_remote_default_local_branch(path)
+    if default_local is not None and default_local in tracking:
+        return default_local, tracking[default_local]
+
+    # No usable origin/HEAD hint: accept the unique tracking branch, else refuse
+    # (ambiguous — we must not guess which branch is the deploy target).
+    if len(tracking) == 1:
+        (only_branch, only_upstream), = tracking.items()
+        return only_branch, only_upstream
+    return None
+
+
+def _git_remote_default_local_branch(path: Path) -> Optional[str]:
+    """Local branch name of ``refs/remotes/origin/HEAD`` (e.g. ``main``), or None.
+
+    ``git clone`` and ``git remote set-head`` record the remote's default
+    branch here as ``<remote>/<branch>``; its ``<branch>`` half is the local
+    deploy branch. Returns ``None`` when unset (a clone made from an empty
+    remote never establishes it) or unparseable.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "symbolic-ref", "--short",
+             "refs/remotes/origin/HEAD"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    ref = (result.stdout or "").strip()
+    if not ref or "/" not in ref:
+        return None
+    _remote, _, local_branch = ref.partition("/")
+    return local_branch or None
+
+
+def _git_local_branches_with_upstream(path: Path) -> dict[str, str]:
+    """Map ``local_branch -> upstream_ref`` for every local branch that tracks one.
+
+    ``git for-each-ref`` reports ``%(upstream:short)`` as empty for a
+    local-only branch, so branches with no upstream are naturally excluded.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "for-each-ref",
+             "--format=%(refname:short)\t%(upstream:short)", "refs/heads/"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return {}
+    if result.returncode != 0:
+        return {}
+    tracking: dict[str, str] = {}
+    for line in (result.stdout or "").splitlines():
+        name, tab, upstream = line.partition("\t")
+        if not tab:
+            continue
+        name = name.strip()
+        upstream = upstream.strip()
+        if name and upstream:
+            tracking[name] = upstream
+    return tracking
+
+
+def _git_head_is_ancestor_of(path: Path, ref: str) -> bool:
+    """True when the current HEAD is an ancestor of (or equal to) ``ref``.
+
+    ``git merge-base --is-ancestor HEAD <ref>`` exits 0 when HEAD is already
+    contained in ``ref`` — i.e. reattaching to ``ref`` and fast-forwarding
+    strands nothing. Any other exit (1 = not contained, 128 = bad ref) is
+    treated as "not provably contained" so the caller refuses.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "merge-base", "--is-ancestor", "HEAD", ref],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def _git_reattach_ff_only(path: Path, branch: str, upstream: str) -> None:
+    """Reattach a clean, contained detached HEAD to ``branch`` and fast-forward.
+
+    Conservative by construction: ``checkout`` moves onto the existing local
+    deploy branch, then ``merge --ff-only`` advances it to the upstream tip.
+    Never ``reset --hard``, never ``--force``, never discards. Callers MUST
+    have already proven the tree is clean and HEAD is an ancestor of
+    ``upstream`` so both steps are lossless.
+    """
+    subprocess.run(
+        ["git", "-C", str(path), "checkout", branch],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60, check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "merge", "--ff-only", upstream],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60, check=True,
+    )
+
+
 def _nearest_existing_path(path: Path) -> Path:
     current = path
     while not current.exists() and current != current.parent:
@@ -9804,19 +9967,77 @@ def _resolve_dir_workspace(task: Task) -> Path:
         # (e.g. ``cwest/integration`` tracking ``origin/cwest/integration``). We
         # refuse only the states where ``--ff-only`` genuinely cannot run — a
         # detached HEAD, or a local-only branch with no upstream.
+        #
+        # The common polluter here is a PREVIOUS lane worker (most often a
+        # REVIEW leg) that checked this shared clone out to a PR head SHA to read
+        # a diff, blocked, and exited WITHOUT restoring the deploy branch. The
+        # dispatcher then auto-routes the next card here and its spawn dies on
+        # this guard. See
+        # ``diagnosing-process-liveness-before-intervening/references/
+        # deploy-clone-detached-by-a-review-leg.md``. That leftover detach is
+        # provably recoverable: when the tree is CLEAN and the detached HEAD is
+        # already an ancestor of the deploy branch's upstream, reattaching and
+        # fast-forwarding strands nothing. Do exactly the human's two-command
+        # recovery (``git checkout <deploy-branch> && git pull --ff-only``) in
+        # place, then continue — rather than converting a mechanical fixup into a
+        # dead card only a human can clear. Anything short of that clean,
+        # contained, detached state still refuses (below).
         if not _git_has_upstream(repo_root):
             current_branch = _git_current_branch(repo_root)
-            where = (
-                f"branch {current_branch!r}" if current_branch else "a detached HEAD"
-            )
-            raise RuntimeError(
-                f"deploy clone {repo_root} on {where} cannot be safely "
-                f"fast-forwarded: its HEAD does not track an upstream, so the "
-                f"post-merge `git pull --ff-only` this workspace depends on "
-                f"cannot run. A card worker must never build on a shared clone "
-                f"whose deploy branch cannot fast-forward. Put the clone on a "
-                f"branch that tracks its upstream before dispatching."
-            )
+            dirty = _git_is_dirty(repo_root)
+            deploy = None if dirty else _git_deploy_branch_with_upstream(repo_root)
+
+            # Conservative self-heal: ONLY a clean tree, an actual detached HEAD
+            # (a named local-only branch is a DELIBERATE state — never
+            # auto-reattached), a resolvable deploy branch that tracks an
+            # upstream, and a HEAD already contained in that upstream. All four
+            # must hold; otherwise fall through and refuse.
+            if (
+                not dirty
+                and current_branch is None
+                and deploy is not None
+                and _git_head_is_ancestor_of(repo_root, deploy[1])
+            ):
+                deploy_branch, deploy_upstream = deploy
+                _git_reattach_ff_only(repo_root, deploy_branch, deploy_upstream)
+            else:
+                # Name the precondition that failed and the likely cause so the
+                # next reader can act without reverse-engineering it from the
+                # reflog.
+                if dirty:
+                    why = (
+                        "its working tree is DIRTY (uncommitted or untracked "
+                        "changes), which must never be auto-recovered — recover "
+                        "the tree by hand first"
+                    )
+                elif current_branch is not None:
+                    why = (
+                        f"it is on the named local-only branch "
+                        f"{current_branch!r} with no upstream — a deliberate "
+                        f"state that is never auto-reattached; put it back on a "
+                        f"branch that tracks its upstream before dispatching"
+                    )
+                elif deploy is None:
+                    why = (
+                        "its deploy branch / upstream could not be resolved from "
+                        "`refs/remotes/origin/HEAD` (no tracked default branch), "
+                        "so a safe reattach target is unknown"
+                    )
+                else:
+                    why = (
+                        f"the detached HEAD is NOT contained in the deploy "
+                        f"branch upstream {deploy[1]!r}, so reattaching would "
+                        f"strand that commit — refusing rather than discard it"
+                    )
+                raise RuntimeError(
+                    f"deploy clone {repo_root} cannot be safely fast-forwarded: "
+                    f"{why}. A card worker must never build on a shared clone "
+                    f"whose deploy branch cannot `git pull --ff-only`. The usual "
+                    f"source is a PREVIOUS lane worker (often a review leg) that "
+                    f"checked this shared clone out to a PR head and exited "
+                    f"without restoring the branch; run `git reflog` in the clone "
+                    f"to confirm, then reattach it to its deploy branch."
+                )
 
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     target = repo_root / ".worktrees" / task.id
