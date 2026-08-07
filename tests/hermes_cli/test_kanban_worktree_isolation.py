@@ -286,9 +286,10 @@ def test_dir_pinned_at_linked_worktree_stays_on_its_branch_no_wt_branch(
     assert head == "topic/obtainability-series"
     # The declared branch's content is present (not a fresh cut from main).
     assert (workspace / "hero.md").exists()
-    # No auto-derived wt/<task-id> branch was ever created anywhere in the repo.
+    # No auto-derived per-task branch was ever created anywhere in the repo.
+    auto_branch = kb._derive_worktree_branch_name(tid, task.title)
     branches = subprocess.run(
-        ["git", "-C", str(wt), "branch", "--list", f"wt/{tid}*"],
+        ["git", "-C", str(wt), "branch", "--list", f"{auto_branch}*", f"wt/{tid}*"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert branches == ""
@@ -404,8 +405,12 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         task = kb.get_task(conn, tid)
 
     workspace, branch = kb._resolve_worktree_workspace(task)
-    assert workspace == (repo / ".worktrees" / tid).resolve()
-    assert branch == f"wt/{tid}-second-sibling"
+    # The occupied path is another task's checkout — this task falls back to its
+    # OWN fresh worktree, now named after the DESCRIPTIVE branch leaf (not the
+    # bare task id). "second sibling" -> topic/second-sibling -> second-sibling.
+    assert workspace == (repo / ".worktrees" / "second-sibling").resolve()
+    assert branch == "topic/second-sibling"
+    assert tid not in workspace.name
     # The sibling's checkout is untouched, still on its own branch.
     assert (occupied / "README.md").exists()
     head = subprocess.run(
@@ -456,8 +461,9 @@ def test_resolve_worktree_own_path_on_foreign_branch_keeps_legacy_reuse(
         conn.commit()
         task = kb.get_task(conn, tid)
 
-    # The fallback target would be the occupied path itself, so the
-    # legacy reuse applies rather than failing dispatch.
+    # No explicit branch is set on the task, so an existing checkout is reused
+    # as-is on whatever branch it already carries — the descriptive rename only
+    # applies to NEWLY materialized worktrees, never disrupting one in flight.
     workspace, branch = kb._resolve_worktree_workspace(task)
     assert workspace == own.resolve()
     assert branch == "wt/foreign"
