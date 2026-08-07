@@ -4199,7 +4199,9 @@ def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban
         assert task is not None
         ws = kb.resolve_workspace(task)
 
-    expected = repo / ".worktrees" / t
+    # Branch + directory are now DESCRIPTIVE kebab case derived from the title
+    # ("ship" -> topic/ship, dir leaf "ship") — no wt/ prefix, no bare task id.
+    expected = repo / ".worktrees" / "ship"
     assert ws == expected
     assert ws.exists()
     repo_common = subprocess.run(
@@ -4222,7 +4224,7 @@ def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban
         text=True,
     ).stdout
     assert f"worktree {expected}" in listed
-    assert f"branch refs/heads/wt/{t}" in listed
+    assert "branch refs/heads/topic/ship" in listed
 
 
 # ---------------------------------------------------------------------------
@@ -4413,9 +4415,9 @@ def test_reap_squash_merged_branch_deleted_worktree(kanban_home, tmp_path):
 def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path):
     """A worktree task created with no explicit path inherits the board's
     default_workdir as its anchor and materializes a per-task linked worktree
-    at ``<repo>/.worktrees/<id>`` — NOT the dispatcher's CWD, and NOT the
-    shared default_workdir verbatim (which would collapse every task into one
-    directory)."""
+    at ``<repo>/.worktrees/<descriptive-slug>`` — NOT the dispatcher's CWD, and
+    NOT the shared default_workdir verbatim (which would collapse every task
+    into one directory)."""
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     kb.create_board("wt-default-board", default_workdir=str(repo))
@@ -4427,9 +4429,12 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
         assert task is not None
         ws = kb.resolve_workspace(task, board="wt-default-board")
 
-    expected = repo / ".worktrees" / t
+    # Descriptive dir leaf from the title ("ship" -> topic/ship -> leaf "ship"),
+    # not the bare task id.
+    expected = repo / ".worktrees" / "ship"
     assert ws == expected
     assert ws.exists()
+    assert ws.name != t  # not the opaque task id
     assert ws != repo  # not the shared default verbatim
 
 
@@ -4517,12 +4522,13 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
         result = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-board")
         task = kb.get_task(conn, tid)
 
-    expected = repo / ".worktrees" / tid
+    # Descriptive kebab-case branch + dir from the title ("ship" -> topic/ship).
+    expected = repo / ".worktrees" / "ship"
     assert result.spawned == [(tid, "sentinel", str(expected))]
     assert spawns == [(tid, str(expected))]
     assert task is not None
     assert task.workspace_path == str(expected)
-    assert task.branch_name == f"wt/{tid}"
+    assert task.branch_name == "topic/ship"
     listed = subprocess.run(
         ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
         check=True,
@@ -4530,7 +4536,7 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
         text=True,
     ).stdout
     assert f"worktree {expected}" in listed
-    assert f"branch refs/heads/wt/{tid}" in listed
+    assert "branch refs/heads/topic/ship" in listed
 
 
 def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch(kanban_home, tmp_path, monkeypatch):
@@ -4556,9 +4562,10 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         first = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-rerun-board")
         first_task = kb.get_task(conn, tid)
         assert first_task is not None
-        expected = repo / ".worktrees" / tid
+        # Descriptive kebab-case dir + branch ("ship" -> topic/ship).
+        expected = repo / ".worktrees" / "ship"
         assert first_task.workspace_path == str(expected)
-        assert first_task.branch_name == f"wt/{tid}"
+        assert first_task.branch_name == "topic/ship"
 
         conn.execute(
             "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
@@ -4580,7 +4587,7 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         capture_output=True,
         text=True,
     ).stdout.strip()
-    assert actual_branch == f"wt/{tid}"
+    assert actual_branch == "topic/ship"
     assert second_task.branch_name == actual_branch
     listed = subprocess.run(
         ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
@@ -4589,7 +4596,7 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         text=True,
     ).stdout
     assert listed.count(f"worktree {expected}\n") == 1
-    assert f"worktree {expected}/.worktrees/{tid}" not in listed
+    assert f"worktree {expected}/.worktrees/ship" not in listed
     assert f"branch refs/heads/{actual_branch}" in listed
 
 
@@ -5380,7 +5387,7 @@ class TestSharedBoardPaths:
             claim_lock=None,
             claim_expires=None,
             tenant=None,
-            branch_name="wt/t_dispatch_env",
+            branch_name="fix/dispatch-env",
         )
         kb._default_spawn(task, str(tmp_path / "ws"))
 
@@ -5390,7 +5397,8 @@ class TestSharedBoardPaths:
             default_home / "kanban" / "workspaces"
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
-        assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        # The persisted (descriptive) branch is propagated to the worker verbatim.
+        assert env["HERMES_KANBAN_BRANCH"] == "fix/dispatch-env"
 
 
 # ---------------------------------------------------------------------------

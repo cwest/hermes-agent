@@ -762,21 +762,55 @@ def project_for_path(
     return get_project(conn, best_pid)
 
 
-# Deterministic branch slug: lowercase, separators collapsed, capped.
-_BRANCH_SAFE_RE = re.compile(r"[^a-z0-9._-]+")
+# One RFC-1123 single DNS label caps at 63 chars. The branch's descriptive
+# leaf is used by the blog preview supervisor as a hostname label, so hold it
+# under this cap and cut on a word boundary rather than mid-word.
+_DNS_LABEL_MAX = 63
+_KEBAB_UNSAFE_RE = re.compile(r"[^a-z0-9]+")
+
+# ``type`` or ``type(scope)`` followed by ``:`` at the very start of a title.
+_CONVENTIONAL_PREFIX_RE = re.compile(r"^\s*[a-z]+(?:\([^)]*\))?\s*:\s*", re.IGNORECASE)
+
+
+def _kebab(text: str) -> str:
+    return _KEBAB_UNSAFE_RE.sub("-", str(text or "").strip().lower()).strip("-")
+
+
+def _word_boundary_cut(slug: str, max_len: int) -> str:
+    if len(slug) <= max_len:
+        return slug
+    out: list[str] = []
+    used = 0
+    for tok in slug.split("-"):
+        add = len(tok) + (1 if out else 0)
+        if used + add > max_len:
+            break
+        out.append(tok)
+        used += add
+    if not out:
+        return slug[:max_len].rstrip("-")
+    return "-".join(out)
 
 
 def branch_name_for(project: Project, task_id: str, *, title: str = "") -> str:
-    """Deterministic branch name for a project-linked kanban task.
+    """Deterministic, DESCRIPTIVE branch name for a project-linked kanban task.
 
-    Shape: ``<project-slug>/<task-id>`` (optionally ``-<title-slug>``). Stable
-    and human-meaningful, replacing the random ``wt/<task-id>`` fallback.
+    Shape: ``<project-slug>/<descriptive-title-slug>``. The project slug is the
+    branch namespace; the descriptive leaf comes from the card title with any
+    Conventional-commit type prefix (``fix:``, ``feat(scope):``, ...) folded in.
+    NO task id and NO underscore appear in the human-facing portion, and the
+    leaf is a valid RFC-1123 DNS label (<= 63 chars, word-boundary truncation)
+    so the blog preview hostname is well-formed with no downstream sanitization.
+
+    When a title slugs away to nothing, fall back to ``<slug>/work-<hex>`` (the
+    descriptive replacement for the old bare-id fallback) — still a valid,
+    underscore-free label.
     """
     slug = project.slug or _slugify(project.name)
-    base = f"{slug}/{task_id}"
-    if title:
-        tslug = _BRANCH_SAFE_RE.sub("-", str(title).strip().lower()).strip("-")
-        tslug = tslug[:40].strip("-")
-        if tslug:
-            base = f"{base}-{tslug}"
-    return base
+    leaf_source = _CONVENTIONAL_PREFIX_RE.sub("", str(title or ""), count=1)
+    leaf = _word_boundary_cut(_kebab(leaf_source), _DNS_LABEL_MAX)
+    if not leaf:
+        hexpart = str(task_id or "").split("_", 1)[-1]
+        hexpart = _kebab(hexpart) or "0"
+        leaf = _word_boundary_cut(f"work-{hexpart}", _DNS_LABEL_MAX)
+    return f"{slug}/{leaf}"

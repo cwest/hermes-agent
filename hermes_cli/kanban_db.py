@@ -3377,10 +3377,13 @@ def create_task(
                     project_slug = None
                     if source_task.branch_name:
                         prefix, separator, leaf = source_task.branch_name.partition("/")
-                        if separator and (
-                            leaf == source_task.id
-                            or leaf.startswith(f"{source_task.id}-")
-                        ):
+                        # The branch prefix is the project slug in BOTH the
+                        # legacy ``<slug>/<task-id>[-...]`` shape and the current
+                        # descriptive ``<slug>/<title-slug>`` shape. Recover the
+                        # slug from the prefix whenever there is one and it
+                        # normalizes; the leaf shape no longer needs to embed the
+                        # task id for this to work.
+                        if separator and prefix:
                             try:
                                 project_slug = _pdb.normalize_slug(prefix)
                             except ValueError:
@@ -3573,14 +3576,14 @@ def create_task(
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
                 # Project-linked worktree: a fresh worktree dir under the repo
-                # plus a deterministic branch (project slug + task id). Together
-                # these kill the random ``wt/<task-id>`` worker fallback and the
-                # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
+                # plus a deterministic, DESCRIPTIVE kebab-case branch (project
+                # slug namespace + title slug, no task id). Together these kill
+                # the ``wt/<task-id>`` worker fallback and the unanchored
+                # ``.worktrees/<id>`` under the dispatcher's cwd. The on-disk
+                # directory is named after the branch's descriptive leaf (not
+                # the bare task id); the id->path mapping lives in the persisted
+                # ``workspace_path`` column, so the dispatcher still finds it.
                 if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(
-                            project_repo, ".worktrees", task_id
-                        )
                     if not branch_name:
                         # _pdb was imported above when project_obj was resolved.
                         try:
@@ -3589,6 +3592,11 @@ def create_task(
                             )
                         except Exception:
                             branch_name = None
+                    if project_repo and not workspace_path:
+                        leaf = _worktree_dir_leaf(branch_name or "", task_id)
+                        workspace_path = os.path.join(
+                            project_repo, ".worktrees", leaf
+                        )
 
                 conn.execute(
                     """
@@ -9436,6 +9444,181 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     return result.returncode == 0
 
 
+# ---------------------------------------------------------------------------
+# Descriptive kebab-case branch + worktree-directory derivation
+# ---------------------------------------------------------------------------
+#
+# Casey's standing rule: branches and worktrees are DESCRIPTIVELY named in
+# kebab case. The dispatcher must produce such names by construction so the
+# rule cannot be violated by an operator. The old ``wt/<task-id>`` fallback
+# carried an opaque, underscore-bearing id in the human-facing portion and
+# truncated the descriptive tail mid-word.
+#
+# The blog preview supervisor derives ``<label>.blog.office.caseywest.com``
+# from a branch's LAST ref segment (``rsplit('/', 1)[-1]``) and requires that
+# segment to be a valid RFC-1123 single DNS label (<= 63 chars, lowercase
+# alnum + internal hyphens, no leading/trailing hyphen). We encode that
+# constraint here rather than assume it: the descriptive segment is always a
+# valid label with no downstream sanitization needed.
+
+# One RFC-1123 single label caps at 63 chars. The branch's descriptive
+# segment (the part after the namespace slash) is the DNS label, so we hold
+# BOTH the whole branch and that segment under this cap.
+_DNS_LABEL_MAX = 63
+
+# Non-``[a-z0-9]`` runs collapse to a single hyphen when slugifying.
+_KEBAB_UNSAFE_RE = re.compile(r"[^a-z0-9]+")
+
+# Conventional-commit type -> branch namespace. Unknown/none -> ``topic``,
+# matching hand-authored branches like ``topic/unlisted-post-flag``.
+_CONVENTIONAL_NAMESPACES = {
+    "fix": "fix",
+    "feat": "feat",
+    "content": "content",
+    "chore": "chore",
+    "docs": "docs",
+    "refactor": "refactor",
+    "test": "test",
+    "perf": "perf",
+    "build": "build",
+    "ci": "ci",
+    "style": "style",
+    "revert": "revert",
+}
+_DEFAULT_NAMESPACE = "topic"
+
+# ``type`` or ``type(scope)`` followed by ``:`` at the very start of a title.
+_CONVENTIONAL_PREFIX_RE = re.compile(
+    r"^\s*([a-z]+)(?:\([^)]*\))?\s*:\s*", re.IGNORECASE
+)
+
+
+def _kebab_slug(text: str) -> str:
+    """Lowercase, collapse non-alnum runs to single hyphens, strip ends."""
+    return _KEBAB_UNSAFE_RE.sub("-", str(text or "").strip().lower()).strip("-")
+
+
+def _truncate_on_word_boundary(slug: str, max_len: int) -> str:
+    """Cut a hyphenated slug at ``max_len`` on a WORD (hyphen) boundary.
+
+    Never leaves a trailing partial token: if the cut would land mid-word we
+    drop the whole final fragment. A single first token longer than ``max_len``
+    is hard-cut (degenerate input) but still yields a valid label.
+    """
+    if len(slug) <= max_len:
+        return slug
+    tokens = slug.split("-")
+    out: list[str] = []
+    used = 0
+    for tok in tokens:
+        add = len(tok) + (1 if out else 0)
+        if used + add > max_len:
+            break
+        out.append(tok)
+        used += add
+    if not out:
+        # First token alone overflows — hard-cut it (no boundary available).
+        return slug[:max_len].rstrip("-")
+    return "-".join(out)
+
+
+def _conventional_namespace_and_rest(title: str) -> tuple[str, str]:
+    """Split a title into (branch-namespace, descriptive-remainder).
+
+    ``fix(post): cut the false claim`` -> (``fix``, ``cut the false claim``).
+    A title with no recognizable Conventional type keeps its whole text as the
+    remainder under the ``topic`` namespace.
+    """
+    title = str(title or "")
+    m = _CONVENTIONAL_PREFIX_RE.match(title)
+    if m:
+        type_token = m.group(1).lower()
+        ns = _CONVENTIONAL_NAMESPACES.get(type_token)
+        if ns is not None:
+            return ns, title[m.end():]
+    return _DEFAULT_NAMESPACE, title
+
+
+def _short_id_hex(task_id: str) -> str:
+    """The task id's hex payload with no ``t_`` prefix / underscore.
+
+    Used only to keep an empty-slug or colliding branch a VALID label — never
+    as the primary human-facing name.
+    """
+    hexpart = str(task_id or "").split("_", 1)[-1]
+    hexpart = _KEBAB_UNSAFE_RE.sub("-", hexpart.lower()).strip("-")
+    return hexpart or "0"
+
+
+def _derive_worktree_branch_name(
+    task_id: str,
+    title: str,
+    *,
+    repo_root: Optional[Path] = None,
+) -> str:
+    """Descriptive kebab-case branch for a worktree task.
+
+    Shape: ``<namespace>/<descriptive-title-slug>`` — NO ``wt/`` prefix and NO
+    task id in the human-facing portion. The namespace comes from the title's
+    Conventional type (``fix``/``feat``/``content``/``chore``/...) or ``topic``
+    when none applies. The descriptive segment is a valid RFC-1123 DNS label
+    (<= 63 chars, word-boundary truncation) so the blog preview hostname is
+    well-formed with no downstream sanitization.
+
+    When a title slugs away to nothing, fall back to ``<namespace>/work-<hex>``
+    (the descriptive replacement for the old bare-id fallback) — still
+    underscore-free and DNS-safe.
+
+    Uniqueness is the EXCEPTION, not the default: when ``repo_root`` is given
+    and the clean branch already exists, append a short suffix (and only then).
+    Collisions were the reason the id used to be inlined; here they cost a
+    suffix, not the readable name.
+    """
+    namespace, rest = _conventional_namespace_and_rest(title)
+    prefix = f"{namespace}/"
+    # Reserve room for the namespace so the WHOLE branch stays <= the cap, and
+    # keep the descriptive segment itself <= the DNS-label cap.
+    seg_budget = min(_DNS_LABEL_MAX, _DNS_LABEL_MAX - len(prefix))
+    slug = _truncate_on_word_boundary(_kebab_slug(rest), seg_budget)
+    if not slug:
+        # Empty descriptive slug: a readable, underscore-free, DNS-safe stand-in.
+        fallback = _truncate_on_word_boundary(
+            f"work-{_short_id_hex(task_id)}", seg_budget
+        )
+        slug = fallback or _short_id_hex(task_id)[:seg_budget]
+    candidate = f"{namespace}/{slug}"
+
+    if repo_root is None or not _git_branch_exists(repo_root, candidate):
+        return candidate
+
+    # Disambiguate only on a real collision. Try a short id-hex suffix first,
+    # then numeric suffixes, always re-truncating so we stay under the cap.
+    hexsfx = _short_id_hex(task_id)[:6]
+    for suffix in [hexsfx] + [f"{hexsfx}-{n}" for n in range(2, 100)]:
+        seg = _truncate_on_word_boundary(slug, seg_budget - len(suffix) - 1)
+        seg = f"{seg}-{suffix}".strip("-") if seg else suffix
+        seg = seg[:seg_budget].rstrip("-")
+        cand = f"{namespace}/{seg}"
+        if not _git_branch_exists(repo_root, cand):
+            return cand
+    return candidate
+
+
+def _worktree_dir_leaf(branch_name: str, task_id: str) -> str:
+    """Descriptive, filesystem-safe leaf for ``<repo>/.worktrees/<leaf>``.
+
+    Derived from the branch's LAST segment (already collision-disambiguated),
+    so directory uniqueness follows branch uniqueness and ``git worktree list``
+    reads as prose. Falls back to a readable id-hex leaf only when the branch
+    somehow has no usable segment (never the bare ``t_<id>`` with its
+    underscore).
+    """
+    leaf = _kebab_slug(str(branch_name or "").rsplit("/", 1)[-1])
+    if not leaf:
+        leaf = f"work-{_short_id_hex(task_id)}"
+    return leaf[:_DNS_LABEL_MAX].strip("-") or _short_id_hex(task_id)
+
+
 def _git_common_dir(path: Path) -> Optional[Path]:
     try:
         result = subprocess.run(
@@ -9802,12 +9985,28 @@ def _resolve_worktree_workspace(
     When ``task.workspace_path`` is unset, the anchor is the board's
     ``default_workdir`` (a persistent project checkout). This keeps every
     worktree task under a meaningful, board-owned repo — ``<repo>/.worktrees/
-    <task-id>`` — instead of silently landing under the dispatcher's current
-    working directory (which is whatever directory the gateway happened to be
-    launched from, e.g. the Hermes checkout). If no anchor is configured
+    <descriptive-slug>`` — instead of silently landing under the dispatcher's
+    current working directory (which is whatever directory the gateway happened
+    to be launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
+
+    Both the branch and the on-disk worktree directory are DESCRIPTIVE kebab
+    case derived from the card title (see ``_derive_worktree_branch_name`` /
+    ``_worktree_dir_leaf``). The id->path mapping lives in the card record
+    (persisted by the dispatcher via ``set_workspace_path``), NOT in the
+    directory name — so ``git worktree list`` reads as prose while the
+    dispatcher can still find a card's worktree.
     """
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+
+    def _branch_for(repo_root: Optional[Path]) -> str:
+        """Honor an explicitly-set branch; otherwise derive a descriptive one."""
+        explicit = (task.branch_name or "").strip()
+        if explicit:
+            return explicit
+        return _derive_worktree_branch_name(
+            task.id, task.title or "", repo_root=repo_root
+        )
+
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -9833,7 +10032,8 @@ def _resolve_worktree_workspace(
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
-        target = repo_root / ".worktrees" / task.id
+        branch_name = _branch_for(repo_root)
+        target = repo_root / ".worktrees" / _worktree_dir_leaf(branch_name, task.id)
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
 
@@ -9865,7 +10065,19 @@ def _resolve_worktree_workspace(
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
-        if actual_branch == branch_name:
+        explicit = (task.branch_name or "").strip()
+        # This task's effective branch: an explicit one if set, else the
+        # descriptive branch it WOULD derive (base form, no collision suffix —
+        # we are checking checkout IDENTITY here, not creating a new branch).
+        effective = explicit or _derive_worktree_branch_name(
+            task.id, task.title or "", repo_root=None
+        )
+        # The requested path is this task's OWN canonical location when its leaf
+        # is the bare task id (legacy) — reuse it regardless of the branch it
+        # currently carries rather than orphaning the task's own checkout.
+        own_canonical = requested.name == task.id
+        if actual_branch and (actual_branch == effective or own_canonical):
+            # Already on this task's branch (or its own canonical dir) — reuse.
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -9876,18 +10088,22 @@ def _resolve_worktree_workspace(
         # of our own under the same repo.
         fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
-            fallback = fallback_root / ".worktrees" / task.id
+            branch_name = _branch_for(fallback_root)
+            fallback = fallback_root / ".worktrees" / _worktree_dir_leaf(
+                branch_name, task.id
+            )
             if fallback.resolve(strict=False) != requested_resolved:
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
         # than failing dispatch.
-        return requested_resolved, actual_branch or branch_name
+        return requested_resolved, actual_branch or _branch_for(None)
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
-        target = repo_root / ".worktrees" / task.id
+        branch_name = _branch_for(repo_root)
+        target = repo_root / ".worktrees" / _worktree_dir_leaf(branch_name, task.id)
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
 
@@ -9897,6 +10113,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
+    branch_name = _branch_for(repo_root)
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
 
@@ -9912,8 +10129,8 @@ def _resolve_dir_workspace(task: Task) -> Path:
     runtime WIP in the tree) twice in one session and broke the fast-forward.
 
     So when the path is a repo root we materialize a per-task linked worktree at
-    ``<repo>/.worktrees/<task-id>`` (the same isolation the ``worktree`` kind
-    uses) and hand THAT to the worker: concurrent workers get distinct trees,
+    ``<repo>/.worktrees/<descriptive-slug>`` (the same isolation the ``worktree``
+    kind uses) and hand THAT to the worker: concurrent workers get distinct trees,
     runtime files in the shared clone never enter a worker's branch, and the
     shared clone's branch is never touched. A ``dir`` path that is NOT a repo
     root (a plain ops directory, or a subdirectory of a repo scoped on purpose)
@@ -10039,8 +10256,17 @@ def _resolve_dir_workspace(task: Task) -> Path:
                     f"to confirm, then reattach it to its deploy branch."
                 )
 
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
-    target = repo_root / ".worktrees" / task.id
+    # Derive DETERMINISTICALLY (repo_root=None → no collision suffix): the
+    # dir-redirect worktree is keyed to THIS task, and dir-kind never persists
+    # branch_name back to the row (the repo-root anchor must survive), so a
+    # re-dispatch must re-derive the SAME name and reuse the existing worktree
+    # rather than disambiguate away from the branch this task created last run.
+    # _ensure_git_worktree is idempotent when the target already exists as this
+    # repo's linked worktree.
+    branch_name = (task.branch_name or "").strip() or _derive_worktree_branch_name(
+        task.id, task.title or "", repo_root=None
+    )
+    target = repo_root / ".worktrees" / _worktree_dir_leaf(branch_name, task.id)
     _ensure_git_worktree(repo_root, target, branch_name)
     return target.resolve(strict=False)
 
@@ -10060,19 +10286,22 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       compute the absolute path themselves.  When the path names a git
       repo ROOT (a shared clone such as the office deploy checkout),
       Hermes redirects to a per-task linked worktree at
-      ``<repo>/.worktrees/<task-id>`` so the worker never checks out its
-      branch in the shared clone, and raises if that clone is found off
+      ``<repo>/.worktrees/<descriptive-slug>`` so the worker never checks out
+      its branch in the shared clone, and raises if that clone is found off
       its default branch. A path inside a repo, or a plain non-repo dir,
       is returned as-is.
     - ``worktree``: a real linked git worktree. If ``workspace_path`` names
       a repo root, Hermes treats it as an anchor and materializes a linked
-      worktree at ``<repo>/.worktrees/<task-id>``. If ``workspace_path`` names
-      a concrete target path, Hermes creates/reuses that linked worktree. With
-      no ``workspace_path``, Hermes anchors on the board's ``default_workdir``
-      and materializes ``<repo>/.worktrees/<task-id>`` per task; if no
-      ``default_workdir`` is configured it raises rather than guessing from the
-      dispatcher's CWD. When ``branch_name`` is empty, Hermes uses
-      ``wt/<task-id>``.
+      worktree at ``<repo>/.worktrees/<descriptive-slug>``. If ``workspace_path``
+      names a concrete target path, Hermes creates/reuses that linked worktree.
+      With no ``workspace_path``, Hermes anchors on the board's
+      ``default_workdir`` and materializes ``<repo>/.worktrees/<descriptive-slug>``
+      per task; if no ``default_workdir`` is configured it raises rather than
+      guessing from the dispatcher's CWD. When ``branch_name`` is empty, Hermes
+      derives a descriptive kebab-case branch from the card title (see
+      ``_derive_worktree_branch_name``) — the directory leaf follows that
+      branch's last segment, and the id->path mapping is kept in the card record,
+      not the directory name.
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
@@ -12901,7 +13130,7 @@ def _dispatch_once_locked(
         # A redirected ``dir`` anchor is preserved (see persist_resolved_workspace).
         persist_resolved_workspace(conn, claimed, str(workspace))
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or _derive_worktree_branch_name(claimed.id, claimed.title or ""))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -12996,7 +13225,7 @@ def _dispatch_once_locked(
         # A redirected ``dir`` anchor is preserved (see persist_resolved_workspace).
         persist_resolved_workspace(conn, claimed, str(workspace))
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or _derive_worktree_branch_name(claimed.id, claimed.title or ""))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the review skill matched to the card's kind/team — the
         # code-review skill (sdlc-review) for a code card, the editorial-review
