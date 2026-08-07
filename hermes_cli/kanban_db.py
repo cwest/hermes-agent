@@ -3369,10 +3369,18 @@ def create_task(
                 and source_task.workspace_path
             ):
                 source_path = Path(source_task.workspace_path)
+                # The source worktree dir leaf is the descriptive slug the
+                # dispatcher would derive for this task, no longer the bare
+                # task id. Accept either the current descriptive shape or the
+                # legacy id-named dir so recovery keeps working across the
+                # rename and for worktrees already in flight.
+                _expected_leaf = _worktree_dir_leaf(
+                    source_task.branch_name or "", source_task.id
+                )
                 if (
                     source_path.is_absolute()
-                    and source_path.name == source_task.id
                     and source_path.parent.name == ".worktrees"
+                    and source_path.name in (_expected_leaf, source_task.id)
                 ):
                     project_slug = None
                     if source_task.branch_name:

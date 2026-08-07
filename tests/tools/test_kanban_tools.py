@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -1301,9 +1302,10 @@ def test_create_default_child_inherits_project_without_reusing_worktree(
     }))
     assert result["ok"] is True
     assert result["workspace_kind"] == "worktree"
-    assert result["workspace_path"] == str(
-        repo / ".worktrees" / result["task_id"]
-    )
+    # The worktree dir is now a descriptive slug, not the bare task id.
+    assert Path(result["workspace_path"]).parent == repo / ".worktrees"
+    assert result["task_id"] not in Path(result["workspace_path"]).name
+    assert "_" not in Path(result["workspace_path"]).name
     assert result["project_id"] == parent.project_id
 
     conn = kb.connect()
@@ -1313,7 +1315,14 @@ def test_create_default_child_inherits_project_without_reusing_worktree(
         assert child.project_id == parent.project_id
         assert child.workspace_kind == "worktree"
         assert child.workspace_path != parent.workspace_path
-        assert child.workspace_path == str(repo / ".worktrees" / child.id)
+        # workspace dir leaf is derived from the branch's descriptive tail.
+        assert child.workspace_path == str(
+            repo / ".worktrees" / kb._worktree_dir_leaf(
+                child.branch_name or "", child.id
+            )
+        )
+        assert child.id not in Path(child.workspace_path).name
+        assert "_" not in Path(child.workspace_path).name
         assert child.branch_name != parent.branch_name
     finally:
         conn.close()
@@ -1383,10 +1392,18 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
         assert task is not None
         assert task.project_id == project_id
         assert task.workspace_kind == "worktree"
-        assert task.workspace_path == str(repo / ".worktrees" / task.id)
+        assert task.workspace_path == str(
+            repo / ".worktrees" / kb._worktree_dir_leaf(
+                task.branch_name or "", task.id
+            )
+        )
+        assert task.id not in _Path(task.workspace_path).name
+        assert "_" not in _Path(task.workspace_path).name
         assert task.workspace_path != parent.workspace_path
         assert task.branch_name is not None
-        assert task.branch_name.startswith(f"cross-profile-project/{task.id}")
+        # Descriptive shape: project-slug namespace, no task id in the leaf.
+        assert task.branch_name.startswith("cross-profile-project/")
+        assert task.id not in task.branch_name
     assert len({task.workspace_path for task in child_tasks}) == 2
     assert len({task.branch_name for task in child_tasks}) == 2
 
@@ -1404,15 +1421,19 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
     assert grandchild is not None
     assert grandchild.project_id == project_id
     assert grandchild.workspace_kind == "worktree"
-    assert grandchild.workspace_path == str(repo / ".worktrees" / grandchild.id)
+    assert grandchild.workspace_path == str(
+        repo / ".worktrees" / kb._worktree_dir_leaf(
+            grandchild.branch_name or "", grandchild.id
+        )
+    )
+    assert grandchild.id not in _Path(grandchild.workspace_path).name
     assert grandchild.workspace_path not in {
         parent.workspace_path,
         *(task.workspace_path for task in child_tasks),
     }
     assert grandchild.branch_name is not None
-    assert grandchild.branch_name.startswith(
-        f"cross-profile-project/{grandchild.id}"
-    )
+    assert grandchild.branch_name.startswith("cross-profile-project/")
+    assert grandchild.id not in grandchild.branch_name
 
 
 def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
