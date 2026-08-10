@@ -1356,7 +1356,31 @@ def _send_media_via_adapter(
             elif ext in _VIDEO_EXTS:
                 coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
             elif ext in _IMAGE_EXTS:
-                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
+                # Downscale an over-cap image to a preview that fits the target
+                # platform's outbound attachment cap, exactly as every other
+                # send site does. Without this a size-capped platform SILENTLY
+                # DROPS the attachment: the text sends, the platform reports
+                # "Couldn't deliver the image attachment," and the file never
+                # arrives — so a cron job reports work it cannot show. A 4K
+                # render (5504x3072) is routinely 15-20 MB against Discord's
+                # ~10 MB non-Nitro cap, so every such frame was lost here.
+                #
+                # Fail-open: prepare_outbound_image returns the original path on
+                # any error, and we additionally guard the import/call so a
+                # downscale bug can never block a delivery that would otherwise
+                # succeed.
+                try:
+                    from gateway.platforms.base import prepare_outbound_image
+                    _image_path = prepare_outbound_image(
+                        media_path, platform=route_platform
+                    )
+                except Exception:
+                    logger.debug(
+                        "Job '%s': outbound downscale failed for %s; sending original",
+                        job.get("id", "?"), media_path, exc_info=True,
+                    )
+                    _image_path = media_path
+                coro = adapter.send_image_file(chat_id=chat_id, image_path=_image_path, metadata=metadata)
             else:
                 coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
 
