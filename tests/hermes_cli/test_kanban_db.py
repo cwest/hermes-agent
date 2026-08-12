@@ -610,6 +610,179 @@ def test_stale_claim_reclaimed_when_termination_succeeds(
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_wedged_worker_reclaimed_below_old_60m_threshold(
+    kanban_home, monkeypatch,
+):
+    """A live-PID worker that has stopped heartbeating is reclaimed within
+    minutes, not an hour.
+
+    Reproduces the exact observed wedge (t_3085f8da run 3): the process is
+    ALIVE at 0% CPU with NO heartbeat for ~14 minutes and ``claim_expires``
+    lapsed. Under the old 60m ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``
+    the heartbeat was not yet "stale", so the live-PID branch EXTENDED the
+    claim and the lane stayed starved for up to a full hour. Post-fix the
+    threshold is short enough (justified against the #31752 activity bridge,
+    which keeps a genuinely active worker's heartbeat fresh from ordinary API
+    traffic) that 14m of silence is reclaimed.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    # The threshold must be well below the observed 14-minute wedge, and the
+    # 14-minute silence used here must exceed it, so the wedge is caught.
+    assert _kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS < 14 * 60
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+
+        now = int(time.time())
+        # claim_expires lapsed, heartbeat 14m stale — the observed wedge.
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
+            "WHERE id = ?",
+            (now - 60, now - 14 * 60, t),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(
+            _kb, "_terminate_reclaimed_worker",
+            lambda *a, **k: {
+                "termination_attempted": True,
+                "host_local": True,
+                "terminated": True,
+            },
+        )
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (t,),
+            ).fetchall()
+        ]
+        assert "reclaimed" in kinds
+        assert "claim_extended" not in kinds
+
+
+def test_healthy_heartbeating_worker_extended_not_reclaimed(
+    kanban_home, monkeypatch,
+):
+    """Negative control: a healthy, actively-heartbeating worker whose TTL
+    has expired is EXTENDED, not reclaimed.
+
+    Guards the #23025 spawn-then-reclaim regression: a slow model inside one
+    tool-free LLM call still refreshes ``last_heartbeat_at`` via the #31752
+    activity bridge (API-call-start + stream deltas), so a fresh heartbeat
+    with an expired TTL means "healthy but slow", not "wedged". Reclaiming it
+    would loop.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+
+        now = int(time.time())
+        old_expires = now - 60
+        # TTL expired, but heartbeat is fresh (30s ago) — within any sane
+        # threshold, so the worker is healthy and must be extended.
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
+            "WHERE id = ?",
+            (old_expires, now - 30, t),
+        )
+        assert _kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS > 30
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        killed: list[int] = []
+        reclaimed = kb.release_stale_claims(
+            conn, signal_fn=lambda _p, sig: killed.append(sig),
+        )
+        assert reclaimed == 0
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.claim_expires > old_expires
+        assert killed == []  # healthy worker not killed
+
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (t,),
+            ).fetchall()
+        ]
+        assert "claim_extended" in kinds
+        assert "reclaimed" not in kinds
+
+
+def test_dangling_claim_on_nonrunning_card_is_released(
+    kanban_home, monkeypatch,
+):
+    """A claim leaked onto a NON-running lane is released so the next lane
+    can spawn.
+
+    The lane-exit starvation at its source: when the ``github-prs`` webhook
+    MOVEs a card ``running -> review`` + assignee ``lamport`` after the author
+    pushed, the MOVE updates status/assignee but leaves the author's
+    ``claim_lock`` / ``claim_expires`` / ``worker_pid`` on the row. The
+    review-spawn path requires ``claim_lock IS NULL``, so the reviewer never
+    spawns — the lane starves. Every legitimate claim path (``claim_task``,
+    ``claim_review_task``) sets ``status='running'`` in the SAME transaction
+    as ``claim_lock``, so a claim on a card that is NOT ``running`` can only
+    be a leaked claim from a lane exit. ``release_stale_claims`` clears it,
+    even without waiting for the TTL, so the handed-off author no longer
+    gates the reviewer.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        # Author claims + runs, then the card is MOVED to review with the
+        # author's claim state still attached (the move_card defect).
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+        now = int(time.time())
+        conn.execute(
+            # status=review but claim_lock/expires/pid still point at the
+            # departed author. claim_expires is even still in the FUTURE —
+            # this is not a TTL-stale claim, it's a lane-exit leak.
+            "UPDATE tasks SET status = 'review', assignee = 'lamport', "
+            "claim_expires = ? WHERE id = ?",
+            (now + 3600, t),
+        )
+        # PID may still be alive (author process winding down) — irrelevant:
+        # the claim is on the wrong lane and must go regardless.
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+
+        task = kb.get_task(conn, t)
+        # The card stays in review (the lane the webhook moved it to) but the
+        # leaked claim is gone, so the review-spawn path can now claim it.
+        assert task.status == "review"
+        assert task.assignee == "lamport"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+
+        # And it is now visible to the review-spawn path, whose gating
+        # predicate is exactly ``status='review' AND claim_lock IS NULL``
+        # (dispatch_once / has_spawnable_review). Before the fix the dangling
+        # claim made this match zero rows and the reviewer never spawned.
+        spawnable = conn.execute(
+            "SELECT id FROM tasks "
+            "WHERE status = 'review' AND claim_lock IS NULL AND id = ?",
+            (t,),
+        ).fetchone()
+        assert spawnable is not None
+
+
 def test_stale_claim_released_when_worker_not_host_local(
     kanban_home, monkeypatch,
 ):
