@@ -202,7 +202,21 @@ DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 # bridges chunk-level liveness into ``last_heartbeat_at`` via #31752,
 # so any genuinely active worker keeps its heartbeat fresh as a side
 # effect of normal API traffic.
-DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
+#
+# Threshold rationale (5 min, was 60 min): the #31752 bridge refreshes
+# ``last_heartbeat_at`` at the START of every API call and on every
+# stream delta (``AIAgent._touch_activity`` -> ``heartbeat_worker``),
+# rate-limited to once per 60s. The dispatcher tick is also ~60s. So a
+# genuinely active worker — INCLUDING one sitting inside a single long
+# tool-free LLM call, the #23025 case the old 60m slack was protecting —
+# is never more than ~60s stale from ordinary traffic. 5 min is 5x that
+# bridge cadence: comfortable headroom over a healthy worker's worst-case
+# single-gap-plus-jitter, while bounding a wedged worker's hold on its
+# lane to minutes instead of an hour. The healthy-but-slow worker is
+# still EXTENDED (its fresh heartbeat keeps ``heartbeat_stale`` False);
+# only a worker that has emitted NO API traffic for 5 minutes is
+# reclaimed.
+DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 5 * 60
 
 # Grace added to a claim when a reclaim is deferred because the previous
 # host-local worker is still alive after a termination attempt. Releasing the
@@ -4247,6 +4261,58 @@ def release_stale_claims(
     now = int(time.time())
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+
+    # ------------------------------------------------------------------
+    # Lane-exit leaked-claim release (fix the starvation at its source).
+    #
+    # Every legitimate claim path — ``claim_task`` (ready -> running) and
+    # ``claim_review_task`` (review -> running) — sets ``claim_lock`` in the
+    # SAME transaction as ``status = 'running'``. Therefore a card that is
+    # NOT ``running`` yet still carries a ``claim_lock`` can only be a claim
+    # that leaked across a lane transition: e.g. the ``github-prs`` webhook
+    # MOVEs a card ``running -> review`` after the author pushed, updating
+    # status/assignee but leaving the author's claim_lock/expires/worker_pid
+    # on the row. The review-spawn path requires ``claim_lock IS NULL``
+    # (``dispatch_once`` / ``has_spawnable_review``), so that dangling claim
+    # STARVES the next lane — the reviewer never spawns — and neither the
+    # TTL scan below nor ``detect_crashed_workers`` can see it (both scan
+    # ``status = 'running'`` only). Clear it here, in the current lane, with
+    # no TTL wait and no PID check: the claim is illegitimate by
+    # construction the instant the card left ``running``. This restores the
+    # invariant "claim state belongs only to running cards" that the
+    # dashboard status-set path already enforces.
+    leaked = conn.execute(
+        "SELECT id, claim_lock, worker_pid, status "
+        "FROM tasks "
+        "WHERE status != 'running' AND claim_lock IS NOT NULL",
+    ).fetchall()
+    for row in leaked:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL "
+                "WHERE id = ? AND status != 'running' AND claim_lock IS ?",
+                (row["id"], row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                # Raced with a legitimate re-claim (card moved back to
+                # running) between the read and the write — leave it alone.
+                continue
+            _append_event(
+                conn, row["id"], "claim_released_lane_exit",
+                {
+                    "reason": "claim_on_non_running_lane",
+                    "status": row["status"],
+                    "stale_lock": row["claim_lock"],
+                    "worker_pid": (
+                        int(row["worker_pid"])
+                        if row["worker_pid"] is not None else None
+                    ),
+                    "now": now,
+                },
+            )
+            reclaimed += 1
+
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
