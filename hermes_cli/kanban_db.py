@@ -6687,6 +6687,46 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _run_claimed_from_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+) -> bool:
+    """Return True if the given run was claimed FROM the ``review`` lane.
+
+    The durable signal is the ``source_status: "review"`` payload
+    :func:`claim_review_task` writes onto the run's ``claimed`` event; a BUILD
+    run claimed via :func:`claim_task` has no such key. Sibling of
+    :func:`_crashed_run_was_review` (which reads the same signal for crash
+    classification) — kept as a separate small predicate so the completion-path
+    self-handoff check reads by intent. Scoped to the given ``run_id`` so a card
+    built once and later moved to review is classified by its CURRENT run, not
+    its history; falls back to the latest ``claimed`` event when ``run_id`` is
+    unknown.
+    """
+    if run_id is not None:
+        ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'claimed' AND run_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
+        ).fetchone()
+    else:
+        ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    if ev is None or not ev["payload"]:
+        return False
+    try:
+        payload = json.loads(ev["payload"])
+    except (ValueError, TypeError):
+        return False
+    return isinstance(payload, dict) and payload.get("source_status") == "review"
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6966,11 +7006,121 @@ def complete_task(
     # review for re-review.
     if not allow_acceptance_complete and not _declared_no_op:
         _row = conn.execute(
-            "SELECT status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            "SELECT status, workspace_kind, workspace_path, assignee, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if _row is not None and _row["status"] in ("running", "ready"):
             _review_owner = _review_owner_from_owner_map(conn, task_id)
+            # Self-owned-review-lane guard (STRUCTURAL — the durable fix for the
+            # respawn wedge the cohort allowlist below only papered over per
+            # cohort). A card claimed FROM the ``review`` lane keeps its reviewer
+            # as ``assignee`` and records ``source_status: "review"`` on the run's
+            # ``claimed`` event. When THAT reviewer completes the card, the
+            # author-lane redirect used to fire on the mere presence of a
+            # ``review`` owner and MOVE the card BACK into ``review`` with the SAME
+            # assignee — a self-handoff with no next actor. The dispatcher then
+            # re-claimed the ``review`` card and re-spawned the same reviewer,
+            # looping forever (live ``t_09717828``, a WRITING card whose reviewer
+            # ``perkins`` is outside ``_RESEARCH_REVIEWERS`` and so still fell into
+            # the loop the research exemption fixed only for reddy/avram).
+            #
+            # The load-bearing question the redirect never asked: is the worker
+            # completing this card the card's OWN ``review`` owner? When the run
+            # was claimed FROM ``review`` AND the completing assignee IS the
+            # resolved review owner, the review lane is FINISHED, not pending — the
+            # redirect MUST NOT fire. Route to the correct terminal instead of
+            # looping:
+            #   * research cohort -> fall through to the ``-> done`` UPDATE (the
+            #     research cohort never enters the acceptance park either; it
+            #     publishes to the CI-gated KB directly — same terminal the cohort
+            #     exemption already reaches).
+            #   * every other cohort -> the acceptance park (``blocked`` + the
+            #     ``blocked-acceptance`` owner, sticky ``awaiting-casey-signoff``),
+            #     Casey's human sign-off gate. Never ``done`` — ``done`` still
+            #     means Casey merged. (An already-merged PR whose sign-off webhook
+            #     was lost is walked ``blocked -> done`` by
+            #     :func:`reconcile_merged_acceptance` from the park; the accept
+            #     seam is reachable from ``blocked``, not from a self-handoff loop
+            #     in ``review``.)
+            #
+            # This is the structural discriminator the card asked for: it makes the
+            # ``_RESEARCH_REVIEWERS`` exemption redundant for the loop it was
+            # patched to fix, without adding another cohort name to the frozenset.
+            if (
+                _review_owner
+                and (_row["assignee"] or "") == _review_owner
+                and _run_claimed_from_review(conn, task_id, _row["current_run_id"])
+            ):
+                if _review_owner in _RESEARCH_REVIEWERS:
+                    # Research self-owned review completion terminates at ``done``
+                    # (no acceptance park) — fall through to the ``-> done`` UPDATE.
+                    pass
+                else:
+                    _acceptance_owner = _acceptance_owner_from_owner_map(conn, task_id)
+                    _park_reason = _normalize_signoff_reason(
+                        (summary or result or "").strip() or None
+                    )
+                    with write_txn(conn):
+                        if expected_run_id is None:
+                            _cur = conn.execute(
+                                "UPDATE tasks "
+                                "SET status='blocked', assignee=COALESCE(?, assignee), "
+                                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                                "block_kind=NULL, block_recurrences=0 "
+                                "WHERE id=? AND status IN ('running','ready')",
+                                (_acceptance_owner, task_id),
+                            )
+                        else:
+                            _cur = conn.execute(
+                                "UPDATE tasks "
+                                "SET status='blocked', assignee=COALESCE(?, assignee), "
+                                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                                "block_kind=NULL, block_recurrences=0 "
+                                "WHERE id=? AND status IN ('running','ready') "
+                                "AND current_run_id=?",
+                                (_acceptance_owner, task_id, int(expected_run_id)),
+                            )
+                        if _cur.rowcount != 1:
+                            # Card moved between the status read and the write
+                            # (a race with the webhook or a stale expected_run_id).
+                            return False
+                        _prev = _row["status"]
+                        run_id = _end_run(
+                            conn, task_id,
+                            outcome="completed", status="blocked",
+                            summary=summary if summary is not None else result,
+                            metadata=metadata,
+                        )
+                        if run_id is None and (summary or metadata or result):
+                            run_id = _synthesize_ended_run(
+                                conn, task_id,
+                                outcome="completed",
+                                summary=summary if summary is not None else result,
+                                metadata=metadata,
+                            )
+                        _append_event(
+                            conn, task_id, "status_changed",
+                            {
+                                "from": _prev,
+                                "to": "blocked",
+                                "assignee": _acceptance_owner,
+                                "by": "onecard:complete-task-self-review",
+                            },
+                            run_id=run_id,
+                        )
+                        # The sticky ``blocked`` event: this makes the acceptance
+                        # park STICK (a raw status write auto-recovers to ready)
+                        # AND fires the acceptance notification.
+                        _append_event(
+                            conn, task_id, "blocked",
+                            {
+                                "reason": _park_reason,
+                                "by": "onecard:complete-task-self-review",
+                            },
+                            run_id=run_id,
+                        )
+                    return True
             # Research-cohort exemption: a card whose review owner is a research
             # reviewer (:data:`_RESEARCH_REVIEWERS` — reddy/avram, repo
             # ``cwest/knowledge-base``) does NOT enter the review lane. The
