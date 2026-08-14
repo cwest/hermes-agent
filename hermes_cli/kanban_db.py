@@ -6696,13 +6696,15 @@ def _run_claimed_from_review(
 
     The durable signal is the ``source_status: "review"`` payload
     :func:`claim_review_task` writes onto the run's ``claimed`` event; a BUILD
-    run claimed via :func:`claim_task` has no such key. Sibling of
-    :func:`_crashed_run_was_review` (which reads the same signal for crash
-    classification) — kept as a separate small predicate so the completion-path
-    self-handoff check reads by intent. Scoped to the given ``run_id`` so a card
-    built once and later moved to review is classified by its CURRENT run, not
-    its history; falls back to the latest ``claimed`` event when ``run_id`` is
-    unknown.
+    run claimed via :func:`claim_task` has no such key. This is the SINGLE
+    authoritative reader of that signal, shared by both consumers: the
+    completion-path self-handoff guard in :func:`complete_task` and the
+    crash-classification path in :func:`detect_crashed_workers` (which used to
+    carry a byte-identical copy — collapsed here to remove a latent divergence
+    bug, the same consolidation applied to :func:`_review_owner_from_owner_map`).
+    Scoped to the given ``run_id`` so a card built once and later moved to review
+    is classified by its CURRENT run, not its history; falls back to the latest
+    ``claimed`` event when ``run_id`` is unknown.
     """
     if run_id is not None:
         ev = conn.execute(
@@ -10818,44 +10820,15 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
-def _crashed_run_was_review(
-    conn: sqlite3.Connection,
-    task_id: str,
-    current_run_id: Optional[int],
-) -> bool:
-    """Return True if the task's current (crashed) run was a REVIEW run.
-
-    The durable signal is the ``source_status: "review"`` payload that
-    ``claim_review_task`` writes onto the run's ``claimed`` event. A build run
-    claimed via ``claim_task`` writes a ``claimed`` event WITHOUT that key.
-    Reading the existing event payload avoids inventing a new schema column.
-
-    Scoped to the crashed run's ``current_run_id`` so a card that was built
-    once (build ``claimed`` event) and later moved to review (review ``claimed``
-    event) is classified by its CURRENT run, not its history. Falls back to the
-    latest ``claimed`` event for the task when the run id is unknown.
-    """
-    if current_run_id is not None:
-        ev = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'claimed' AND run_id = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id, current_run_id),
-        ).fetchone()
-    else:
-        ev = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'claimed' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-    if ev is None or not ev["payload"]:
-        return False
-    try:
-        payload = json.loads(ev["payload"])
-    except (ValueError, TypeError):
-        return False
-    return isinstance(payload, dict) and payload.get("source_status") == "review"
+# NOTE: crash classification ("was the crashed run a REVIEW run?") reads the same
+# durable signal as the completion-path self-handoff guard — the
+# ``source_status: "review"`` payload on the run's ``claimed`` event. A second,
+# byte-identical reader (``_crashed_run_was_review``) used to live here; it was
+# collapsed into the single authoritative :func:`_run_claimed_from_review` above
+# to remove a latent divergence bug (two readers of one signal that could drift
+# apart — the same consolidation applied to ``_review_owner_from_owner_map``).
+# The crash-classification call site calls :func:`_run_claimed_from_review`
+# directly; the ``was_review_run`` local at that site preserves read-by-intent.
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -11801,7 +11774,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if "current_run_id" in row.keys()
                 else None
             )
-            was_review_run = _crashed_run_was_review(
+            was_review_run = _run_claimed_from_review(
                 conn, row["id"], current_run_id
             )
             restore_status = "review" if was_review_run else "ready"
