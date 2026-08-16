@@ -49,16 +49,82 @@ from agent.model_metadata import (
 logger = logging.getLogger(__name__)
 
 
+# Upper bound on the rendered voice-contract reminder block (wrapper text
+# included). The reminder is dynamic content appended AFTER the cached system
+# prefix, so it bills input tokens on every turn it fires and prompt caching
+# never amortizes it — a bloated reminder is negative leverage (the same
+# placement/composition effect that makes a buried rule worse than none). Keep
+# it a small always-on core, hard-capped like the todo re-injection block
+# (see TodoStore.MAX_TODO_CONTENT_CHARS). "A few hundred characters", per the
+# card's payload guidance.
+MAX_VOICE_CONTRACT_CHARS = 600
+_VOICE_CONTRACT_TRUNCATION_MARKER = "… [truncated]"
+# Persisted (via the api_content sidecar) as ordinary user-message content, so
+# the block self-identifies as a system note to keep the model from treating
+# it as a fresh user instruction. Mirrors build_memory_context_block's shape.
+_VOICE_CONTRACT_HEADER = (
+    "[System note: hold the author's voice contract below. "
+    "This is a persistence reminder, NOT new user input.]"
+)
+
+
+def format_voice_contract_reminder(
+    contract: Optional[str], cap: int = MAX_VOICE_CONTRACT_CHARS
+) -> Optional[str]:
+    """Render the short voice-contract reminder for api_content injection.
+
+    Returns ``None`` for an empty/blank contract (nothing to inject).
+    Otherwise wraps the contract text in a fenced system-note block and
+    hard-caps the *whole rendered block* at ``cap`` chars — an oversized
+    configured contract is truncated (head kept) rather than allowed to
+    inflate every fired turn's prompt, following the ``TodoStore`` bounding
+    precedent.
+    """
+    if not isinstance(contract, str):
+        return None
+    body = contract.strip()
+    if not body:
+        return None
+    block = f"{_VOICE_CONTRACT_HEADER}\n{body}"
+    if len(block) > cap:
+        keep = max(0, cap - len(_VOICE_CONTRACT_TRUNCATION_MARKER))
+        block = block[:keep] + _VOICE_CONTRACT_TRUNCATION_MARKER
+    return block
+
+
+def should_inject_voice_contract(user_turn_count: int, interval: int) -> bool:
+    """Whether the voice-contract reminder fires on this turn.
+
+    Pure cadence predicate so the policy is unit-testable without a live
+    agent. ``interval <= 0`` disables the feature (the default — it changes
+    prompt bytes for every user, so it is opt-in). Otherwise it fires when
+    ``user_turn_count`` is a positive multiple of ``interval`` — i.e. every
+    N turns, never on the first turn (``_user_turn_count`` is 1 on turn one,
+    before any multi-turn decay could have set in) and never on every turn.
+    """
+    if interval <= 0:
+        return False
+    return user_turn_count > 0 and user_turn_count % interval == 0
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
+    voice_contract: str = "",
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
     Sources: memory-manager prefetch + ``pre_llm_call`` plugin context with
-    target="user_message" (the default). Both are appended to the *API copy*
-    of the user message only — the stored content stays clean.
+    target="user_message" (the default) + an optional periodic voice-contract
+    reminder. All are appended to the *API copy* of the user message only —
+    the stored content stays clean.
+
+    ``voice_contract`` is the already-rendered reminder block (produced by
+    ``format_voice_contract_reminder`` and gated by
+    ``should_inject_voice_contract`` in the prologue) or ``""`` when the
+    reminder does not fire this turn. Passing the rendered block here keeps
+    this function a pure string composer with no config/cadence knowledge.
 
     This is the single source of that composition. The prologue stamps the
     result onto the live message as ``api_content`` (persisted alongside the
@@ -79,6 +145,8 @@ def compose_user_api_content(
             injections.append(fenced)
     if plugin_user_context:
         injections.append(plugin_user_context)
+    if voice_contract:
+        injections.append(voice_contract)
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
@@ -1163,8 +1231,28 @@ def build_turn_context(
         and messages[current_turn_user_idx].get("role") == "user"
     ):
         _turn_user_msg = messages[current_turn_user_idx]
+        # Periodic voice-contract reminder (opt-in; default off). Re-asserts a
+        # SHORT, hard-capped voice contract on a turn-count cadence so a long
+        # session's decayed system-prompt voice rule gets a fresh nudge —
+        # riding the api_content sidecar (never the cached system prefix, never
+        # a synthetic user message). Rendered here, gated by the pure cadence
+        # predicate, so the composer stays config-agnostic.
+        _voice_reminder = ""
+        _vc_interval = int(getattr(agent, "_voice_contract_interval", 0) or 0)
+        if should_inject_voice_contract(
+            getattr(agent, "_user_turn_count", 0), _vc_interval
+        ):
+            _voice_reminder = (
+                format_voice_contract_reminder(
+                    getattr(agent, "_voice_contract", "") or ""
+                )
+                or ""
+            )
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _turn_user_msg.get("content", ""),
+            ext_prefetch_cache,
+            plugin_user_context,
+            _voice_reminder,
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content

@@ -1015,6 +1015,28 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Mid-session voice-contract re-injection (opt-in; default off). A
+        # system-prompt voice/style rule is composed once and cached for the
+        # session, so a long conversation's early voice contract decays as
+        # context grows (multi-turn instruction decay). When enabled, a SHORT,
+        # hard-capped reminder is re-asserted on a turn-count cadence by riding
+        # the current user message's api_content sidecar — it never mutates the
+        # cached system prefix and never inserts a synthetic user message, so
+        # prompt caching and role alternation are both preserved. It changes
+        # prompt bytes for every turn it fires, so it is off by default.
+        "voice_contract": {
+            # Cadence in user turns. 0 (default) disables the feature. When
+            # >0, the reminder fires every N user turns (never on turn 1).
+            # ~half a session between fires is a reasonable start given the
+            # observed multi-turn adherence decay.
+            "interval": 0,
+            # The voice contract text re-injected on the cadence. Keep it a
+            # few hundred chars — a small always-on core; a bloated reminder is
+            # negative leverage and is truncated to the hard cap regardless.
+            # Empty = nothing to inject even when interval > 0.
+            "text": "",
+        },
+
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

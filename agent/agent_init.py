@@ -1706,6 +1706,25 @@ def init_agent(
     except Exception:
         pass
 
+    # Voice-contract re-injection (opt-in; default off). A cached system-prompt
+    # voice rule decays over a long session; when configured, a SHORT reminder
+    # is re-asserted on a turn-count cadence via the api_content sidecar (see
+    # agent/turn_context.py: compose_user_api_content / should_inject_voice_contract).
+    # Behavioral config, no env var: agent.voice_contract.{interval,text}.
+    agent._voice_contract_interval = 0
+    agent._voice_contract = ""
+    try:
+        _vc_cfg = _agent_cfg.get("agent", {})
+        if not isinstance(_vc_cfg, dict):
+            _vc_cfg = {}
+        _vc_cfg = _vc_cfg.get("voice_contract", {})
+        if isinstance(_vc_cfg, dict):
+            agent._voice_contract_interval = int(_vc_cfg.get("interval", 0) or 0)
+            agent._voice_contract = str(_vc_cfg.get("text", "") or "")
+    except Exception:
+        pass
+
+
     # Tool-use enforcement config: "auto" (default — matches hardcoded
     # model list), true (always), false (never), or list of substrings.
     _agent_section = _agent_cfg.get("agent", {})
