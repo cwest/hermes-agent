@@ -498,6 +498,78 @@ def test_preflight_still_runs_for_other_session_with_same_db(tmp_path):
     agent._compress_context.assert_called()
 
 
+# ── E2E: mid-session voice-contract re-injection through the real prologue ──
+# These drive the real ``build_turn_context`` (not the pure composer) against
+# the ``_FakeAgent`` harness to prove the harness-level invariants the card
+# requires: system-prompt byte-stability, no synthetic user message, the
+# api_content sidecar equalling the composed bytes, and the configured cadence.
+
+from agent.turn_context import (  # noqa: E402
+    format_voice_contract_reminder,
+    should_inject_voice_contract,
+)
+
+_VOICE = "Terse. Evidence-first. Cut everything not load-bearing."
+
+
+def test_voice_contract_fires_at_cadence_and_stamps_sidecar():
+    agent = _FakeAgent()
+    agent._voice_contract = _VOICE
+    agent._voice_contract_interval = 3
+    # Pre-seed so this turn's increment lands on a multiple of the interval.
+    agent._user_turn_count = 2
+
+    ctx = _build(agent)
+
+    assert agent._user_turn_count == 3
+    user_msg = ctx.messages[ctx.current_turn_user_idx]
+    # (c) the sidecar carries exactly the composed reminder bytes...
+    assert "api_content" in user_msg
+    reminder = format_voice_contract_reminder(_VOICE)
+    assert reminder is not None and reminder in user_msg["api_content"]
+    # ...and the clean stored content stays untouched.
+    assert user_msg["content"] == "hello"
+    # (b) no synthetic user message was inserted — exactly one user turn.
+    assert sum(1 for m in ctx.messages if m.get("role") == "user") == 1
+    # (a) the system prompt is unchanged by the injection.
+    assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_voice_contract_silent_on_non_cadence_turn():
+    agent = _FakeAgent()
+    agent._voice_contract = _VOICE
+    agent._voice_contract_interval = 3
+    # This turn increments 0 -> 1, not a multiple of 3.
+    ctx = _build(agent)
+
+    assert agent._user_turn_count == 1
+    user_msg = ctx.messages[ctx.current_turn_user_idx]
+    # (d) no reminder this turn => no sidecar => message ships clean.
+    assert "api_content" not in user_msg
+    assert user_msg["content"] == "hello"
+
+
+def test_voice_contract_off_by_default_leaves_message_clean():
+    agent = _FakeAgent()
+    # No _voice_contract / _voice_contract_interval attrs at all: the prologue
+    # must default OFF (getattr fallbacks), never touch the message.
+    ctx = _build(agent)
+    user_msg = ctx.messages[ctx.current_turn_user_idx]
+    assert "api_content" not in user_msg
+    assert user_msg["content"] == "hello"
+
+
+def test_voice_contract_disabled_interval_never_fires():
+    agent = _FakeAgent()
+    agent._voice_contract = _VOICE
+    agent._voice_contract_interval = 0  # explicitly disabled
+    agent._user_turn_count = 5  # would be a multiple of many intervals
+    ctx = _build(agent)
+    user_msg = ctx.messages[ctx.current_turn_user_idx]
+    assert "api_content" not in user_msg
+    assert should_inject_voice_contract(agent._user_turn_count, 0) is False
+
+
 def test_expired_cooldown_allows_preflight(tmp_path):
     agent = _make_agent_with_cooldown(
         tmp_path / "state.db",
