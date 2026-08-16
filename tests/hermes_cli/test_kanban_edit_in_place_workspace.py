@@ -255,7 +255,12 @@ def test_dir_non_edit_in_place_repo_root_still_redirects(kanban_home, tmp_path):
         task = kb.get_task(conn, tid)
 
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    # Descriptive leaf (feat(office): ... -> feat/ordinary-repo-still-redirects),
+    # not the bare task id.
+    assert workspace.resolve() == (
+        repo / ".worktrees" / "ordinary-repo-still-redirects"
+    ).resolve()
+    assert tid not in workspace.name
     assert kb._is_linked_worktree_checkout(workspace)
 
 

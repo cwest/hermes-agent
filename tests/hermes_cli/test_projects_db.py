@@ -181,13 +181,61 @@ def test_active_pointer(conn):
     assert pdb.get_active_id(conn) is None
 
 
-def test_branch_name_for_is_deterministic():
+def test_branch_name_for_is_descriptive_kebab_case():
     proj = pdb.Project(id="p_1", slug="web-app", name="Web App", created_at=0)
 
-    assert pdb.branch_name_for(proj, "t_abc") == "web-app/t_abc"
-    assert pdb.branch_name_for(proj, "t_abc", title="Add login!") == "web-app/t_abc-add-login"
+    # No title: fall back to a descriptive-but-unique leaf with no underscore
+    # and no raw task id in the human-facing portion.
+    bare = pdb.branch_name_for(proj, "t_abc")
+    assert bare.split("/", 1)[0] == "web-app"
+    assert "_" not in bare
+    assert "t_abc" not in bare
+
+    # With a title: <project-slug>/<descriptive-title-slug>, no task id.
+    b = pdb.branch_name_for(proj, "t_abc", title="Add login!")
+    assert b == "web-app/add-login"
+    assert "t_abc" not in b
+    assert "_" not in b
     # Stable across calls.
-    assert pdb.branch_name_for(proj, "t_abc") == pdb.branch_name_for(proj, "t_abc")
+    assert pdb.branch_name_for(proj, "t_abc", title="Add login!") == b
+
+
+def test_branch_name_for_strips_conventional_type_into_leaf():
+    proj = pdb.Project(id="p_1", slug="web-app", name="Web App", created_at=0)
+    b = pdb.branch_name_for(proj, "t_abc", title="fix: correct the widget")
+    # The project slug is the namespace; the Conventional type is folded into
+    # the descriptive leaf rather than nesting a second slash.
+    assert b == "web-app/correct-the-widget"
+    assert b.count("/") == 1
+
+
+def test_branch_name_for_stays_under_dns_label_cap():
+    import re
+
+    proj = pdb.Project(id="p_1", slug="web-app", name="Web App", created_at=0)
+    title = (
+        "feat: an extraordinarily long and rambling feature title that would "
+        "certainly blow past the sixty three character single label limit"
+    )
+    b = pdb.branch_name_for(proj, "t_abc", title=title)
+    leaf = b.rsplit("/", 1)[-1]
+    assert len(leaf) <= 63
+    assert re.match(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", leaf)
+    # Word-boundary: no truncated fragment of a title word.
+    title_words = set(re.sub(r"[^a-z0-9]+", " ", title.lower()).split())
+    for token in leaf.split("-"):
+        assert token in title_words, f"mid-word fragment: {token!r}"
+
+
+def test_branch_name_for_empty_title_slug_falls_back():
+    import re
+
+    proj = pdb.Project(id="p_1", slug="web-app", name="Web App", created_at=0)
+    b = pdb.branch_name_for(proj, "t_9999", title="!!! ...")
+    leaf = b.rsplit("/", 1)[-1]
+    assert leaf, "empty leaf is not a routable label"
+    assert "_" not in b
+    assert re.match(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", leaf)
 
 
 def test_per_profile_isolation(tmp_path):

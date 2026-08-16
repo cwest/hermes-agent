@@ -130,7 +130,11 @@ def test_worker_run_leaves_dir_repo_root_on_main_clean(
     # The workspace the worker was handed is NOT the shared clone.
     _, handed_ws = next(s for s in spawned if s[0] == tid)
     assert Path(handed_ws).resolve() != deploy.resolve()
-    assert Path(handed_ws).resolve() == (deploy / ".worktrees" / tid).resolve()
+    # It is a per-task worktree named after the card's DESCRIPTIVE branch leaf
+    # (feat(office): ... -> feat/a-card-...), never the opaque task id.
+    assert Path(handed_ws).parent.resolve() == (deploy / ".worktrees").resolve()
+    assert Path(handed_ws).name == "a-card-that-used-to-corrupt-the-deploy-clone"
+    assert tid not in Path(handed_ws).name
 
     # The deploy clone is STILL on main with a clean tree — the whole point.
     assert _current_branch(deploy) == "main"
@@ -189,7 +193,10 @@ def test_dir_repo_root_anchor_survives_dispatch(kanban_home, tmp_path, monkeypat
 
     # The worker was handed the per-task worktree, not the shared clone.
     _, handed_ws = next(s for s in spawned if s[0] == tid)
-    assert Path(handed_ws).resolve() == (deploy / ".worktrees" / tid).resolve()
+    assert Path(handed_ws).resolve() == (
+        deploy / ".worktrees" / "anchor-must-survive-dispatch"
+    ).resolve()
+    assert tid not in Path(handed_ws).name
 
     # The declared anchor on the row is UNCHANGED — still the repo root.
     assert task_after is not None
@@ -225,7 +232,9 @@ def test_dir_repo_root_redispatch_resolves_same_worktree_no_nesting(
         )
         # Run 1: a real dispatcher tick (claim → resolve → set_workspace_path → spawn).
         _dispatch_ready_card(conn, tid, _spawn_recording(spawned))
-        expected = (deploy / ".worktrees" / tid).resolve()
+        # Descriptive leaf from the title (feat(office): ... -> feat/re-dispatch-...).
+        leaf = "re-dispatch-must-not-nest"
+        expected = (deploy / ".worktrees" / leaf).resolve()
         run1_ws = Path(next(ws for t, ws in spawned if t == tid)).resolve()
         # Run 2: the next tick reads the row as persisted by run 1 and re-resolves.
         task_reloaded = kb.get_task(conn, tid)
@@ -235,9 +244,10 @@ def test_dir_repo_root_redispatch_resolves_same_worktree_no_nesting(
     # Both resolutions land on the single top-level per-task worktree.
     assert run1_ws == expected
     assert run2_ws == expected
+    assert tid not in run2_ws.name
     # No nested worktree path is ever produced.
-    assert f".worktrees/{tid}/.worktrees/{tid}" not in str(run2_ws)
-    assert not (deploy / ".worktrees" / tid / ".worktrees" / tid).exists()
+    assert f".worktrees/{leaf}/.worktrees/{leaf}" not in str(run2_ws)
+    assert not (deploy / ".worktrees" / leaf / ".worktrees" / leaf).exists()
 
 
 def test_worktree_kind_write_back_persists_resolved_path(
@@ -268,8 +278,11 @@ def test_worktree_kind_write_back_persists_resolved_path(
         task_after = kb.get_task(conn, tid)
 
     _, handed_ws = next(s for s in spawned if s[0] == tid)
-    expected = (deploy / ".worktrees" / tid).resolve()
+    # Descriptive leaf ("worktree card: ..." has no mapped Conventional type ->
+    # topic/worktree-card-write-back-unchanged), never the bare task id.
+    expected = (deploy / ".worktrees" / "worktree-card-write-back-unchanged").resolve()
     assert Path(handed_ws).resolve() == expected
+    assert tid not in Path(handed_ws).name
     # worktree-kind persists the resolved worktree path back to the row.
     assert task_after is not None
     assert task_after.workspace_path is not None
