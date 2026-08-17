@@ -3496,6 +3496,80 @@ def resolve_review_owner(
     return owner or default
 
 
+# Keys the resolved-origin fragment contributes to the ``created`` event payload.
+# Kept as an explicit tuple so the audit shape is discoverable and stable.
+_CREATED_ORIGIN_KEYS = (
+    "origin_platform",
+    "origin_chat_id",
+    "origin_thread_id",
+    "origin_session_id",
+    "origin_source",
+    "origin_pid",
+)
+
+
+def _resolve_created_origin() -> dict:
+    """Resolve the card origin to RECORD in the ``created`` event payload.
+
+    A card's origin — the concrete delivery surface a transition wake routes to —
+    is stamped onto the mutable ``kanban_notify_subs`` row by the tool layer
+    (``tools/kanban_tools._maybe_auto_subscribe``). That mutable stamp is not an
+    audit trail: once overwritten, which caller filed the card and what origin it
+    carried at creation is unrecoverable. This snapshots the SAME resolution into
+    the immutable ``created`` event so the event history alone is sufficient to
+    reconstruct the filed origin.
+
+    The returned fragment always carries every :data:`_CREATED_ORIGIN_KEYS`:
+
+    - ``origin_source`` — HOW the origin was resolved:
+        - ``"inherited"``     an origin already bound on the ``HERMES_KANBAN_ORIGIN``
+                              channel (ContextVar or env mirror) — the spawn-boundary
+                              case where a detached worker/subagent carries the human
+                              origin it inherited.
+        - ``"live_session"``  no inherited origin, but a live gateway session
+                              (``HERMES_SESSION_PLATFORM`` + ``_CHAT_ID``) — the root
+                              capture at the top of a human-initiated workstream.
+        - ``"none"``          neither — a detached CLI/cron/test context with no
+                              routable surface. The origin_* fields are ``None``.
+    - ``origin_platform / origin_chat_id / origin_thread_id / origin_session_id``
+      — the resolved surface (``None`` when ``origin_source == "none"``).
+    - ``origin_pid`` — the pid of the process that filed the card. ALWAYS recorded
+      (the creating process is always knowable), so a mis-stamp post-mortem can
+      attribute the filing even when there was no routable origin.
+
+    Resolution mirrors ``gateway.session_context.capture_kanban_origin_from_session``
+    exactly (inherit beats live capture), but reports the SOURCE the folded helper
+    discards. ``gateway.session_context`` is a higher layer, so the import is lazy
+    and guarded: a context that cannot import it (or that raises) degrades to a
+    ``"none"`` origin with the pid still recorded — an absent origin is a
+    recoverable detached context, never a wrong one.
+    """
+    fragment: dict = {k: None for k in _CREATED_ORIGIN_KEYS}
+    fragment["origin_source"] = "none"
+    fragment["origin_pid"] = os.getpid()
+    try:
+        import gateway.session_context as _sc
+
+        inherited = _sc.get_kanban_origin()
+        if inherited is not None:
+            origin = inherited
+            source = "inherited"
+        else:
+            origin = _sc.capture_kanban_origin_from_session()
+            source = "live_session" if origin is not None else "none"
+    except Exception:
+        return fragment
+
+    if origin is None:
+        return fragment
+    fragment["origin_source"] = source
+    fragment["origin_platform"] = origin.get("platform")
+    fragment["origin_chat_id"] = origin.get("chat_id")
+    fragment["origin_thread_id"] = origin.get("thread_id")
+    fragment["origin_session_id"] = origin.get("session_id")
+    return fragment
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3796,6 +3870,12 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Resolve the card origin ONCE, before the id-collision retry loop, so an
+    # id retry cannot re-read a context that shifted mid-call. This snapshots the
+    # resolved delivery surface + its resolution source + the creating pid into
+    # the immutable ``created`` event payload below.
+    created_origin = _resolve_created_origin()
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -3920,6 +4000,13 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        # Resolved card origin (platform/chat/thread/session) + how
+                        # it was resolved (inherited vs live-session capture) + the
+                        # creating pid. Recording it here makes the immutable event
+                        # history sufficient to reconstruct the filed origin without
+                        # consulting the mutable tasks / notify-sub columns — the
+                        # audit trail a mis-stamped-origin post-mortem needs.
+                        **created_origin,
                     },
                 )
 
