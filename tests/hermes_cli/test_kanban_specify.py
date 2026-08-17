@@ -331,4 +331,6 @@ def test_cli_specify_author_passed_through(kanban_home, capsys):
     assert rc == 0
     with kb.connect() as conn:
         comments = kb.list_comments(conn, tid)
+    # Exclude the create_task owner-map stamp (author 'kanban', t_0c8744a1).
+    comments = [c for c in comments if c.author != "kanban"]
     assert comments and comments[0].author == "custom-agent"

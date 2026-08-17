@@ -1238,6 +1238,7 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     board = args.get("board")
+    kind = args.get("kind")
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1279,6 +1280,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                kind=kind,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1375,7 +1377,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                     conn, task_id=task_id,
                     platform=platform, chat_id=chat_id,
                     thread_id=thread_id, user_id=user_id,
-                    notifier_profile=os.environ.get("HERMES_PROFILE"),
+                    notifier_profile=_kb.notifier_delivery_profile(),
                 )
                 return True
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
@@ -1434,25 +1436,27 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                     conn, task_id=task_id,
                     platform=platform, chat_id=chat_id,
                     thread_id=thread_id, user_id=user_id,
-                    notifier_profile=os.environ.get("HERMES_PROFILE"),
+                    notifier_profile=_kb.notifier_delivery_profile(),
                 )
                 return True
             platform = "tui"
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
-        )
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
+        # A notify sub is delivered ONLY by the notifier whose profile matches the
+        # sub's notifier_profile. A WORKER-created sub previously stamped the
+        # WORKER's own profile (HERMES_PROFILE / HERMES_SESSION_PROFILE), which the
+        # shared gateway notifier silently dropped (card t_0c8744a1, constraint 5 —
+        # the same root as the un-stamped owner map). Always stamp the DELIVERING
+        # profile so the sub is actually deliverable.
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
             thread_id=thread_id, user_id=user_id,
-            notifier_profile=notifier_profile,
+            notifier_profile=_kb.notifier_delivery_profile(),
         )
         return True
     except Exception as _exc:
@@ -2013,6 +2017,18 @@ KANBAN_CREATE_SCHEMA = {
             "title": {
                 "type": "string",
                 "description": "Short task title (required).",
+            },
+            "kind": {
+                "type": "string",
+                "enum": ["code", "research", "writing"],
+                "description": (
+                    "Card kind — stamps a kind-correct owner map so the card "
+                    "routes to the right reviewer lane (code→code reviewer, "
+                    "research→research reviewer, writing→editor). Omit only for a "
+                    "generic bookkeeping card; an omitted kind defaults to 'code' "
+                    "and is recorded as defaulted, so a mis-route is auditable "
+                    "rather than silent."
+                ),
             },
             "assignee": {
                 "type": "string",

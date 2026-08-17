@@ -868,7 +868,8 @@ def _(home, kb):
         tid = kb.create_task(conn, title="chatty", assignee="w")
         for i in range(1000):
             kb.add_comment(conn, tid, author=f"user{i % 5}", body=f"comment number {i}")
-        comments = kb.list_comments(conn, tid)
+        # Exclude the create_task owner-map stamp (author 'kanban', t_0c8744a1).
+        comments = [c for c in kb.list_comments(conn, tid) if c.author != "kanban"]
         assert len(comments) == 1000
         t0 = time.monotonic()
         ctx = kb.build_worker_context(conn, tid)

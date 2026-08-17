@@ -351,6 +351,206 @@ _SUBMIT_AUDIT_RE = re.compile(r"^\[audit\][^\n]*\bstage=submit\b", re.MULTILINE)
 # body is the same ``{lane: owner, …}`` payload, so the pair-splitting is shared.
 _PROSE_OWNER_MAP_RE = re.compile(r"[Rr]outing\s*\(owner map\)\s*:\s*\{([^}]*)\}")
 
+# Marks the chokepoint stamp written for a card whose kind was DEFAULTED (no
+# explicit kind passed to ``create_task``) — see ``_format_submit_owner_map_comment``.
+# The owner-map guarantee (card t_0c8744a1) stamps a map on EVERY card so routing
+# always resolves, but a defaulted-kind stamp is the AUTOMATIC fallback for a
+# generic bookkeeping card, NOT an intentional "this is a gated review work-item"
+# declaration. The strict owner-map reader prefers an INTENTIONAL submit stamp
+# over this one, and review-eligibility ignores it (a plain create_task card
+# still completes to ``done``).
+_DEFAULTED_KIND_MARKER_RE = re.compile(r"\bkind_source=defaulted\b")
+
+# ---------------------------------------------------------------------------
+# Owner-map TEMPLATES — the single source of truth (card t_0c8744a1).
+# ---------------------------------------------------------------------------
+# The per-kind ``state_owners`` routing table used to live ONLY skill-side in
+# ``onecard_common`` (``cwest/hermes-config``), so a card minted via a bare
+# ``create_task`` (bypassing ``submit_card``) carried no map at all and
+# ``resolve_card_kind`` fell back to ``code`` silently — a research card
+# mis-routed to the code reviewer, a code card was "correct by coincidence".
+# Moving the table here (the chokepoint every filing path funnels through) makes
+# the map a birth guarantee, not an optional afterthought, and gives the readers
+# above ONE table to reverse-map against. ``onecard_common`` imports these from
+# ``kanban_db`` after this ships (edit-in-place, not a PR).
+#
+# The map's kind SIGNATURE is its review-lane owner — unique per kind and stable
+# across the writing ready-author split (lawrence/baldwin/tamayo all review to
+# perkins), which is why ``resolve_card_kind`` reverse-maps on ``review``.
+_OWNER_MAPS: dict[str, dict[str, str]] = {
+    "code": {"ready": "easley", "review": "lamport", "blocked-acceptance": "casey"},
+    "research": {"ready": "reddy", "review": "avram"},
+    "writing": {
+        "ready": "lawrence",
+        "review": "perkins",
+        "blocked-acceptance": "casey",
+    },
+}
+
+# Alternate ready-lane authors a kind ACCEPTS beyond its canonical default. The
+# ``writing`` kind splits its ready lane by piece: lawrence (short-form, the
+# default), baldwin (long-form), tamayo (illustration) — all sharing the SAME
+# review (perkins) + acceptance (casey) lanes, so this is a ready-lane DRAFTER
+# choice, not a distinct kind. Other kinds have a fixed ready lane, so an
+# override on them is a caller error.
+_ALT_READY_AUTHORS: dict[str, tuple[str, ...]] = {
+    "writing": ("baldwin", "tamayo"),
+}
+
+# The ``team`` that owns a freshly-created card's (ready) lane for each kind.
+_KIND_TEAMS: dict[str, str] = {
+    "code": "engineering",
+    "research": "research",
+    "writing": "writing",
+}
+
+#: The kind a card defaults to when ``create_task`` is called without an
+#: explicit ``kind``. ``code`` is the fail-safe kind (its reviewable set is the
+#: widest, so a mis-derivation never SKIPS a review that should run). The
+#: default is always RECORDED (``kind_source=defaulted`` in the submit audit
+#: comment) so the fallback is visible rather than silent (card t_0c8744a1).
+DEFAULT_CARD_KIND = "code"
+
+
+def _accepted_ready_authors(kind: str) -> tuple[str, ...]:
+    """Every author accepted for ``kind``'s ready lane (canonical default + alts).
+
+    Raises ``ValueError`` for an unknown kind.
+    """
+    if kind not in _OWNER_MAPS:
+        raise ValueError(
+            f"kind: unknown card kind {kind!r} (expected one of {sorted(_OWNER_MAPS)})"
+        )
+    return (_OWNER_MAPS[kind]["ready"], *_ALT_READY_AUTHORS.get(kind, ()))
+
+
+def materialize_owner_map(kind: str, ready_author: Optional[str] = None) -> dict[str, str]:
+    """Return the per-lane ``state_owners`` map for a card ``kind``.
+
+    A fresh copy each call so callers can mutate without corrupting the template.
+    Raises ``ValueError`` for an unknown kind.
+
+    ``ready_author`` overrides the READY-lane owner (the writing long-form /
+    short-form / illustration split). It must be one of the kind's accepted
+    ready authors; a kind with no alternate author (code / research) rejects any
+    non-default override. ``None`` keeps the canonical ready owner.
+    """
+    if kind not in _OWNER_MAPS:
+        raise ValueError(
+            f"kind: unknown card kind {kind!r} (expected one of {sorted(_OWNER_MAPS)})"
+        )
+    out = dict(_OWNER_MAPS[kind])
+    if ready_author is not None:
+        accepted = _accepted_ready_authors(kind)
+        if ready_author not in accepted:
+            raise ValueError(
+                f"ready author {ready_author!r} is not an accepted ready-lane "
+                f"author for kind {kind!r} (expected one of {sorted(accepted)})"
+            )
+        out["ready"] = ready_author
+    return out
+
+
+def default_assignee(kind: str) -> str:
+    """The ready-lane owner for ``kind`` — the assignee of a dispatchable card."""
+    return materialize_owner_map(kind)["ready"]
+
+
+def default_team(kind: str) -> str:
+    """The ``team`` owning a freshly-created card's (ready) lane for ``kind``."""
+    if kind not in _KIND_TEAMS:
+        raise ValueError(
+            f"kind: unknown card kind {kind!r} (expected one of {sorted(_KIND_TEAMS)})"
+        )
+    return _KIND_TEAMS[kind]
+
+
+def format_owner_map(owner_map: dict[str, str]) -> str:
+    """Render an owner map to the canonical UNQUOTED ``state_owners={…}`` form.
+
+    The chokepoint emits this by construction (no caller-supplied string), so the
+    repr-vs-bare formatting slip that once wedged routing (a Python-repr writer
+    emitting ``{'ready': 'reddy'}``) can no longer be introduced at write time.
+    Lanes are rendered in the map's own insertion order.
+    """
+    inner = ", ".join(f"{lane}: {owner}" for lane, owner in owner_map.items())
+    return "state_owners={" + inner + "}"
+
+
+def parse_owner_map_from_notes(notes: Optional[str]) -> dict[str, str]:
+    """Parse the ``state_owners={lane: owner, …}`` fragment from a note / comment.
+
+    Returns the map as a dict, or an empty dict when no fragment is present.
+    Quotes around lane keys / owner values are stripped (repr-tolerant), sharing
+    the exact splitting :func:`_lane_owner_from_map_body` uses.
+    """
+    if not notes:
+        return {}
+    m = _OWNER_MAP_RE.search(notes)
+    if not m:
+        return {}
+    out: dict[str, str] = {}
+    for pair in m.group(1).split(","):
+        if ":" not in pair:
+            continue
+        lane, owner = pair.split(":", 1)
+        lane = lane.strip().strip("'\"")
+        owner = owner.strip().strip("'\"")
+        if lane and owner:
+            out[lane] = owner
+    return out
+
+
+def _kind_signature(owner_map: dict[str, str]) -> str:
+    """A kind's stable signature: its REVIEW-lane owner (unique per kind)."""
+    return owner_map.get("review", "")
+
+
+def _format_submit_owner_map_comment(
+    owner_map: dict[str, str], *, kind: str, kind_source: str, actor: str
+) -> str:
+    """Render the submit-stage §9.1 audit comment that stamps the owner map.
+
+    Shape (matches the ``[audit] … stage=submit …`` form every owner-map reader
+    keys on — ``_SUBMIT_AUDIT_RE`` + ``_OWNER_MAP_RE``)::
+
+        [audit] actor=kanban stage=submit ts=2026-…Z
+        notes: state_owners={ready: …, review: …, …} kind=code kind_source=defaulted
+
+    ``kind_source`` is ``explicit`` when the caller passed a kind and
+    ``defaulted`` when it was defaulted to ``code`` — so the previously-silent
+    fallback is auditable rather than invisible.
+    """
+    from datetime import datetime, timezone
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    header = f"[audit] actor={actor} stage=submit ts={ts}"
+    notes = f"notes: {format_owner_map(owner_map)} kind={kind} kind_source={kind_source}"
+    return f"{header}\n{notes}"
+
+
+def resolve_card_kind(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return a card's kind (``code`` / ``research`` / ``writing``).
+
+    Reverse-maps the card's stamped ``state_owners`` map (read from any comment
+    carrying a parseable fragment, preferring the earliest filing-time stamp) to
+    the kind whose template matches on the REVIEW-lane owner. Falls back to
+    ``code`` for a legacy / un-stamped card — but after card t_0c8744a1 every
+    card minted through ``create_task`` carries a real stamped map, so a
+    post-change ``code`` resolution is provably a stamped code card, never the
+    silent fallback.
+    """
+    reverse = {_kind_signature(m): k for k, m in _OWNER_MAPS.items()}
+    for c in list_comments(conn, task_id):
+        owner_map = parse_owner_map_from_notes(c.body)
+        if not owner_map:
+            continue
+        kind = reverse.get(_kind_signature(owner_map))
+        if kind:
+            return kind
+    return DEFAULT_CARD_KIND
+
+
 # Matches a GitHub pull-request URL and captures owner/repo/number so two
 # spellings of the same PR (trailing path, query string, or surrounding prose)
 # collapse to one canonical identity. The host is matched case-insensitively;
@@ -3291,6 +3491,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    kind: Optional[str] = None,
+    ready_author: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3330,6 +3532,19 @@ def create_task(
     provider_override = (provider_override or "").strip() or None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+
+    # Owner-map guarantee (card t_0c8744a1): every card minted here carries a
+    # kind-correct ``state_owners`` map, so no caller — worker, script, CLI, or
+    # future code — can produce a card that is structurally un-routable. Posture
+    # (b): ``kind`` is optional, but a map is ALWAYS written; an omitted kind
+    # defaults to ``code`` EXPLICITLY and the default is RECORDED
+    # (``kind_source=defaulted``), so the previously-silent fallback becomes
+    # visible in the audit trail. ``materialize_owner_map`` raises on an unknown
+    # kind, so a bad kind hard-fails before any DB write.
+    kind_source = "explicit" if kind else "defaulted"
+    resolved_kind = kind or DEFAULT_CARD_KIND
+    owner_map = materialize_owner_map(resolved_kind, ready_author=ready_author)
+
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3663,6 +3878,29 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                     },
+                )
+
+                # Owner-map guarantee (card t_0c8744a1): stamp the kind-correct
+                # ``state_owners`` map as a submit-stage §9.1 audit comment INSIDE
+                # this same transaction, so a card can never exist without its map
+                # (atomic with the row + created event). Written directly rather
+                # than via ``add_comment`` because that opens its own write_txn and
+                # we are already inside one; the INSERT + ``commented`` event
+                # mirror ``add_comment`` exactly. ``actor=kanban`` marks the
+                # chokepoint as the author so the trail attributes the stamp to a
+                # distinct, real identity.
+                stamp_body = _format_submit_owner_map_comment(
+                    owner_map, kind=resolved_kind, kind_source=kind_source,
+                    actor="kanban",
+                )
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (task_id, "kanban", stamp_body, now),
+                )
+                _append_event(
+                    conn, task_id, "commented",
+                    {"author": "kanban", "len": len(stamp_body)},
                 )
             return task_id
         except sqlite3.IntegrityError:
@@ -4037,7 +4275,19 @@ def _owner_from_owner_map(
     owner when stamped in either form, else ``None`` so the caller can fall back.
     """
     # 1) Strict ``state_owners={…}`` form — authoritative in the submit-stage
-    #    audit comment only.
+    #    audit comment only. Owner-map guarantee interaction (card t_0c8744a1):
+    #    every card now carries a chokepoint-written submit stamp, and a card that
+    #    ALSO goes through ``submit_card`` (or is filed with an explicit ``kind``)
+    #    carries an INTENTIONAL stamp too. An intentional stamp SUPERSEDES the
+    #    chokepoint's DEFAULTED-kind stamp entirely — the defaulted stamp is only
+    #    the fallback for a card that never declared its kind. So: if ANY
+    #    intentional submit stamp carries a parseable map, it is authoritative
+    #    (return its owner for this lane, or None when it omits the lane — never
+    #    leak through to the defaulted stamp, which would resurrect a reviewer the
+    #    intentional map deliberately dropped). Only when NO intentional stamp
+    #    exists do we fall back to the defaulted chokepoint stamp.
+    _defaulted_owner: Optional[str] = None
+    _saw_intentional = False
     for c in list_comments(conn, task_id):
         body = c.body or ""
         if not _SUBMIT_AUDIT_RE.search(body):
@@ -4045,19 +4295,37 @@ def _owner_from_owner_map(
         m = _OWNER_MAP_RE.search(body)
         if not m:
             continue
+        if _DEFAULTED_KIND_MARKER_RE.search(body):
+            # Remember the chokepoint default but keep scanning for an
+            # intentional stamp that should override it.
+            if _defaulted_owner is None:
+                _defaulted_owner = _lane_owner_from_map_body(m.group(1), lane)
+            continue
+        # An intentional submit stamp with a parseable map is authoritative.
+        _saw_intentional = True
         owner = _lane_owner_from_map_body(m.group(1), lane)
         if owner:
             return owner
+    if _saw_intentional:
+        # An intentional strict map exists but does not name this lane — do NOT
+        # fall back to the defaulted stamp (that would resurrect a lane the
+        # intentional map deliberately dropped) or to the prose form; the strict
+        # intentional map is authoritative.
+        return None
     # 2) Prose ``Routing (owner map): {…}`` form — read from the card body first
     #    (the canonical placement for a bare-create_task inline routing line),
     #    then any comment. Preferring the body keeps a card whose body declares
-    #    the map authoritative over an incidental later echo.
+    #    the map authoritative over an incidental later echo. This is also an
+    #    INTENTIONAL form, so it takes precedence over the defaulted chokepoint
+    #    stamp (checked last, below).
     row = conn.execute(
         "SELECT body FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
+    _saw_prose = False
     if row is not None and row["body"]:
         pm = _PROSE_OWNER_MAP_RE.search(row["body"])
         if pm:
+            _saw_prose = True
             owner = _lane_owner_from_map_body(pm.group(1), lane)
             if owner:
                 return owner
@@ -4065,9 +4333,22 @@ def _owner_from_owner_map(
         pm = _PROSE_OWNER_MAP_RE.search(c.body or "")
         if not pm:
             continue
+        _saw_prose = True
         owner = _lane_owner_from_map_body(pm.group(1), lane)
         if owner:
             return owner
+    if _saw_prose:
+        # An intentional prose map exists but does not name this lane — do NOT
+        # fall back to the defaulted chokepoint stamp (that would resurrect a
+        # reviewer the prose map deliberately omitted, letting a review-eligible
+        # card self-complete past a reviewer). The prose map is authoritative.
+        return None
+    # 3) Defaulted chokepoint stamp — the lowest-precedence fallback (card
+    #    t_0c8744a1). Only reached when the card has NO intentional strict map and
+    #    NO prose map: a plain ``create_task`` card whose only routing signal is
+    #    the automatic defaulted-``code`` stamp.
+    if _defaulted_owner is not None:
+        return _defaulted_owner
     return None
 
 
@@ -4916,7 +5197,11 @@ def auto_route_review_bounce(
         # sat blocked forever because the author never resolved). Fall back to
         # event history for legacy / un-stamped cards.
         author = (
-            _ready_owner_from_owner_map(conn, task_id)
+            (
+                _ready_owner_from_owner_map(conn, task_id)
+                if _card_declares_intentional_owner_map(conn, task_id)
+                else None
+            )
             or _resolve_review_author(conn, task_id, reviewer=row["assignee"])
         )
         if not author or author == row["assignee"]:
@@ -5121,7 +5406,14 @@ def auto_promote_no_pr_review(
         # profile name and NEVER infer from event history (the failure
         # auto_route_review_bounce already fixed). No resolvable reviewer → leave
         # the card for a human. A reviewer that already equals the assignee is a
-        # no-op (nothing to move).
+        # no-op (nothing to move). The reviewer is honored only from an INTENTIONAL
+        # owner map — a submit-gated / explicit-kind / prose map — never from the
+        # chokepoint's DEFAULTED-kind stamp that every card now carries
+        # (t_0c8744a1); a plain create_task card is not an intentional review
+        # handoff, so it stays blocked for a human exactly as an un-stamped card
+        # did before.
+        if not _card_declares_intentional_owner_map(conn, task_id):
+            continue
         reviewer = _review_owner_from_owner_map(conn, task_id)
         if not reviewer or reviewer == row["assignee"]:
             continue
@@ -6697,6 +6989,47 @@ def _card_declares_owner_map(conn: sqlite3.Connection, task_id: str) -> bool:
     return False
 
 
+def _card_declares_intentional_owner_map(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """Return True when a card INTENTIONALLY declares a review-lane owner map.
+
+    Distinct from :func:`_card_declares_owner_map`, which is True for the
+    chokepoint's automatic map too. A map is INTENTIONAL when it is:
+
+      * a human-prose ``Routing (owner map): {…}`` line (edit-in-place / gated
+        filing recipe), OR
+      * a strict submit-stage ``state_owners={…}`` audit comment that is NOT the
+        chokepoint's DEFAULTED-kind stamp (``submit_card`` writes no
+        ``kind_source`` field; ``create_task(kind=<explicit>)`` writes
+        ``kind_source=explicit``).
+
+    The chokepoint's ``kind_source=defaulted`` stamp is excluded so a plain
+    ``create_task`` card (a swarm/decompose child, a bookkeeping tick) is not
+    turned into a review-eligible work-item merely because every card now carries
+    a routing map. This preserves the ``t_baaa247f`` fix (a real gated card must
+    not self-complete) while keeping generic cards review-EXEMPT.
+    """
+    row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is not None and row["body"] and (
+        _OWNER_MAP_RE.search(row["body"]) or _PROSE_OWNER_MAP_RE.search(row["body"])
+    ):
+        return True
+    for c in list_comments(conn, task_id):
+        body = c.body or ""
+        if _PROSE_OWNER_MAP_RE.search(body):
+            return True
+        if (
+            _SUBMIT_AUDIT_RE.search(body)
+            and _OWNER_MAP_RE.search(body)
+            and not _DEFAULTED_KIND_MARKER_RE.search(body)
+        ):
+            return True
+    return False
+
+
 def _card_is_review_eligible(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when a card is subject to the author→review lane, not exempt.
 
@@ -6705,9 +7038,13 @@ def _card_is_review_eligible(conn: sqlite3.Connection, task_id: str) -> bool:
     reviewer, never straight to ``done``) when it shows ANY of the concrete,
     core-visible signals that it is a real pipeline work-item:
 
-      * it declares an owner/routing map (:func:`_card_declares_owner_map`) — the
-        card was filed as a gated work-item with a review lane (strict
-        ``state_owners={…}`` or prose ``Routing (owner map): {…}``); OR
+      * it declares an INTENTIONAL owner/routing map
+        (:func:`_card_declares_intentional_owner_map`) — a submit-gated card, a
+        card filed with an explicit ``kind``, or a prose ``Routing (owner map):
+        {…}`` line. The chokepoint's DEFAULTED-kind stamp (every plain
+        ``create_task`` card now carries a routing map so routing always
+        resolves — card t_0c8744a1) is deliberately NOT a review signal, so a
+        generic bookkeeping card / swarm child still completes to ``done``; OR
       * it builds in an isolated git worktree cut for a branch/PR
         (:func:`_card_requires_pr`); OR
       * it already owns an open PR artifact (:func:`_card_has_pr_artifact`).
@@ -6721,7 +7058,7 @@ def _card_is_review_eligible(conn: sqlite3.Connection, task_id: str) -> bool:
     edit-in-place card that DID declare a review lane — the ``t_baaa247f``
     false-``done``).
     """
-    if _card_declares_owner_map(conn, task_id):
+    if _card_declares_intentional_owner_map(conn, task_id):
         return True
     ws = conn.execute(
         "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?", (task_id,)
@@ -7079,7 +7416,22 @@ def complete_task(
             (task_id,),
         ).fetchone()
         if _row is not None and _row["status"] in ("running", "ready"):
-            _review_owner = _review_owner_from_owner_map(conn, task_id)
+            # Owner-map guarantee interaction (card t_0c8744a1): EVERY card now
+            # carries a stamped owner map so routing always resolves, but the
+            # author→review redirect must fire ONLY for an INTENTIONAL work-item
+            # (a submit-gated card, one filed with an explicit ``kind``, or one
+            # carrying a prose ``Routing (owner map):`` line) — NOT for the
+            # chokepoint's DEFAULTED-kind stamp on a plain ``create_task`` card
+            # (a swarm/decompose child, a bookkeeping tick). Without this guard a
+            # generic parent card would MOVE to ``review`` on completion instead
+            # of ``done`` and never promote its children. A defaulted-stamp card
+            # is treated as "no review owner" here, so it falls through to the
+            # ``-> done`` UPDATE exactly as an un-stamped card did before.
+            _review_owner = (
+                _review_owner_from_owner_map(conn, task_id)
+                if _card_declares_intentional_owner_map(conn, task_id)
+                else None
+            )
             # Self-owned-review-lane guard (STRUCTURAL — the durable fix for the
             # respawn wedge the cohort allowlist below only papered over per
             # cohort). A card claimed FROM the ``review`` lane keeps its reviewer
@@ -11732,9 +12084,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 _has_pr = _card_has_pr_artifact(conn, row["id"])
                 _crashed_kind = kind in ("signaled", "nonzero_exit", "unknown")
                 if _has_pr or _crashed_kind:
-                    advance_review_owner = _review_owner_from_owner_map(
-                        conn, row["id"]
-                    )
+                    # Owner-map guarantee interaction (card t_0c8744a1): the
+                    # auto-advance MOVE is gated on an INTENTIONAL owner map, not
+                    # the chokepoint's DEFAULTED-kind stamp that every card now
+                    # carries. A generic PR/edit card that never declared its kind
+                    # has no review destination and falls through to the benign
+                    # release-to-``ready`` (the #47 draft-PR carve-out) exactly as
+                    # an un-stamped card did before this change.
+                    if _card_declares_intentional_owner_map(conn, row["id"]):
+                        advance_review_owner = _review_owner_from_owner_map(
+                            conn, row["id"]
+                        )
             elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling

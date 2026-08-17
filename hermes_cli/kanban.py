@@ -325,6 +325,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
+    p_create.add_argument("--kind", default=None, choices=["code", "research", "writing"],
+                          help="Card kind — stamps a kind-correct owner map so the "
+                               "card routes to the right reviewer. Omitted defaults to "
+                               "'code' (recorded as defaulted).")
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
                                "its id is returned instead of creating a duplicate.")
@@ -1513,6 +1517,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             priority=args.priority,
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),
+            kind=getattr(args, "kind", None),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
