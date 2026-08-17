@@ -4155,20 +4155,40 @@ def test_submit_for_review_refuses_terminal_card(kanban_home):
         assert kb.get_task(conn, t).status == "done"
 
 
-def test_submit_for_review_cannot_reach_done(kanban_home):
-    """NEGATIVE CONTROL: the handoff verb has no path to 'done'. Its only
-    target is 'review'; it can never mark the work item merged/accepted."""
-    import inspect
-
-    src = inspect.getsource(kb.submit_for_review)
-    # The verb must never write status 'done' — that is Casey's merge lane.
-    assert "'done'" not in src and '"done"' not in src
-    # And behaviorally: after a handoff the card is review, never done.
+def test_submit_for_review_only_target_is_review(kanban_home):
+    """NEGATIVE CONTROL (positive half): the only status the verb can ever
+    produce is 'review'. A successful handoff from a live lane lands the card
+    at 'review' and nowhere else — never 'done'."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="impl done", assignee="easley")
         _claim_running(conn, t)
-        kb.submit_for_review(conn, t, reviewer="lamport")
+        assert kb.submit_for_review(conn, t, reviewer="lamport") is True
         assert kb.get_task(conn, t).status == "review"
+
+
+@pytest.mark.parametrize("status", ["done", "review", "blocked", "triage", "todo", "scheduled", "archived"])
+def test_submit_for_review_refuses_every_non_handoffable_status(kanban_home, status):
+    """NEGATIVE CONTROL (the guard): the handoff verb can ONLY act on a live,
+    worker-held lane ('running'/'ready'). For every other status — including
+    the terminal 'done' — the call returns False and leaves the row untouched
+    (status AND assignee unchanged). This proves the guard behaviorally, at the
+    only place the negative contract is enforced: the SQL ``WHERE status IN
+    ('running','ready')``. A verb that could drag a 'done' card back to review,
+    or reach 'done' itself, would fail here."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="settled card", assignee="easley")
+        _set_task_status(conn, t, status)
+        before = kb.get_task(conn, t)
+        assert before is not None
+
+        # reviewer != current assignee, so a 'review' card exercises the guard's
+        # rowcount=0 path, not the idempotent already-at-target no-op.
+        assert kb.submit_for_review(conn, t, reviewer="lamport") is False
+
+        after = kb.get_task(conn, t)
+        assert after is not None
+        assert after.status == status
+        assert after.assignee == before.assignee
 
 
 def test_submit_for_review_refuses_unknown_task(kanban_home):

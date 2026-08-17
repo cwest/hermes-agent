@@ -2838,6 +2838,10 @@ def resolve_review_owner(
         comments = list_comments(conn, task_id)
     except Exception:
         return default
+    # First-match, not last-write: the owner map is stamped once at submit and
+    # is not re-negotiated per lane, so the earliest parseable state_owners map
+    # is authoritative. (If cards ever gain a re-stamp flow, switch to scanning
+    # newest-first here.)
     for c in comments:
         owner = _parse_owner_map(getattr(c, "body", "")).get("review")
         if owner:
