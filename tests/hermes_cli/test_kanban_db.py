@@ -4174,12 +4174,31 @@ def test_submit_for_review_refuses_every_non_handoffable_status(kanban_home, sta
     (status AND assignee unchanged). This proves the guard behaviorally, at the
     only place the negative contract is enforced: the SQL ``WHERE status IN
     ('running','ready')``. A verb that could drag a 'done' card back to review,
-    or reach 'done' itself, would fail here."""
+    or reach 'done' itself, would fail here.
+
+    This control is only meaningful if the STATUS clause is the *sole* thing
+    standing between the call and a successful write — otherwise the call could
+    bail on some other precondition and the assertion would pass no matter what
+    the status clause said (a vacuous pass). So the fixture seeds the row the
+    way a real *settled* card looks: no claim held. ``create_task`` +
+    ``_set_task_status`` already leave ``claim_lock``/``claim_expires``/
+    ``worker_pid``/``current_run_id`` NULL, but we assert that explicitly here
+    so the mutation test is decisive: widening the SQL ``WHERE status IN
+    ('running','ready')`` to admit ``done``/``review``/``blocked`` MUST turn
+    those parametrizations RED. If it does not, the guard is not what is being
+    measured, and this test is decoration."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="settled card", assignee="easley")
         _set_task_status(conn, t, status)
         before = kb.get_task(conn, t)
         assert before is not None
+        # A real settled card holds no claim — the status clause is the ONLY
+        # guard left, so this test genuinely measures it (not a claim/run
+        # precondition that would make the pass vacuous).
+        assert before.claim_lock is None
+        assert before.claim_expires is None
+        assert before.worker_pid is None
+        assert before.current_run_id is None
 
         # reviewer != current assignee, so a 'review' card exercises the guard's
         # rowcount=0 path, not the idempotent already-at-target no-op.
