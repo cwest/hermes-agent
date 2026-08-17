@@ -14123,7 +14123,7 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
-    env = dict(os.environ)
+    env = sanitize_worker_env(dict(os.environ))
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -14781,6 +14781,31 @@ def notifier_delivery_profile() -> str:
         return get_active_profile_name() or "default"
     except Exception:
         return "default"
+
+
+def sanitize_worker_env(env: dict) -> dict:
+    """Strip ambient, non-inheritable workstream state from a worker env copy.
+
+    A worker subprocess env starts as ``dict(os.environ)``. The dispatcher runs
+    inside the gateway process, whose ``HERMES_KANBAN_ORIGIN`` is a
+    last-writer-wins process-global belonging to whichever turn most recently
+    bound an origin — NOT necessarily the workstream this worker serves. Copying
+    it hands the worker a foreign delivery surface, and every card that worker
+    creates inherits it (``session_context.capture_kanban_origin_from_session``
+    returns an inherited origin verbatim, before it ever consults the live
+    session). Cards then report into an unrelated thread.
+
+    The correct origin for a worker is seeded explicitly per card from that
+    card's own notify-sub (:func:`worker_origin_env`). That seed is conditional:
+    it is skipped when the card has no routable sub and swallowed on error. So
+    the ambient value must be dropped UNCONDITIONALLY here rather than merely
+    overwritten later — absent origin degrades to a detached context and is
+    recoverable, whereas a confidently wrong origin is not.
+
+    Mutates and returns *env* for call-site brevity.
+    """
+    env.pop("HERMES_KANBAN_ORIGIN", None)
+    return env
 
 
 def worker_origin_env(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
