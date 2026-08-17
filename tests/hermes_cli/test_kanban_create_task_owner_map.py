@@ -216,3 +216,158 @@ def test_worker_auto_subscribe_stamps_delivering_profile(kanban_home, monkeypatc
             assert s["notifier_profile"] != "reddy-worker"
     finally:
         conn.close()
+
+
+# ── Intentional map supersedes the defaulted chokepoint stamp ─────────────────
+#
+# The exact failure shape the five prior recurrences were about (card t_0c8744a1,
+# Lamport review): every card now carries a chokepoint-written DEFAULTED-code
+# submit stamp. A card that ALSO declares an INTENTIONAL map (explicit kind /
+# prose Routing line / submit-gated stamp) must have that intentional map win —
+# and when the intentional map names one lane but OMITS another, the reader must
+# return None for the omitted lane rather than resurrecting the co-present
+# defaulted stamp's owner. Leaking to the defaulted stamp would re-route past a
+# lane the intentional map deliberately dropped — the recurrence this card kills.
+
+
+def _add_intentional_strict_stamp(conn, tid, owner_map_body):
+    """File an INTENTIONAL submit-stage strict stamp (no kind_source=defaulted).
+
+    This is the shape ``submit_card`` / ``create_task(kind=<explicit>)`` write:
+    a ``stage=submit`` audit comment carrying ``state_owners={…}`` WITHOUT the
+    ``kind_source=defaulted`` marker that flags the chokepoint's automatic map.
+    """
+    body = (
+        "[audit] actor=hollis stage=submit ts=2026-08-17T00:00:00Z\n"
+        f"notes: state_owners={{{owner_map_body}}} kind_source=explicit"
+    )
+    kb.add_comment(conn, tid, author="hollis", body=body)
+
+
+def test_intentional_strict_map_omitting_review_returns_none_not_defaulted(kanban_home):
+    """An intentional strict map that names ``ready`` but OMITS ``review`` must
+    resolve the review owner to None — never fall through to the co-present
+    defaulted-code stamp's reviewer (the exact live mis-route this card ends)."""
+    conn = kb.connect()
+    try:
+        # create_task with no kind stamps the DEFAULTED code map (carries a
+        # real review-lane owner: the code reviewer).
+        tid = kb.create_task(conn, title="intentional strict omit review")
+        defaulted_reviewer = kb.materialize_owner_map("code")["review"]
+        author = kb.materialize_owner_map("research")["ready"]
+        # Now stamp an INTENTIONAL strict map naming only ready.
+        _add_intentional_strict_stamp(conn, tid, f"ready: {author}")
+
+        # ready resolves from the intentional map.
+        assert kb._owner_from_owner_map(conn, tid, "ready") == author
+        # review is OMITTED in the intentional map -> None, NOT the defaulted
+        # stamp's code reviewer.
+        assert kb._review_owner_from_owner_map(conn, tid) is None
+        assert kb._review_owner_from_owner_map(conn, tid) != defaulted_reviewer
+    finally:
+        conn.close()
+
+
+def test_intentional_prose_map_omitting_review_returns_none_not_defaulted(kanban_home):
+    """The prose-form equivalent: a body ``Routing (owner map): {ready: X}`` that
+    omits the review lane resolves the review owner to None, not the defaulted
+    chokepoint stamp's reviewer."""
+    conn = kb.connect()
+    try:
+        author = kb.materialize_owner_map("research")["ready"]
+        # Body carries an intentional prose routing line omitting review; the
+        # chokepoint still stamps a defaulted-code map on create.
+        tid = kb.create_task(
+            conn,
+            title="intentional prose omit review",
+            body=f"Routing (owner map): {{ready: {author}}}",
+        )
+        defaulted_reviewer = kb.materialize_owner_map("code")["review"]
+        assert kb._owner_from_owner_map(conn, tid, "ready") == author
+        assert kb._review_owner_from_owner_map(conn, tid) is None
+        assert kb._review_owner_from_owner_map(conn, tid) != defaulted_reviewer
+    finally:
+        conn.close()
+
+
+def test_intentional_strict_map_with_review_supersedes_defaulted(kanban_home):
+    """When the intentional map DOES name review, its reviewer wins over the
+    co-present defaulted-code stamp — the supersedes relationship, both ways."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="intentional strict with review")
+        research_map = kb.materialize_owner_map("research")
+        intentional_reviewer = research_map["review"]
+        defaulted_reviewer = kb.materialize_owner_map("code")["review"]
+        assert intentional_reviewer != defaulted_reviewer  # precondition
+        _add_intentional_strict_stamp(
+            conn,
+            tid,
+            f"ready: {research_map['ready']}, review: {intentional_reviewer}",
+        )
+        assert kb._review_owner_from_owner_map(conn, tid) == intentional_reviewer
+    finally:
+        conn.close()
+
+
+# ── _card_declares_intentional_owner_map discriminator ───────────────────────
+#
+# The discriminator all six review-lifecycle gates depend on: True for a card
+# that INTENTIONALLY declared its routing (explicit kind / prose / submit-gated),
+# False for a card carrying only the chokepoint's automatic DEFAULTED stamp — so
+# a generic bookkeeping card still completes to done while a real work-item still
+# routes to review (preserves the t_baaa247f no-self-complete fix).
+
+
+def test_declares_intentional_false_for_defaulted_only(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="defaulted only")
+        # It DOES declare a map (routing always resolves)...
+        assert kb._card_declares_owner_map(conn, tid) is True
+        # ...but NOT an intentional one — the chokepoint default is routing-only.
+        assert kb._card_declares_intentional_owner_map(conn, tid) is False
+    finally:
+        conn.close()
+
+
+def test_declares_intentional_true_for_explicit_kind(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="explicit kind", kind="research")
+        assert kb._card_declares_intentional_owner_map(conn, tid) is True
+    finally:
+        conn.close()
+
+
+def test_declares_intentional_true_for_prose_routing_line(kanban_home):
+    conn = kb.connect()
+    try:
+        author = kb.materialize_owner_map("writing")["ready"]
+        tid = kb.create_task(
+            conn,
+            title="prose routing",
+            body=f"Routing (owner map): {{ready: {author}, review: "
+            f"{kb.materialize_owner_map('writing')['review']}}}",
+        )
+        assert kb._card_declares_intentional_owner_map(conn, tid) is True
+    finally:
+        conn.close()
+
+
+def test_declares_intentional_true_for_submit_gated_stamp(kanban_home):
+    """A submit-gated card (submit_card writes a stage=submit state_owners stamp
+    with NO kind_source field) is intentional even without an explicit kind."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="submit gated")
+        wmap = kb.materialize_owner_map("writing")
+        # submit_card's stamp shape: no kind_source marker at all.
+        body = (
+            "[audit] actor=hollis stage=submit ts=2026-08-17T00:00:00Z\n"
+            f"notes: state_owners={{ready: {wmap['ready']}, review: {wmap['review']}}}"
+        )
+        kb.add_comment(conn, tid, author="hollis", body=body)
+        assert kb._card_declares_intentional_owner_map(conn, tid) is True
+    finally:
+        conn.close()
