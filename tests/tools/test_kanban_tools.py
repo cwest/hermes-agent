@@ -58,6 +58,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_submit_for_review",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -140,6 +141,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
+        "kanban_submit_for_review",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -741,6 +743,123 @@ def test_block_rejects_empty_reason(worker_env):
     for bad in ["", "   ", None]:
         out = kt._handle_block({"reason": bad})
         assert json.loads(out).get("error")
+
+
+# ---------------------------------------------------------------------------
+# kanban_submit_for_review — worker's sanctioned running->review handoff
+# ---------------------------------------------------------------------------
+
+def test_submit_for_review_visible_in_worker_schema(monkeypatch, tmp_path):
+    """The handoff verb is a worker lifecycle tool — it must appear in the
+    dispatcher-spawned worker schema alongside complete/block."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # noqa: F401 ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert "kanban_submit_for_review" in names
+
+
+def test_submit_for_review_happy_path(worker_env):
+    """A running card is MOVED to review with the reviewer from the owner map."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        kb.add_comment(
+            conn, worker_env, "kanban",
+            "[audit] stage=submit\nnotes: state_owners={ready: test-worker, "
+            "review: lamport, blocked-acceptance: casey}",
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_submit_for_review({})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["status"] == "review"
+    assert d["assignee"] == "lamport"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "review"
+        assert task.assignee == "lamport"
+        assert task.claim_lock is None
+    finally:
+        conn.close()
+
+
+def test_submit_for_review_falls_back_to_default_reviewer(worker_env):
+    """No owner map (legacy card) -> the default code reviewer."""
+    from tools import kanban_tools as kt
+
+    out = kt._handle_submit_for_review({})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["assignee"] == "lamport"
+
+
+def test_submit_for_review_explicit_reviewer_override(worker_env):
+    """An explicit reviewer arg wins over the resolved owner-map reviewer."""
+    from tools import kanban_tools as kt
+
+    out = kt._handle_submit_for_review({"reviewer": "perkins"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["assignee"] == "perkins"
+
+
+def test_submit_for_review_rejects_foreign_task(worker_env):
+    """A worker cannot hand off a task other than its own scoped one."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="not mine", assignee="peer")
+    finally:
+        conn.close()
+
+    out = kt._handle_submit_for_review({"task_id": other})
+    assert "scoped to task" in json.loads(out).get("error", "")
+
+
+def test_submit_for_review_rejected_from_delegate_child(worker_env, monkeypatch):
+    """A delegate_task child is not a run owner and must not hand off."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_is_delegated_child_context", lambda: True)
+    out = kt._handle_submit_for_review({})
+    assert "delegate_task child" in json.loads(out).get("error", "")
+
+
+def test_submit_for_review_cannot_set_done(worker_env):
+    """NEGATIVE CONTROL: the tool exposes no way to reach done/undraft/merge.
+
+    Its schema carries no status/merge/undraft parameter, and after a call the
+    card is in review — never done."""
+    from tools import kanban_tools as kt
+
+    props = kt.KANBAN_SUBMIT_FOR_REVIEW_SCHEMA["parameters"]["properties"]
+    for forbidden in ("status", "merge", "undraft", "done"):
+        assert forbidden not in props
+
+    from hermes_cli import kanban_db as kb
+    kt._handle_submit_for_review({})
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "review"
+    finally:
+        conn.close()
 
 
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):

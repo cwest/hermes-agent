@@ -4079,6 +4079,181 @@ def test_claim_review_task_fails_when_already_claimed(kanban_home):
     assert second is None
 
 
+# ---------------------------------------------------------------------------
+# submit_for_review — the worker's sanctioned running->review handoff verb
+# ---------------------------------------------------------------------------
+
+
+def _claim_running(conn, task_id):
+    """Test helper: put a ready task into running (claimed), like the dispatcher."""
+    _set_task_status(conn, task_id, "ready")
+    return kb.claim_task(conn, task_id)
+
+
+def test_submit_for_review_moves_running_to_review(kanban_home):
+    """A running (claimed) card MOVES to review + reviewer assignee, and the
+    claim is cleared so the dispatcher's claim_review_task can pick it up."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl done", assignee="easley")
+        claimed = _claim_running(conn, t)
+        assert claimed is not None and claimed.status == "running"
+
+        ok = kb.submit_for_review(conn, t, reviewer="lamport")
+        assert ok is True
+
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.assignee == "lamport"
+        # The claim MUST be cleared, else claim_review_task never fires.
+        assert task.claim_lock is None
+        # The dispatcher's review claim now succeeds on the handed-off card.
+        reclaimed = kb.claim_review_task(conn, t)
+        assert reclaimed is not None
+        assert reclaimed.status == "running"
+
+
+def test_submit_for_review_emits_status_and_assigned_events(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl done", assignee="easley")
+        _claim_running(conn, t)
+        kb.submit_for_review(conn, t, reviewer="lamport")
+        events = [e.kind for e in kb.list_events(conn, t)]
+    assert "status_changed" in events
+    assert "assigned" in events
+
+
+def test_submit_for_review_ends_the_running_run(kanban_home):
+    """The worker's run is closed on handoff — it does not stay 'running'."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl done", assignee="easley")
+        _claim_running(conn, t)
+        kb.submit_for_review(conn, t, reviewer="lamport")
+        task = kb.get_task(conn, t)
+        assert task.current_run_id is None
+        runs = kb.list_runs(conn, t)
+    # The worker run closed with a non-terminal handoff outcome.
+    assert runs and runs[-1].ended_at is not None
+    assert runs[-1].outcome != "completed"
+
+
+def test_submit_for_review_is_idempotent_noop(kanban_home):
+    """A second identical call is a no-op (already at target)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl done", assignee="easley")
+        _claim_running(conn, t)
+        assert kb.submit_for_review(conn, t, reviewer="lamport") is True
+        # Card is now review/lamport, unclaimed — a repeat converges, no error.
+        assert kb.submit_for_review(conn, t, reviewer="lamport") is False
+
+
+def test_submit_for_review_refuses_terminal_card(kanban_home):
+    """A done/archived card cannot be dragged back to review."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="already done", assignee="easley")
+        _set_task_status(conn, t, "done")
+        assert kb.submit_for_review(conn, t, reviewer="lamport") is False
+        assert kb.get_task(conn, t).status == "done"
+
+
+def test_submit_for_review_only_target_is_review(kanban_home):
+    """NEGATIVE CONTROL (positive half): the only status the verb can ever
+    produce is 'review'. A successful handoff from a live lane lands the card
+    at 'review' and nowhere else — never 'done'."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl done", assignee="easley")
+        _claim_running(conn, t)
+        assert kb.submit_for_review(conn, t, reviewer="lamport") is True
+        assert kb.get_task(conn, t).status == "review"
+
+
+@pytest.mark.parametrize("status", ["done", "review", "blocked", "triage", "todo", "scheduled", "archived"])
+def test_submit_for_review_refuses_every_non_handoffable_status(kanban_home, status):
+    """NEGATIVE CONTROL (the guard): the handoff verb can ONLY act on a live,
+    worker-held lane ('running'/'ready'). For every other status — including
+    the terminal 'done' — the call returns False and leaves the row untouched
+    (status AND assignee unchanged). This proves the guard behaviorally, at the
+    only place the negative contract is enforced: the SQL ``WHERE status IN
+    ('running','ready')``. A verb that could drag a 'done' card back to review,
+    or reach 'done' itself, would fail here.
+
+    This control is only meaningful if the STATUS clause is the *sole* thing
+    standing between the call and a successful write — otherwise the call could
+    bail on some other precondition and the assertion would pass no matter what
+    the status clause said (a vacuous pass). So the fixture seeds the row the
+    way a real *settled* card looks: no claim held. ``create_task`` +
+    ``_set_task_status`` already leave ``claim_lock``/``claim_expires``/
+    ``worker_pid``/``current_run_id`` NULL, but we assert that explicitly here
+    so the mutation test is decisive: widening the SQL ``WHERE status IN
+    ('running','ready')`` to admit ``done``/``review``/``blocked`` MUST turn
+    those parametrizations RED. If it does not, the guard is not what is being
+    measured, and this test is decoration."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="settled card", assignee="easley")
+        _set_task_status(conn, t, status)
+        before = kb.get_task(conn, t)
+        assert before is not None
+        # A real settled card holds no claim — the status clause is the ONLY
+        # guard left, so this test genuinely measures it (not a claim/run
+        # precondition that would make the pass vacuous).
+        assert before.claim_lock is None
+        assert before.claim_expires is None
+        assert before.worker_pid is None
+        assert before.current_run_id is None
+
+        # reviewer != current assignee, so a 'review' card exercises the guard's
+        # rowcount=0 path, not the idempotent already-at-target no-op.
+        assert kb.submit_for_review(conn, t, reviewer="lamport") is False
+
+        after = kb.get_task(conn, t)
+        assert after is not None
+        assert after.status == status
+        assert after.assignee == before.assignee
+
+
+def test_submit_for_review_refuses_unknown_task(kanban_home):
+    with kb.connect() as conn:
+        assert kb.submit_for_review(conn, "t_doesnotexist", reviewer="lamport") is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_review_owner — read the reviewer from the card's state_owners map
+# ---------------------------------------------------------------------------
+
+
+def _stamp_owner_map(conn, task_id, owner_map_str):
+    """Write a submit-stage audit comment carrying a state_owners map, the way
+    the submit flow records the owner map (it lives in the audit trail, not a
+    column)."""
+    kb.add_comment(
+        conn,
+        task_id,
+        "kanban",
+        f"[audit] actor=kanban stage=submit\nnotes: state_owners={{{owner_map_str}}} kind=code",
+    )
+
+
+def test_resolve_review_owner_reads_stamped_map(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="c", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        assert kb.resolve_review_owner(conn, t) == "lamport"
+
+
+def test_resolve_review_owner_honors_non_default_reviewer(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="w", assignee="baldwin")
+        _stamp_owner_map(conn, t, "ready: baldwin, review: perkins, blocked-acceptance: casey")
+        assert kb.resolve_review_owner(conn, t) == "perkins"
+
+
+def test_resolve_review_owner_falls_back_when_unstamped(kanban_home):
+    """A legacy / CLI-created card with no owner map falls back to the default."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="c", assignee="easley")
+        assert kb.resolve_review_owner(conn, t) == "lamport"
+        assert kb.resolve_review_owner(conn, t, default="custom") == "custom"
+
+
 def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
     """dispatch_once dry-run sees review tasks and reports them as spawned."""
     with kb.connect() as conn:

@@ -2784,6 +2784,71 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+#: The default review-lane owner for a card that carries no stamped owner map
+#: (legacy / CLI-created cards). ``code`` cards review to ``lamport``; callers
+#: with a different default (e.g. a writing card -> ``perkins``) pass ``default``.
+DEFAULT_REVIEW_OWNER = "lamport"
+
+#: The owner-map fragment recorded in a card's ``submit``-stage audit comment,
+#: e.g. ``state_owners={ready: easley, review: lamport, blocked-acceptance: casey}``.
+#: The owner map is NOT a column — it lives in the audit trail — so lane-owner
+#: resolution parses it out of the card's comments.
+_OWNER_MAP_RE = re.compile(r"state_owners=\{([^}]*)\}")
+
+
+def _parse_owner_map(text: Optional[str]) -> dict:
+    """Parse a ``state_owners={lane: owner, ...}`` fragment from audit text.
+
+    Returns the lane->owner dict, or an empty dict when the text carries no
+    parseable ``state_owners={...}`` fragment.
+    """
+    if not text:
+        return {}
+    m = _OWNER_MAP_RE.search(text)
+    if not m:
+        return {}
+    out: dict = {}
+    for pair in m.group(1).split(","):
+        if ":" not in pair:
+            continue
+        lane, owner = pair.split(":", 1)
+        lane, owner = lane.strip(), owner.strip()
+        if lane and owner:
+            out[lane] = owner
+    return out
+
+
+def resolve_review_owner(
+    conn: sqlite3.Connection, task_id: str, default: str = DEFAULT_REVIEW_OWNER
+) -> str:
+    """Return the review-lane owner for a card from its ``state_owners`` map.
+
+    The owner map lives in the card's audit trail (recorded by the submit
+    flow), not a column. This reads ``state_owners["review"]`` from any audit
+    comment that carries a parseable ``state_owners={...}`` fragment — so a
+    worker handing off can assign the card's OWN reviewer (code -> ``lamport``,
+    writing -> ``perkins``) rather than a hardcoded one. Falls back to
+    ``default`` (the code reviewer) for a legacy / un-stamped card.
+
+    Mirrors the review-lane resolution the PR-review webhook uses, kept in core
+    so the worker's self-service handoff picks the same reviewer the webhook
+    would have on PR-open.
+    """
+    try:
+        comments = list_comments(conn, task_id)
+    except Exception:
+        return default
+    # First-match, not last-write: the owner map is stamped once at submit and
+    # is not re-negotiated per lane, so the earliest parseable state_owners map
+    # is authoritative. (If cards ever gain a re-stamp flow, switch to scanning
+    # newest-first here.)
+    for c in comments:
+        owner = _parse_owner_map(getattr(c, "body", "")).get("review")
+        if owner:
+            return owner
+    return default
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -5656,6 +5721,116 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    return True
+
+
+def submit_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reviewer: str,
+    summary: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """MOVE a worker's own card ``running``/``ready`` -> ``review`` + reviewer.
+
+    The sanctioned, non-terminal handoff a worker uses to hand its finished
+    lane to the review lane. It is the deliberate counterpart to
+    ``complete_task``: ``complete_task`` means *the work item is finished*
+    (status ``done`` == Casey merged/accepted), which is premature at a lane
+    boundary; this verb only advances the card one lane so the review agent
+    the dispatcher spawns for ``status='review'`` cards picks it up.
+
+    What it does, atomically, inside one ``write_txn``:
+
+    * Guarded ``UPDATE ... WHERE id=? AND status IN ('running','ready')`` — an
+      atomic check-and-set. A card that went terminal (or was already moved)
+      between the read and the write matches zero rows and is NOT moved
+      (returns ``False``), so a TOCTOU race can never drag a ``done`` card back.
+    * Clears ``claim_lock`` / ``claim_expires`` / ``worker_pid`` — REQUIRED, or
+      ``claim_review_task`` (which needs ``status='review' AND claim_lock IS
+      NULL``) would never fire and the card would sit un-dispatched.
+    * Sets ``assignee`` to ``reviewer`` (resolved by the caller from the card's
+      ``state_owners`` map via :func:`resolve_review_owner`).
+    * Closes the worker's current run with a non-terminal ``handed_off``
+      outcome and emits ``status_changed`` + ``assigned`` events so the audit
+      trail is complete.
+
+    What it deliberately CANNOT do — the negative contract this verb exists to
+    honor:
+
+    * It has NO code path to ``done``. Its only status target is ``review``;
+      the guard forbids any other transition. A worker can never mark the work
+      item merged/accepted through this seam — that stays Casey's merge lane.
+    * It touches only the board row. It does not undraft, merge, or otherwise
+      touch the PR (that is the reviewer's / Casey's authority) — this layer
+      has no GitHub surface at all.
+
+    ``reviewer`` is the review-lane owner; resolve it from the card's owner map
+    with :func:`resolve_review_owner` so the card's OWN map (code -> lamport,
+    writing -> perkins) is honored rather than a hardcoded assignee.
+
+    Idempotency: a card already at ``review`` with the same reviewer is a
+    no-op — returns ``False``, writes nothing, emits no event. Returns
+    ``False`` for an unknown id or a card not in ``running``/``ready``.
+    """
+    reviewer_norm = _canonical_assignee(reviewer)
+    if not reviewer_norm:
+        raise ValueError("reviewer is required")
+    reviewer = reviewer_norm
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        prev_status = row["status"]
+        prev_assignee = row["assignee"]
+        # Idempotent no-op: already handed off to this reviewer.
+        if prev_status == "review" and prev_assignee == reviewer:
+            return False
+        # Atomic guard: only a live, worker-held lane may hand off. This is the
+        # single seam that makes reaching any status other than 'review'
+        # impossible — the SET is a literal 'review', and the WHERE forbids a
+        # terminal or already-moved card from matching.
+        params: tuple = (reviewer, task_id)
+        run_guard = ""
+        if expected_run_id is not None:
+            run_guard = " AND current_run_id = ?"
+            params = (reviewer, task_id, int(expected_run_id))
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'review',
+                   assignee      = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND status IN ('running', 'ready')
+            """ + run_guard,
+            params,
+        )
+        if cur.rowcount != 1:
+            # Not in a handoff-able state (terminal, already review, or a
+            # stale expected_run_id). No change, no event.
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="handed_off", status="handed_off",
+            summary=summary,
+        )
+        _append_event(
+            conn, task_id, "status_changed",
+            {"from": prev_status, "to": "review", "by": "submit_for_review"},
+            run_id=run_id,
+        )
+        if prev_assignee != reviewer:
+            _append_event(
+                conn, task_id, "assigned",
+                {"from": prev_assignee, "to": reviewer, "by": "submit_for_review"},
+                run_id=run_id,
+            )
     return True
 
 
