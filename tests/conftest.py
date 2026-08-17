@@ -214,6 +214,14 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    # The card-origin channel (gateway/session_context._KANBAN_ORIGIN_ENV).
+    # A dispatched worker inherits this across the spawn boundary; under bare
+    # pytest (no CI wrapper) it leaks into every test, so
+    # _maybe_auto_subscribe resolves a real origin and auto-subscribes even
+    # when a test has cleared the HERMES_SESSION_* vars. Scrub it alongside
+    # the other kanban pins so subscription tests see a truly detached
+    # context.
+    "HERMES_KANBAN_ORIGIN",
     "HERMES_TENANT",
     # Honcho host selection changes which nested config block wins. A local
     # shell override leaked "myhost" into the full suite and flipped 20
