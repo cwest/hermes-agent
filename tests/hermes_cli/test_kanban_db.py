@@ -4699,7 +4699,7 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
     assert spawns == [(tid, str(expected))]
     assert task is not None
     assert task.workspace_path == str(expected)
-    assert task.branch_name == f"wt/{tid}"
+    assert task.branch_name == f"wt/{tid}-ship"
     listed = subprocess.run(
         ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
         check=True,
@@ -4735,7 +4735,7 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         assert first_task is not None
         expected = repo / ".worktrees" / tid
         assert first_task.workspace_path == str(expected)
-        assert first_task.branch_name == f"wt/{tid}"
+        assert first_task.branch_name == f"wt/{tid}-ship"
 
         conn.execute(
             "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
@@ -4757,7 +4757,7 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         capture_output=True,
         text=True,
     ).stdout.strip()
-    assert actual_branch == f"wt/{tid}"
+    assert actual_branch == f"wt/{tid}-ship"
     assert second_task.branch_name == actual_branch
     listed = subprocess.run(
         ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
@@ -6471,7 +6471,7 @@ def test_submit_for_review_refuses_unknown_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
-def _stamp_owner_map(conn, task_id, owner_map_str):
+def _stamp_owner_map_str(conn, task_id, owner_map_str):
     """Write a submit-stage audit comment carrying a state_owners map, the way
     the submit flow records the owner map (it lives in the audit trail, not a
     column)."""
@@ -6486,21 +6486,37 @@ def _stamp_owner_map(conn, task_id, owner_map_str):
 def test_resolve_review_owner_reads_stamped_map(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="c", assignee="easley")
-        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        _stamp_owner_map_str(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
         assert kb.resolve_review_owner(conn, t) == "lamport"
 
 
 def test_resolve_review_owner_honors_non_default_reviewer(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="w", assignee="baldwin")
-        _stamp_owner_map(conn, t, "ready: baldwin, review: perkins, blocked-acceptance: casey")
+        _stamp_owner_map_str(conn, t, "ready: baldwin, review: perkins, blocked-acceptance: casey")
         assert kb.resolve_review_owner(conn, t) == "perkins"
 
 
 def test_resolve_review_owner_falls_back_when_unstamped(kanban_home):
-    """A legacy / CLI-created card with no owner map falls back to the default."""
+    """A card that carries NO owner map at all falls back to the default.
+
+    On this fork ``create_task`` auto-stamps a ``kind_source=defaulted`` owner
+    map at the chokepoint (owner-map birth guarantee), so a plain code card
+    resolves to its defaulted-code reviewer (``lamport``) rather than the
+    caller's ``default``. The ``default`` param only wins for a genuinely
+    map-less card — a legacy row whose chokepoint stamp was never written — so
+    we strip the auto-stamp to exercise that true fallback.
+    """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="c", assignee="easley")
+        # The chokepoint's defaulted stamp resolves the code reviewer even for a
+        # plain create_task card (this is the birth-guarantee behavior).
+        assert kb.resolve_review_owner(conn, t) == "lamport"
+
+        # Strip every comment to simulate a legacy / map-less card, then the
+        # caller-supplied default is what applies.
+        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (t,))
+        conn.commit()
         assert kb.resolve_review_owner(conn, t) == "lamport"
         assert kb.resolve_review_owner(conn, t, default="custom") == "custom"
 

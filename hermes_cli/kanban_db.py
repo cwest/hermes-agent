@@ -3470,58 +3470,30 @@ def _review_pr_url(
 DEFAULT_REVIEW_OWNER = "lamport"
 
 
-def _parse_owner_map(text: Optional[str]) -> dict:
-    """Parse a ``state_owners={lane: owner, ...}`` fragment from audit text.
-
-    Returns the lane->owner dict, or an empty dict when the text carries no
-    parseable ``state_owners={...}`` fragment. Reuses ``_OWNER_MAP_RE``
-    (defined once above alongside the fork's owner-map machinery).
-    """
-    if not text:
-        return {}
-    m = _OWNER_MAP_RE.search(text)
-    if not m:
-        return {}
-    out: dict = {}
-    for pair in m.group(1).split(","):
-        if ":" not in pair:
-            continue
-        lane, owner = pair.split(":", 1)
-        lane, owner = lane.strip(), owner.strip()
-        if lane and owner:
-            out[lane] = owner
-    return out
-
-
 def resolve_review_owner(
     conn: sqlite3.Connection, task_id: str, default: str = DEFAULT_REVIEW_OWNER
 ) -> str:
     """Return the review-lane owner for a card from its ``state_owners`` map.
 
     The owner map lives in the card's audit trail (recorded by the submit
-    flow), not a column. This reads ``state_owners["review"]`` from any audit
-    comment that carries a parseable ``state_owners={...}`` fragment — so a
-    worker handing off can assign the card's OWN reviewer (code -> ``lamport``,
-    writing -> ``perkins``) rather than a hardcoded one. Falls back to
-    ``default`` (the code reviewer) for a legacy / un-stamped card.
+    flow), not a column. So a worker handing off can assign the card's OWN
+    reviewer (code -> ``lamport``, writing -> ``perkins``) rather than a
+    hardcoded one. Falls back to ``default`` (the code reviewer) only for a
+    card that carries no owner map at all.
 
-    Mirrors the review-lane resolution the PR-review webhook uses, kept in core
-    so the worker's self-service handoff picks the same reviewer the webhook
-    would have on PR-open.
+    Delegates to :func:`_review_owner_from_owner_map` so it honors the SAME
+    authoritative-comment precedence every other owner-map reader uses: an
+    intentional submit stamp (or prose ``Routing (owner map): {…}``) wins over
+    the chokepoint's ``kind_source=defaulted`` stamp, and an intentional map
+    that omits the review lane does not leak through to the defaulted stamp.
+    This keeps the worker's self-service handoff picking the same reviewer the
+    PR-review webhook would on PR-open.
     """
     try:
-        comments = list_comments(conn, task_id)
+        owner = _review_owner_from_owner_map(conn, task_id)
     except Exception:
         return default
-    # First-match, not last-write: the owner map is stamped once at submit and
-    # is not re-negotiated per lane, so the earliest parseable state_owners map
-    # is authoritative. (If cards ever gain a re-stamp flow, switch to scanning
-    # newest-first here.)
-    for c in comments:
-        owner = _parse_owner_map(getattr(c, "body", "")).get("review")
-        if owner:
-            return owner
-    return default
+    return owner or default
 
 
 def create_task(
