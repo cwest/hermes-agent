@@ -4079,6 +4079,142 @@ def test_claim_review_task_fails_when_already_claimed(kanban_home):
     assert second is None
 
 
+# ---------------------------------------------------------------------------
+# submit_for_review — the worker's sanctioned running->review handoff verb
+# ---------------------------------------------------------------------------
+
+
+def _claim_running(conn, task_id):
+    """Test helper: put a ready task into running (claimed), like the dispatcher."""
+    _set_task_status(conn, task_id, "ready")
+    return kb.claim_task(conn, task_id)
+
+
+def test_submit_for_review_moves_running_to_review(kanban_home):
+    """A running (claimed) card MOVES to review + reviewer assignee, and the
+    claim is cleared so the dispatcher's claim_review_task can pick it up."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl done", assignee="easley")
+        claimed = _claim_running(conn, t)
+        assert claimed is not None and claimed.status == "running"
+
+        ok = kb.submit_for_review(conn, t, reviewer="lamport")
+        assert ok is True
+
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.assignee == "lamport"
+        # The claim MUST be cleared, else claim_review_task never fires.
+        assert task.claim_lock is None
+        # The dispatcher's review claim now succeeds on the handed-off card.
+        reclaimed = kb.claim_review_task(conn, t)
+        assert reclaimed is not None
+        assert reclaimed.status == "running"
+
+
+def test_submit_for_review_emits_status_and_assigned_events(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl done", assignee="easley")
+        _claim_running(conn, t)
+        kb.submit_for_review(conn, t, reviewer="lamport")
+        events = [e.kind for e in kb.list_events(conn, t)]
+    assert "status_changed" in events
+    assert "assigned" in events
+
+
+def test_submit_for_review_ends_the_running_run(kanban_home):
+    """The worker's run is closed on handoff — it does not stay 'running'."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl done", assignee="easley")
+        _claim_running(conn, t)
+        kb.submit_for_review(conn, t, reviewer="lamport")
+        task = kb.get_task(conn, t)
+        assert task.current_run_id is None
+        runs = kb.list_runs(conn, t)
+    # The worker run closed with a non-terminal handoff outcome.
+    assert runs and runs[-1].ended_at is not None
+    assert runs[-1].outcome != "completed"
+
+
+def test_submit_for_review_is_idempotent_noop(kanban_home):
+    """A second identical call is a no-op (already at target)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl done", assignee="easley")
+        _claim_running(conn, t)
+        assert kb.submit_for_review(conn, t, reviewer="lamport") is True
+        # Card is now review/lamport, unclaimed — a repeat converges, no error.
+        assert kb.submit_for_review(conn, t, reviewer="lamport") is False
+
+
+def test_submit_for_review_refuses_terminal_card(kanban_home):
+    """A done/archived card cannot be dragged back to review."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="already done", assignee="easley")
+        _set_task_status(conn, t, "done")
+        assert kb.submit_for_review(conn, t, reviewer="lamport") is False
+        assert kb.get_task(conn, t).status == "done"
+
+
+def test_submit_for_review_cannot_reach_done(kanban_home):
+    """NEGATIVE CONTROL: the handoff verb has no path to 'done'. Its only
+    target is 'review'; it can never mark the work item merged/accepted."""
+    import inspect
+
+    src = inspect.getsource(kb.submit_for_review)
+    # The verb must never write status 'done' — that is Casey's merge lane.
+    assert "'done'" not in src and '"done"' not in src
+    # And behaviorally: after a handoff the card is review, never done.
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl done", assignee="easley")
+        _claim_running(conn, t)
+        kb.submit_for_review(conn, t, reviewer="lamport")
+        assert kb.get_task(conn, t).status == "review"
+
+
+def test_submit_for_review_refuses_unknown_task(kanban_home):
+    with kb.connect() as conn:
+        assert kb.submit_for_review(conn, "t_doesnotexist", reviewer="lamport") is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_review_owner — read the reviewer from the card's state_owners map
+# ---------------------------------------------------------------------------
+
+
+def _stamp_owner_map(conn, task_id, owner_map_str):
+    """Write a submit-stage audit comment carrying a state_owners map, the way
+    the submit flow records the owner map (it lives in the audit trail, not a
+    column)."""
+    kb.add_comment(
+        conn,
+        task_id,
+        "kanban",
+        f"[audit] actor=kanban stage=submit\nnotes: state_owners={{{owner_map_str}}} kind=code",
+    )
+
+
+def test_resolve_review_owner_reads_stamped_map(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="c", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        assert kb.resolve_review_owner(conn, t) == "lamport"
+
+
+def test_resolve_review_owner_honors_non_default_reviewer(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="w", assignee="baldwin")
+        _stamp_owner_map(conn, t, "ready: baldwin, review: perkins, blocked-acceptance: casey")
+        assert kb.resolve_review_owner(conn, t) == "perkins"
+
+
+def test_resolve_review_owner_falls_back_when_unstamped(kanban_home):
+    """A legacy / CLI-created card with no owner map falls back to the default."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="c", assignee="easley")
+        assert kb.resolve_review_owner(conn, t) == "lamport"
+        assert kb.resolve_review_owner(conn, t, default="custom") == "custom"
+
+
 def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
     """dispatch_once dry-run sees review tasks and reports them as spawned."""
     with kb.connect() as conn:

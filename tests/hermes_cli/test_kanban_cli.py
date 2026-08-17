@@ -159,6 +159,38 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_run_slash_review_hands_off_to_reviewer(kanban_home):
+    """`kanban review <id>` MOVEs a running card to review + the owner-map
+    reviewer, clearing the claim so the review dispatch can pick it up."""
+    import re
+    out = kc.run_slash("create 'impl' --assignee easley")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    kc.run_slash(f"claim {tid}")
+    with kb.connect() as conn:
+        kb.add_comment(
+            conn, tid, "kanban",
+            "[audit] stage=submit\nnotes: state_owners={ready: easley, "
+            "review: lamport, blocked-acceptance: casey}",
+        )
+    msg = kc.run_slash(f"review {tid}")
+    assert "lamport" in msg
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "review"
+    assert task.assignee == "lamport"
+    assert task.claim_lock is None
+
+
+def test_run_slash_review_explicit_reviewer(kanban_home):
+    import re
+    out = kc.run_slash("create 'impl' --assignee easley")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    kc.run_slash(f"claim {tid}")
+    kc.run_slash(f"review {tid} --reviewer perkins")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).assignee == "perkins"
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)

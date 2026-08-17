@@ -623,6 +623,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
 
+    p_review = sub.add_parser(
+        "review",
+        help="Hand a running/ready task off to the review lane (running -> review)",
+    )
+    p_review.add_argument("task_id")
+    p_review.add_argument(
+        "--reviewer",
+        default=None,
+        help=(
+            "Reviewer profile override. Omit to use the card's own "
+            "state_owners review lane (code -> lamport, writing -> perkins); "
+            "a card with no owner map falls back to the code reviewer."
+        ),
+    )
+
     p_unblock = sub.add_parser(
         "unblock",
         help="Return blocked/scheduled tasks to ready, or todo while parents remain open",
@@ -1042,6 +1057,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
+            "review":   _cmd_review,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
@@ -2270,6 +2286,41 @@ def _cmd_block(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_review(args: argparse.Namespace) -> int:
+    """Hand a running/ready task off to the review lane.
+
+    MOVEs the card running -> review and assigns the reviewer, resolved from
+    the card's ``state_owners`` owner map unless ``--reviewer`` overrides it.
+    This is the sanctioned lane-boundary handoff — it does NOT complete the
+    task (done == merged) and does not touch any PR.
+    """
+    reviewer_arg = getattr(args, "reviewer", None)
+    if reviewer_arg and reviewer_arg.lower() in {"none", "-", "null"}:
+        reviewer_arg = None
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            print(f"cannot review {args.task_id}: unknown task", file=sys.stderr)
+            return 1
+        reviewer = reviewer_arg or kb.resolve_review_owner(conn, args.task_id)
+        if not kb.submit_for_review(
+            conn,
+            args.task_id,
+            reviewer=reviewer,
+            expected_run_id=_worker_run_id_for(args.task_id),
+        ):
+            landed = kb.get_task(conn, args.task_id)
+            print(
+                f"cannot hand off {args.task_id} to review "
+                f"(status is {landed.status if landed else 'unknown'!r}; "
+                f"only a running/ready card can be handed off)",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{args.task_id} → review (reviewer: {reviewer})")
+    return 0
+
+
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
@@ -3123,6 +3174,7 @@ Common subcommands:
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `review <id>`         Hand a running task off to the review lane (running → review)
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts
