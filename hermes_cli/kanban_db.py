@@ -3464,6 +3464,38 @@ def _review_pr_url(
     return _canonical_pr_url(title) or _canonical_pr_url(body)
 
 
+#: The default review-lane owner for a card that carries no stamped owner map
+#: (legacy / CLI-created cards). ``code`` cards review to ``lamport``; callers
+#: with a different default (e.g. a writing card -> ``perkins``) pass ``default``.
+DEFAULT_REVIEW_OWNER = "lamport"
+
+
+def resolve_review_owner(
+    conn: sqlite3.Connection, task_id: str, default: str = DEFAULT_REVIEW_OWNER
+) -> str:
+    """Return the review-lane owner for a card from its ``state_owners`` map.
+
+    The owner map lives in the card's audit trail (recorded by the submit
+    flow), not a column. So a worker handing off can assign the card's OWN
+    reviewer (code -> ``lamport``, writing -> ``perkins``) rather than a
+    hardcoded one. Falls back to ``default`` (the code reviewer) only for a
+    card that carries no owner map at all.
+
+    Delegates to :func:`_review_owner_from_owner_map` so it honors the SAME
+    authoritative-comment precedence every other owner-map reader uses: an
+    intentional submit stamp (or prose ``Routing (owner map): {…}``) wins over
+    the chokepoint's ``kind_source=defaulted`` stamp, and an intentional map
+    that omits the review lane does not leak through to the defaulted stamp.
+    This keeps the worker's self-service handoff picking the same reviewer the
+    PR-review webhook would on PR-open.
+    """
+    try:
+        owner = _review_owner_from_owner_map(conn, task_id)
+    except Exception:
+        return default
+    return owner or default
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3818,6 +3850,17 @@ def create_task(
                             )
                         except Exception:
                             branch_name = None
+
+                # A branch name must be MEANINGFUL whether or not the card is
+                # project-linked. Project-linked cards get the richer
+                # ``<project-slug>/<task-id>-<title-slug>`` shape above; every
+                # other card still derives ``wt/<task-id>-<title-slug>`` from its
+                # title here. Without this, an unlinked card fell through to the
+                # bare ``wt/<task-id>`` fallback in ``_ensure_git_worktree`` and
+                # surfaced as an opaque ``t-39521e0e`` branch — unreadable in a
+                # branch list or a preview dashboard.
+                if not branch_name and workspace_kind == "worktree":
+                    branch_name = _derive_worktree_branch_name(task_id, title)
 
                 conn.execute(
                     """
@@ -4788,6 +4831,17 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
+_DECISIVE_MOVE_ACTORS = frozenset({
+    # Both one-card verbs park a card deliberately on a human. `move_card` is
+    # the generic lane transition; `accept_card` is the acceptance park itself
+    # — the MOST common way a card lands on Casey. Omitting accept_card let
+    # `recompute_ready` flip an acceptance card blocked -> ready seconds after
+    # the PASS, fighting the reviewer in a loop.
+    "onecard:move_card",
+    "onecard:accept_card",
+})
+
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by a deliberate
     human-gated transition (#28712).
@@ -4861,7 +4915,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
             data = json.loads(payload)
         except (ValueError, TypeError):
             continue
-        if not isinstance(data, dict) or data.get("by") != "onecard:move_card":
+        if not isinstance(data, dict) or data.get("by") not in _DECISIVE_MOVE_ACTORS:
             continue
         return data.get("to") == "blocked"
     return False
@@ -6141,6 +6195,26 @@ def reconcile_merged_acceptance(
         allow_acceptance_complete=True,
     )
     return bool(completed)
+
+
+
+_REVIEW_HANDOFF_RE = re.compile(
+    r"(awaiting|await|ready for|pending)\s+(a\s+)?(re-?)?review"
+    r"|re-?review\b"
+    r"|review-required"
+    r"|awaiting-casey-signoff",
+    re.IGNORECASE,
+)
+
+
+def _is_review_handoff(reason: "Optional[str]") -> bool:
+    """True when a dependency-wait reason is really a review handoff.
+
+    A handoff means the worker FINISHED and wants the next lane; it is not a
+    parent-task dependency.  Promoting these back to ``ready`` respawns the
+    author on completed work (the t_b6a0a903 respawn loop).
+    """
+    return bool(reason) and bool(_REVIEW_HANDOFF_RE.search(reason))
 
 
 def recompute_ready(
@@ -8948,10 +9022,17 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            # A worker that finished its lane and is asking for a HANDOFF is
+            # not waiting on a parent task.  Parking it in ``todo`` lets the
+            # ``recompute_ready`` sweep promote it to ``ready``, where the
+            # dispatcher respawns the AUTHOR on already-complete work — the
+            # card ping-pongs instead of advancing.  Route those to ``review``
+            # so the sweep leaves them alone and the reviewer picks them up.
+            _dest = "review" if _is_review_handoff(reason) else "todo"
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status        = 'todo',
+                   SET status        = ?,
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
@@ -8959,8 +9040,8 @@ def block_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (_dest, kind, task_id) if expected_run_id is None
+                else (_dest, kind, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -9147,6 +9228,116 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    return True
+
+
+def submit_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reviewer: str,
+    summary: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """MOVE a worker's own card ``running``/``ready`` -> ``review`` + reviewer.
+
+    The sanctioned, non-terminal handoff a worker uses to hand its finished
+    lane to the review lane. It is the deliberate counterpart to
+    ``complete_task``: ``complete_task`` means *the work item is finished*
+    (status ``done`` == Casey merged/accepted), which is premature at a lane
+    boundary; this verb only advances the card one lane so the review agent
+    the dispatcher spawns for ``status='review'`` cards picks it up.
+
+    What it does, atomically, inside one ``write_txn``:
+
+    * Guarded ``UPDATE ... WHERE id=? AND status IN ('running','ready')`` — an
+      atomic check-and-set. A card that went terminal (or was already moved)
+      between the read and the write matches zero rows and is NOT moved
+      (returns ``False``), so a TOCTOU race can never drag a ``done`` card back.
+    * Clears ``claim_lock`` / ``claim_expires`` / ``worker_pid`` — REQUIRED, or
+      ``claim_review_task`` (which needs ``status='review' AND claim_lock IS
+      NULL``) would never fire and the card would sit un-dispatched.
+    * Sets ``assignee`` to ``reviewer`` (resolved by the caller from the card's
+      ``state_owners`` map via :func:`resolve_review_owner`).
+    * Closes the worker's current run with a non-terminal ``handed_off``
+      outcome and emits ``status_changed`` + ``assigned`` events so the audit
+      trail is complete.
+
+    What it deliberately CANNOT do — the negative contract this verb exists to
+    honor:
+
+    * It has NO code path to ``done``. Its only status target is ``review``;
+      the guard forbids any other transition. A worker can never mark the work
+      item merged/accepted through this seam — that stays Casey's merge lane.
+    * It touches only the board row. It does not undraft, merge, or otherwise
+      touch the PR (that is the reviewer's / Casey's authority) — this layer
+      has no GitHub surface at all.
+
+    ``reviewer`` is the review-lane owner; resolve it from the card's owner map
+    with :func:`resolve_review_owner` so the card's OWN map (code -> lamport,
+    writing -> perkins) is honored rather than a hardcoded assignee.
+
+    Idempotency: a card already at ``review`` with the same reviewer is a
+    no-op — returns ``False``, writes nothing, emits no event. Returns
+    ``False`` for an unknown id or a card not in ``running``/``ready``.
+    """
+    reviewer_norm = _canonical_assignee(reviewer)
+    if not reviewer_norm:
+        raise ValueError("reviewer is required")
+    reviewer = reviewer_norm
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        prev_status = row["status"]
+        prev_assignee = row["assignee"]
+        # Idempotent no-op: already handed off to this reviewer.
+        if prev_status == "review" and prev_assignee == reviewer:
+            return False
+        # Atomic guard: only a live, worker-held lane may hand off. This is the
+        # single seam that makes reaching any status other than 'review'
+        # impossible — the SET is a literal 'review', and the WHERE forbids a
+        # terminal or already-moved card from matching.
+        params: tuple = (reviewer, task_id)
+        run_guard = ""
+        if expected_run_id is not None:
+            run_guard = " AND current_run_id = ?"
+            params = (reviewer, task_id, int(expected_run_id))
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'review',
+                   assignee      = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND status IN ('running', 'ready')
+            """ + run_guard,
+            params,
+        )
+        if cur.rowcount != 1:
+            # Not in a handoff-able state (terminal, already review, or a
+            # stale expected_run_id). No change, no event.
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="handed_off", status="handed_off",
+            summary=summary,
+        )
+        _append_event(
+            conn, task_id, "status_changed",
+            {"from": prev_status, "to": "review", "by": "submit_for_review"},
+            run_id=run_id,
+        )
+        if prev_assignee != reviewer:
+            _append_event(
+                conn, task_id, "assigned",
+                {"from": prev_assignee, "to": reviewer, "by": "submit_for_review"},
+                run_id=run_id,
+            )
     return True
 
 
@@ -9992,6 +10183,25 @@ def _git_toplevel(path: Path) -> Optional[Path]:
         return Path(out).expanduser()
 
 
+_WORKTREE_BRANCH_SAFE_RE = re.compile(r"[^a-z0-9._-]+")
+_WORKTREE_TITLE_SLUG_MAX = 40
+
+
+def _derive_worktree_branch_name(task_id: str, title: str | None) -> str:
+    """Human-meaningful worktree branch name for a non-project-linked card.
+
+    Shape: ``wt/<task-id>-<title-slug>``, mirroring the slug rules
+    ``projects_db.branch_name_for`` uses for project-linked cards so both paths
+    produce the same readable style.
+
+    A bare ``wt/<task-id>`` is returned ONLY when the title is empty or slugs
+    away to nothing — the opaque form is a last resort, never the default.
+    """
+    slug = _WORKTREE_BRANCH_SAFE_RE.sub("-", str(title or "").strip().lower())
+    slug = slug.strip("-")[:_WORKTREE_TITLE_SLUG_MAX].strip("-")
+    return f"wt/{task_id}-{slug}" if slug else f"wt/{task_id}"
+
+
 def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     try:
         result = subprocess.run(
@@ -10377,7 +10587,9 @@ def _resolve_worktree_workspace(
     launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
     """
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    branch_name = (task.branch_name or "").strip() or _derive_worktree_branch_name(
+        task.id, getattr(task, "title", None)
+    )
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -10609,7 +10821,9 @@ def _resolve_dir_workspace(task: Task) -> Path:
                     f"to confirm, then reattach it to its deploy branch."
                 )
 
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    branch_name = (task.branch_name or "").strip() or _derive_worktree_branch_name(
+        task.id, getattr(task, "title", None)
+    )
     target = repo_root / ".worktrees" / task.id
     _ensure_git_worktree(repo_root, target, branch_name)
     return target.resolve(strict=False)

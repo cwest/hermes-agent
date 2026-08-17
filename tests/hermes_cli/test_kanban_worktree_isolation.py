@@ -140,7 +140,7 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
 
     workspace, branch = kb._resolve_worktree_workspace(task)
     assert workspace == (repo / ".worktrees" / tid).resolve()
-    assert branch == f"wt/{tid}"
+    assert branch == f"wt/{tid}-second-sibling"
     # The sibling's checkout is untouched, still on its own branch.
     assert (occupied / "README.md").exists()
     head = subprocess.run(
