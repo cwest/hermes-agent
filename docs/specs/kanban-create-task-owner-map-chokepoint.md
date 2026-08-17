@@ -98,16 +98,22 @@ defaulted vs `kind_source=explicit` when supplied. A post-change card therefore
 never reaches the legacy `resolve_card_kind` silent fallback — it always carries
 a real stamped map — and a `code` resolution is provably a stamped `code` card.
 
-### 2.4 Notify-sub: hard-fail a non-delivering `notifier_profile`
+### 2.4 Notify-sub: stamp the delivering profile at the WORKER paths
 
-Chosen over "chokepoint registers the sub" because `create_task` takes no
-origin/session args (the CLI/gateway resolve those upstream and already register
-the sub with `notifier_delivery_profile()`). The robust root-cause fix makes the
-bad sub **impossible to write from any path**: `add_notify_sub` raises
-`ValueError` when given a `notifier_profile` that is not the delivering profile
-(`notifier_delivery_profile()`). `None`/unset is still accepted (the legacy
-self-heal path backfills it), so this only rejects an *actively wrong* owner —
-the exact `notifier_profile=<worker>` shape observed live.
+Chosen: **(a)** — fix the source. The worker-side auto-subscribe
+(`tools/kanban_tools.py::_maybe_auto_subscribe`, three `add_notify_sub` call
+sites) previously stamped `os.environ["HERMES_PROFILE"]` / `HERMES_SESSION_PROFILE`
+— the WORKER's own profile — which the notifier's owner-profile gate silently
+drops. All three now stamp `notifier_delivery_profile()` (the delivering
+gateway's profile) so the sub is actually deliverable.
+
+Option (b) — a hard-fail in `add_notify_sub` for any non-delivering
+`notifier_profile` — was implemented, then REJECTED: `add_notify_sub` is a shared
+primitive, and a sub is legitimately owned by a SECONDARY profile in the
+multi-gateway ownership model (a `beta`-owned telegram sub delivered only by
+beta's notifier — `test_notifier_owning_profile_adapter_no_default_fallback`).
+A blanket hard-fail there forbids that valid case, so the guard stays out and the
+root-cause fix lives at the worker paths that actually produced the bad sub.
 
 ## 3. Behavior contracts (tests — assert relationships, not names)
 
@@ -124,8 +130,10 @@ the exact `notifier_profile=<worker>` shape observed live.
   review owner (they must differ), reproducing the mis-route.
 - The coincidental code shape: a code card resolves to `code` AND is stamped
   (declares a map), not merely resolving-right.
-- `add_notify_sub(notifier_profile=<non-delivering>)` raises; the delivering
-  profile and `None` are accepted.
+- The worker auto-subscribe path (`_maybe_auto_subscribe`) stamps the sub with
+  `notifier_delivery_profile()`, never the worker's own profile — asserted by
+  driving `kanban_create` under a worker profile inside a gateway session and
+  checking the resulting sub's `notifier_profile`.
 
 ## 4. Cross-repo seam (which half goes where)
 

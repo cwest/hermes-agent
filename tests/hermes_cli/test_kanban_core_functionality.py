@@ -2921,7 +2921,11 @@ def test_build_worker_context_caps_comments(kanban_home):
         assert body_count == kb._CTX_MAX_COMMENTS, (
             f"expected {kb._CTX_MAX_COMMENTS} comments shown, got {body_count}"
         )
-        omitted = 100 - kb._CTX_MAX_COMMENTS
+        # create_task stamps one owner-map audit comment (t_0c8744a1), so the
+        # total comment count is 100 authored + 1 stamp = 101; the cap shows the
+        # newest _CTX_MAX_COMMENTS and reports the rest as earlier.
+        total_comments = 100 + 1
+        omitted = total_comments - kb._CTX_MAX_COMMENTS
         assert f"{omitted} earlier comment" in ctx
     finally:
         conn.close()

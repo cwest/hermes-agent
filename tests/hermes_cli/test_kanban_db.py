@@ -3204,8 +3204,12 @@ def test_comments_recorded_in_order(kanban_home):
         kb.add_comment(conn, t, "user", "first")
         kb.add_comment(conn, t, "researcher", "second")
         comments = kb.list_comments(conn, t)
-    assert [c.body for c in comments] == ["first", "second"]
-    assert [c.author for c in comments] == ["user", "researcher"]
+    # create_task stamps a submit-stage owner-map audit comment (t_0c8744a1);
+    # the ordering contract is about the caller's own comments, so exclude the
+    # chokepoint stamp.
+    user_comments = [c for c in comments if c.author != "kanban"]
+    assert [c.body for c in user_comments] == ["first", "second"]
+    assert [c.author for c in user_comments] == ["user", "researcher"]
 
 
 def test_empty_comment_rejected(kanban_home):
@@ -6407,16 +6411,24 @@ def test_review_skills_for_card_code_owner_map_selects_sdlc(kanban_home):
 
 
 def test_review_skills_for_card_assignee_fallback_when_unstamped(kanban_home):
-    """No owner map stamped: fall back to the review card's assignee."""
+    """No owner map stamped: fall back to the review card's assignee.
+
+    ``create_task`` now stamps a defaulted owner map on every card (t_0c8744a1),
+    so a genuinely un-stamped (legacy) card is simulated by stripping that stamp
+    — this keeps coverage of the pre-change assignee-fallback path that still
+    runs for old rows.
+    """
     with kb.connect() as conn:
         # Writing reviewer as assignee, no owner-map comment -> editorial.
         tw = kb.create_task(conn, title="writing: unstamped", assignee="perkins")
+        _strip_chokepoint_stamp(conn, tw)
         _set_task_status(conn, tw, "review")
         assert kb.review_skills_for_card(conn, kb.get_task(conn, tw)) == [
             "editorial-review"
         ]
         # Code reviewer as assignee, no owner-map comment -> sdlc.
         tc = kb.create_task(conn, title="fix: unstamped", assignee="lamport")
+        _strip_chokepoint_stamp(conn, tc)
         _set_task_status(conn, tc, "review")
         assert kb.review_skills_for_card(conn, kb.get_task(conn, tc)) == [
             "sdlc-review"
@@ -7765,6 +7777,22 @@ def _stamp_submit_owner_map_raw(conn, task_id, map_body):
         "[audit] actor=hollis stage=submit ts=2026-08-02T19:46:36Z\n"
         f"notes: state_owners={{{map_body}}} triager=hollis team=engineering",
     )
+
+
+def _strip_chokepoint_stamp(conn, task_id):
+    """Delete the chokepoint's DEFAULTED-kind submit stamp from a card.
+
+    After card t_0c8744a1 ``create_task`` stamps every card with a defaulted
+    owner map. A test that needs a genuinely LEGACY / un-stamped card (to
+    exercise the pre-change fallback path that still runs for old rows) removes
+    that stamp so the card carries no owner map at all.
+    """
+    conn.execute(
+        "DELETE FROM task_comments WHERE task_id = ? AND author = 'kanban' "
+        "AND body LIKE '%kind_source=defaulted%'",
+        (task_id,),
+    )
+    conn.commit()
 
 
 def test_review_owner_from_owner_map_resolves_quoted_audit_comment(kanban_home):

@@ -1008,10 +1008,13 @@ def test_comment_happy_path(worker_env):
     conn = kb.connect()
     try:
         comments = kb.list_comments(conn, worker_env)
-        assert len(comments) == 1
+        # create_task stamps a submit-stage owner-map audit comment (author
+        # 'kanban', t_0c8744a1); the caller's comment is the non-kanban one.
+        user_comments = [c for c in comments if c.author != "kanban"]
+        assert len(user_comments) == 1
         # Author defaults to HERMES_PROFILE env we set in the fixture
-        assert comments[0].author == "test-worker"
-        assert comments[0].body == "hello thread"
+        assert user_comments[0].author == "test-worker"
+        assert user_comments[0].body == "hello thread"
     finally:
         conn.close()
 
@@ -1040,8 +1043,10 @@ def test_comment_ignores_caller_supplied_author(worker_env):
     try:
         comments = kb.list_comments(conn, worker_env)
         # Author comes from HERMES_PROFILE in the fixture, not the
-        # caller-supplied "hermes-system" override.
-        assert comments[0].author == "test-worker"
+        # caller-supplied "hermes-system" override. Skip the create_task
+        # owner-map stamp (author 'kanban', t_0c8744a1).
+        user_comments = [c for c in comments if c.author != "kanban"]
+        assert user_comments[0].author == "test-worker"
     finally:
         conn.close()
 
@@ -1889,8 +1894,11 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert child.status == "ready", (
             f"child should be ready after parent done, got {child.status}"
         )
-        # Comment is visible
-        assert len(kb.list_comments(conn, worker_env)) == 1
+        # Comment is visible (excluding the create_task owner-map stamp)
+        user_comments = [
+            c for c in kb.list_comments(conn, worker_env) if c.author != "kanban"
+        ]
+        assert len(user_comments) == 1
         # Heartbeat event recorded
         hb = [e for e in kb.list_events(conn, worker_env) if e.kind == "heartbeat"]
         assert len(hb) == 1
@@ -2164,9 +2172,11 @@ def test_worker_can_comment_on_foreign_task(worker_env):
     conn = kb.connect()
     try:
         comments = kb.list_comments(conn, other)
-        assert len(comments) == 1
-        assert comments[0].author == "test-worker"
-        assert comments[0].body.startswith("handoff:")
+        # Exclude the create_task owner-map stamp (author 'kanban', t_0c8744a1).
+        user_comments = [c for c in comments if c.author != "kanban"]
+        assert len(user_comments) == 1
+        assert user_comments[0].author == "test-worker"
+        assert user_comments[0].body.startswith("handoff:")
     finally:
         conn.close()
 
@@ -2440,8 +2450,10 @@ def test_board_param_routes_comment_to_alt_board(multi_board_env):
 
     with kb.connect(board="alt") as conn:
         comments = kb.list_comments(conn, alt_seed)
-        assert len(comments) == 1
-        assert comments[0].body == "alt comment"
+        # Exclude the create_task owner-map stamp (author 'kanban', t_0c8744a1).
+        user_comments = [c for c in comments if c.author != "kanban"]
+        assert len(user_comments) == 1
+        assert user_comments[0].body == "alt comment"
     # Default board does not have this task at all, so no rogue comment.
     with kb.connect() as conn:
         assert kb.get_task(conn, alt_seed) is None

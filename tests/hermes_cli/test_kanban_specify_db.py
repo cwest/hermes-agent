@@ -129,6 +129,8 @@ def test_specify_records_audit_comment_only_when_author_given(kanban_home):
             conn, tid1, title="A-spec", body="b", author="ace"
         )
         comments1 = kb.list_comments(conn, tid1)
+    # Exclude the create_task owner-map stamp (author 'kanban', t_0c8744a1).
+    comments1 = [c for c in comments1 if c.author != "kanban"]
     assert len(comments1) == 1
     assert "Specified" in comments1[0].body
     assert comments1[0].author == "ace"
@@ -138,7 +140,7 @@ def test_specify_records_audit_comment_only_when_author_given(kanban_home):
         tid2 = _create_triage(conn, title="b")
         kb.specify_triage_task(conn, tid2, title="B-spec", body="b")
         comments2 = kb.list_comments(conn, tid2)
-    assert comments2 == []
+    assert [c for c in comments2 if c.author != "kanban"] == []
 
 
 def test_specify_skips_comment_when_nothing_changed(kanban_home):
@@ -159,7 +161,9 @@ def test_specify_skips_comment_when_nothing_changed(kanban_home):
         # Promoted.
         assert kb.get_task(conn, tid).status in {"todo", "ready"}
         # No audit comment because neither field changed.
-        assert kb.list_comments(conn, tid) == []
+        assert [
+            c for c in kb.list_comments(conn, tid) if c.author != "kanban"
+        ] == []
 
 
 def test_specify_with_only_body_preserves_title(kanban_home):
