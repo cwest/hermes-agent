@@ -839,6 +839,71 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _handle_submit_for_review(args: dict, **kw) -> str:
+    """MOVE the worker's own card running->review + assign the reviewer.
+
+    The sanctioned, non-terminal handoff at a lane boundary. It resolves the
+    reviewer from the card's ``state_owners`` owner map (or an explicit
+    ``reviewer`` override), then advances the card exactly one lane so the
+    dispatcher spawns the review agent for it. It is NOT ``kanban_complete``
+    (which means the work item is finished == merged) and it does NOT touch
+    the PR — no undraft, no merge, no ``done``.
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_submit_for_review")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    board = args.get("board")
+    reviewer_arg = _normalize_profile(args.get("reviewer"))
+    summary = args.get("summary")
+    if summary:
+        summary = redact_sensitive_text(str(summary), force=True)
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+            # Resolve the reviewer: an explicit arg wins, else read the card's
+            # own state_owners["review"] (code->lamport, writing->perkins),
+            # falling back to the code reviewer default for un-stamped cards.
+            reviewer = reviewer_arg or kb.resolve_review_owner(conn, tid)
+            ok = kb.submit_for_review(
+                conn, tid,
+                reviewer=reviewer,
+                summary=summary,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                landed = kb.get_task(conn, tid)
+                return tool_error(
+                    f"could not hand off {tid} to review (status is "
+                    f"{landed.status if landed else 'unknown'!r}; the handoff "
+                    f"only moves a running/ready card, and is a no-op if the "
+                    f"card is already in review). Nothing was changed."
+                )
+            landed = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                status=landed.status if landed else "review",
+                assignee=landed.assignee if landed else reviewer,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_submit_for_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_submit_for_review failed")
+        return tool_error(f"kanban_submit_for_review: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1849,6 +1914,53 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_SUBMIT_FOR_REVIEW_SCHEMA = {
+    "name": "kanban_submit_for_review",
+    "description": (
+        "Hand your OWN card off to the review lane once your implementation "
+        "is committed and the draft PR is open. This MOVES the card from "
+        "running to review and assigns the reviewer from the card's owner "
+        "map — the one sanctioned, non-terminal handoff at a lane boundary. "
+        "It is NOT kanban_complete: complete means the work item is finished "
+        "(done == merged/accepted), which is premature here; this only "
+        "advances the card one lane so the reviewer picks it up. It does NOT "
+        "touch the PR — it never undrafts, merges, or marks the card done "
+        "(that authority stays with the reviewer and Casey). Call it after "
+        "posting your PR-url handoff comment, then end your run. Reserve "
+        "kanban_block for a genuine STOP that needs a human, not for this "
+        "handoff."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "reviewer": {
+                "type": "string",
+                "description": (
+                    "Optional reviewer profile override. Omit to use the "
+                    "card's own state_owners review lane (code -> lamport, "
+                    "writing -> perkins); a legacy card with no owner map "
+                    "falls back to the code reviewer."
+                ),
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "Optional 1-2 sentence note recorded on the run as you "
+                    "hand off (e.g. what the PR does + head SHA). Put the "
+                    "full PR url + test evidence in a kanban_comment; this is "
+                    "just a short handoff line."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -2315,6 +2427,15 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_submit_for_review",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_FOR_REVIEW_SCHEMA,
+    handler=_handle_submit_for_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
 )
 
 registry.register(
