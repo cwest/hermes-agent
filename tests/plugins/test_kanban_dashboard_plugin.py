@@ -698,9 +698,11 @@ def test_add_comment(client):
 
     r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
     comments = r.json()["comments"]
-    assert len(comments) == 1
-    assert comments[0]["body"] == "how's progress?"
-    assert comments[0]["author"] == "teknium"
+    # Exclude the create_task owner-map stamp (author 'kanban', t_0c8744a1).
+    user_comments = [c for c in comments if c["author"] != "kanban"]
+    assert len(user_comments) == 1
+    assert user_comments[0]["body"] == "how's progress?"
+    assert user_comments[0]["author"] == "teknium"
 
 
 def test_add_comment_empty_rejected(client):
