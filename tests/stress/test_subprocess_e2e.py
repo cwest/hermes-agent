@@ -81,7 +81,7 @@ exec {PY} -m hermes_cli.main "$@"
     tids = []
     for i in range(3):
         tid = kb.create_task(
-            conn, title=f"real-e2e-{i}", assignee="default",
+            conn, title=f"real-e2e-{i}", assignee="default", detached=True,
         )
         tids.append(tid)
 
@@ -145,7 +145,7 @@ exec {PY} -m hermes_cli.main "$@"
     print("=" * 60)
 
     crash_tid = kb.create_task(
-        conn, title="crash-e2e", assignee="default",
+        conn, title="crash-e2e", assignee="default", detached=True,
     )
 
     # Spawn a worker that sleeps long enough for us to kill it.

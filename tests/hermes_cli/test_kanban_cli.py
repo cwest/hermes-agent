@@ -84,7 +84,7 @@ def test_run_slash_no_args_shows_usage(kanban_home):
 
 
 def test_run_slash_create_and_list(kanban_home):
-    out = kc.run_slash("create 'ship feature' --assignee alice")
+    out = kc.run_slash("create 'ship feature' --assignee alice --detached")
     assert "Created" in out
     out = kc.run_slash("list")
     assert "ship feature" in out
@@ -95,7 +95,7 @@ def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()
     out = kc.run_slash(
-        f"create 'ship worktree' --workspace worktree:{target_arg} --branch wt/t6-wire"
+        f"create 'ship worktree' --workspace worktree:{target_arg} --branch wt/t6-wire --detached"
     )
     assert "Created" in out
 
@@ -108,19 +108,19 @@ def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
 
 
 def test_run_slash_rejects_branch_without_worktree(kanban_home):
-    out = kc.run_slash("create 'bad branch' --workspace scratch --branch wt/bad")
+    out = kc.run_slash("create 'bad branch' --workspace scratch --branch wt/bad --detached")
     assert "--branch is only valid with --workspace worktree" in out
 
 
 def test_run_slash_create_with_parent_and_cascade(kanban_home):
     # Parent then child via --parent
-    out1 = kc.run_slash("create 'parent' --assignee alice")
+    out1 = kc.run_slash("create 'parent' --assignee alice --detached")
     # Extract the "t_xxxx" id from "Created t_xxxx (ready, ...)"
     import re
     m = re.search(r"(t_[a-f0-9]+)", out1)
     assert m
     p = m.group(1)
-    out2 = kc.run_slash(f"create 'child' --assignee bob --parent {p}")
+    out2 = kc.run_slash(f"create 'child' --assignee bob --parent {p} --detached")
     assert "todo" in out2  # child starts as todo
 
     # Complete parent; list should promote child to ready
@@ -131,7 +131,7 @@ def test_run_slash_create_with_parent_and_cascade(kanban_home):
 
 
 def test_run_slash_show_includes_comments(kanban_home):
-    out = kc.run_slash("create 'x'")
+    out = kc.run_slash("create 'x' --detached")
     import re
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
     kc.run_slash(f"comment {tid} 'remember to include performance section'")
@@ -140,7 +140,7 @@ def test_run_slash_show_includes_comments(kanban_home):
 
 
 def test_run_slash_comment_max_len_trims_long_body(kanban_home):
-    out = kc.run_slash("create 'x'")
+    out = kc.run_slash("create 'x' --detached")
     import re
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
     kc.run_slash(f"comment {tid} '{'x' * 30}' --max-len 20")
@@ -150,7 +150,7 @@ def test_run_slash_comment_max_len_trims_long_body(kanban_home):
 
 
 def test_run_slash_block_unblock_cycle(kanban_home):
-    out = kc.run_slash("create 'x' --assignee alice")
+    out = kc.run_slash("create 'x' --assignee alice --detached")
     import re
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
     # Claim first so block() finds it running
@@ -163,7 +163,7 @@ def test_run_slash_review_hands_off_to_reviewer(kanban_home):
     """`kanban review <id>` MOVEs a running card to review + the owner-map
     reviewer, clearing the claim so the review dispatch can pick it up."""
     import re
-    out = kc.run_slash("create 'impl' --assignee easley")
+    out = kc.run_slash("create 'impl' --assignee easley --detached")
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
     kc.run_slash(f"claim {tid}")
     with kb.connect() as conn:
@@ -183,7 +183,7 @@ def test_run_slash_review_hands_off_to_reviewer(kanban_home):
 
 def test_run_slash_review_explicit_reviewer(kanban_home):
     import re
-    out = kc.run_slash("create 'impl' --assignee easley")
+    out = kc.run_slash("create 'impl' --assignee easley --detached")
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
     kc.run_slash(f"claim {tid}")
     kc.run_slash(f"review {tid} --reviewer perkins")
@@ -192,7 +192,7 @@ def test_run_slash_review_explicit_reviewer(kanban_home):
 
 
 def test_run_slash_json_output(kanban_home):
-    out = kc.run_slash("create 'jsontask' --assignee alice --json")
+    out = kc.run_slash("create 'jsontask' --assignee alice --json --detached")
     payload = json.loads(out)
     assert payload["title"] == "jsontask"
     assert payload["assignee"] == "alice"
@@ -200,14 +200,14 @@ def test_run_slash_json_output(kanban_home):
 
 
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
-    kc.run_slash("create 'a' --assignee alice")
-    kc.run_slash("create 'b' --assignee bob")
+    kc.run_slash("create 'a' --assignee alice --detached")
+    kc.run_slash("create 'b' --assignee bob --detached")
     out = kc.run_slash("dispatch --dry-run")
     assert "Spawned:" in out
 
 
 def test_run_slash_context_output_format(kanban_home):
-    out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC'")
+    out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC' --detached")
     import re
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
     kc.run_slash(f"comment {tid} 'remember to include performance section'")
@@ -218,8 +218,8 @@ def test_run_slash_context_output_format(kanban_home):
 
 
 def test_run_slash_tenant_filter(kanban_home):
-    kc.run_slash("create 'biz-a task' --tenant biz-a --assignee alice")
-    kc.run_slash("create 'biz-b task' --tenant biz-b --assignee alice")
+    kc.run_slash("create 'biz-a task' --tenant biz-a --assignee alice --detached")
+    kc.run_slash("create 'biz-b task' --tenant biz-b --assignee alice --detached")
     a = kc.run_slash("list --tenant biz-a")
     b = kc.run_slash("list --tenant biz-b")
     assert "biz-a task" in a and "biz-b task" not in a
@@ -240,7 +240,7 @@ def test_run_slash_session_filter(kanban_home):
         kb.create_task(
             conn, title="from sess-2", assignee="alice", session_id="sess-2"
         )
-        kb.create_task(conn, title="cli only", assignee="alice")
+        kb.create_task(conn, title="cli only", assignee="alice", detached=True)
     out_1 = kc.run_slash("list --session sess-1")
     out_2 = kc.run_slash("list --session sess-2")
     assert "from sess-1 a" in out_1
@@ -275,7 +275,7 @@ def test_run_slash_usage_error_returns_message(kanban_home):
 
 
 def test_run_slash_assign_reassigns(kanban_home):
-    out = kc.run_slash("create 'x' --assignee alice")
+    out = kc.run_slash("create 'x' --assignee alice --detached")
     import re
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
     assert "Assigned" in kc.run_slash(f"assign {tid} bob")
@@ -284,8 +284,8 @@ def test_run_slash_assign_reassigns(kanban_home):
 
 
 def test_run_slash_link_unlink(kanban_home):
-    a = kc.run_slash("create 'a'")
-    b = kc.run_slash("create 'b'")
+    a = kc.run_slash("create 'a' --detached")
+    b = kc.run_slash("create 'b' --detached")
     import re
     ta = re.search(r"(t_[a-f0-9]+)", a).group(1)
     tb = re.search(r"(t_[a-f0-9]+)", b).group(1)
@@ -319,7 +319,7 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     failures: list[str] = []
 
     def worker(board: str, title: str) -> None:
-        args = parser.parse_args(["kanban", "--board", board, "create", title])
+        args = parser.parse_args(["kanban", "--board", board, "create", title, "--detached"])
         rc = kc.kanban_command(args)
         if rc != 0:
             failures.append(f"{board}:{rc}")
@@ -406,7 +406,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import secrets
     from hermes_cli import kanban_db as kb
 
-    out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
+    out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model --detached")
     m = re.search(r"(t_[a-f0-9]+)", out1)
     assert m
     tid = m.group(1)
@@ -444,7 +444,7 @@ def test_run_slash_reassign_with_reclaim_flag(kanban_home):
     import secrets
     from hermes_cli import kanban_db as kb
 
-    out1 = kc.run_slash("create 'switch model' --assignee orig")
+    out1 = kc.run_slash("create 'switch model' --assignee orig --detached")
     m = re.search(r"(t_[a-f0-9]+)", out1)
     tid = m.group(1)
 
@@ -485,7 +485,7 @@ def test_run_slash_specify_end_to_end(kanban_home, monkeypatch):
     from unittest.mock import MagicMock
 
     # Create a triage task via the same slash surface.
-    create_out = kc.run_slash("create 'rough idea' --triage")
+    create_out = kc.run_slash("create 'rough idea' --triage --detached")
     import re
     m = re.search(r"(t_[a-f0-9]+)", create_out)
     assert m, f"no task id in: {create_out!r}"

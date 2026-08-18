@@ -182,7 +182,7 @@ def main():
     conn = kb.connect()
     for i in range(NUM_TASKS):
         kb.create_task(
-            conn, title=f"t#{i}", assignee="shared", tenant="mixed-stress",
+            conn, title=f"t#{i}", assignee="shared", tenant="mixed-stress", detached=True,
         )
     conn.close()
     print(f"Seeded {NUM_TASKS} tasks, launching {NUM_WORKERS} workers + 1 reclaimer")

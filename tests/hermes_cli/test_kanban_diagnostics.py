@@ -420,8 +420,8 @@ def test_engine_works_on_sqlite_row_objects(kanban_home):
     """
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="p", assignee="w")
-        real = kb.create_task(conn, title="r", assignee="x", created_by="w")
+        parent = kb.create_task(conn, title="p", assignee="w", detached=True)
+        real = kb.create_task(conn, title="r", assignee="x", created_by="w", detached=True)
         with pytest.raises(kb.HallucinatedCardsError):
             kb.complete_task(
                 conn, parent,
@@ -607,7 +607,7 @@ def test_stranded_in_ready_works_on_real_db_row(kanban_home):
     conn = kb.connect()
     try:
         # Create a task and force its created_at into the past.
-        tid = kb.create_task(conn, title="stranded one", assignee="ghost")
+        tid = kb.create_task(conn, title="stranded one", assignee="ghost", detached=True)
         old_ts = int(_t.time()) - 90 * 60  # 90 min old
         conn.execute(
             "UPDATE tasks SET status = 'ready', created_at = ? WHERE id = ?",

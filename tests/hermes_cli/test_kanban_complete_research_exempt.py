@@ -84,7 +84,7 @@ def test_research_curation_sweep_completes_to_done(kanban_home: Path) -> None:
             conn,
             title="curate: write-time sweep @ aefa5a1a",
             assignee="avram",
-            workspace_kind="scratch",
+            workspace_kind="scratch", detached=True,
         )
         _stamp_owner_map(conn, tid, "ready: reddy, review: avram", team="research")
         kb.claim_task(conn, tid)
@@ -108,7 +108,7 @@ def test_research_sweep_emits_no_review_move(kanban_home: Path) -> None:
             conn,
             title="curate: write-time sweep @ deadbeef",
             assignee="avram",
-            workspace_kind="scratch",
+            workspace_kind="scratch", detached=True,
         )
         _stamp_owner_map(conn, tid, "ready: reddy, review: avram", team="research")
         kb.claim_task(conn, tid)
@@ -143,7 +143,7 @@ def test_engineering_scratch_card_still_moves_to_review(kanban_home: Path) -> No
             conn,
             title="stamp SOUL block in place",
             assignee="eckert",
-            workspace_kind="scratch",
+            workspace_kind="scratch", detached=True,
         )
         _stamp_owner_map(
             conn, tid,
@@ -168,7 +168,7 @@ def test_writing_scratch_card_still_moves_to_review(kanban_home: Path) -> None:
     """A writing card (review owner perkins) is not research and still MOVEs to
     review — the exemption must not leak to the writing cohort."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="draft the post", assignee="lawrence")
+        tid = kb.create_task(conn, title="draft the post", assignee="lawrence", detached=True)
         _stamp_owner_map(
             conn, tid,
             "ready: lawrence, review: perkins, blocked-acceptance: casey",
@@ -199,7 +199,7 @@ def test_worktree_pr_card_still_moves_to_review(kanban_home: Path) -> None:
             title="fix the widget",
             assignee="eckert",
             workspace_kind="worktree",
-            workspace_path="/Users/x/src/repo/.worktrees/t_abc",
+            workspace_path="/Users/x/src/repo/.worktrees/t_abc", detached=True,
         )
         _stamp_owner_map(
             conn, tid,
@@ -236,7 +236,7 @@ def test_worktree_card_without_pr_still_refused_missing_pr(kanban_home: Path) ->
             title="fix the widget",
             assignee="eckert",
             workspace_kind="worktree",
-            workspace_path="/Users/x/src/repo/.worktrees/t_def",
+            workspace_path="/Users/x/src/repo/.worktrees/t_def", detached=True,
         )
         _stamp_owner_map(
             conn, tid,
@@ -266,7 +266,7 @@ def test_unstamped_card_still_completes_to_done(kanban_home: Path) -> None:
     review-EXEMPT and completes to ``done`` exactly as before — the research
     exemption is additive and must not change this."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="bookkeeping tick", assignee="salton")
+        tid = kb.create_task(conn, title="bookkeeping tick", assignee="salton", detached=True)
         kb.claim_task(conn, tid)
 
         assert kb.complete_task(conn, tid, summary="done, no review needed") is True

@@ -40,7 +40,7 @@ def conn(kanban_home):
 
 def test_uncontended_tick_runs_and_is_not_skipped(conn):
     """With no other holder, a tick runs normally and skipped_locked is False."""
-    kb.create_task(conn, title="t", assignee="w")
+    kb.create_task(conn, title="t", assignee="w", detached=True)
     result = kb.dispatch_once(conn)
     assert result.skipped_locked is False
 
@@ -48,7 +48,7 @@ def test_uncontended_tick_runs_and_is_not_skipped(conn):
 def test_held_lock_skips_the_tick_without_writes(conn):
     """While another holder owns the board lock, dispatch_once must skip and
     must NOT invoke spawn_fn (no DB writes happen on a skipped tick)."""
-    kb.create_task(conn, title="t", assignee="w")
+    kb.create_task(conn, title="t", assignee="w", detached=True)
     db_path = kb.kanban_db_path(board="default")
 
     spawn_calls: list = []
@@ -69,7 +69,7 @@ def test_held_lock_skips_the_tick_without_writes(conn):
 
 def test_lock_releases_so_next_tick_runs(conn):
     """After the holder releases, the next tick is no longer skipped."""
-    kb.create_task(conn, title="t", assignee="w")
+    kb.create_task(conn, title="t", assignee="w", detached=True)
     db_path = kb.kanban_db_path(board="default")
 
     with kb._dispatch_tick_lock(db_path) as held:

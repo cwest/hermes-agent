@@ -55,7 +55,7 @@ def _review_lane_card(conn, *, assignee: str = "lamport") -> str:
     Mirrors how the existing suite stages a review card: a plain status flip to
     ``review`` (the ``stage-pr-review`` MOVE that happens on PR-open).
     """
-    tid = kb.create_task(conn, title="implemented feature", assignee=assignee)
+    tid = kb.create_task(conn, title="implemented feature", assignee=assignee, detached=True)
     conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
     assert kb.get_task(conn, tid).status == "review"
     return tid
@@ -178,7 +178,7 @@ def test_rework_ready_to_review_is_unchanged(kanban_home: Path) -> None:
     card to ``review`` + its review owner — the merge-path widening must not turn
     this handoff into a straight-to-done completion."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="reworked after bounce", assignee="eckert")
+        tid = kb.create_task(conn, title="reworked after bounce", assignee="eckert", detached=True)
         _stamp_owner_map(
             conn, tid, "ready: eckert, review: lamport, blocked-acceptance: casey"
         )

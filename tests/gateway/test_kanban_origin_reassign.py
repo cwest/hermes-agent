@@ -38,7 +38,7 @@ def _subs(conn, task_id):
 
 
 def _make_task_with_events(conn, n_events=3):
-    tid = kb.create_task(conn, title="fork me", assignee="peer")
+    tid = kb.create_task(conn, title="fork me", assignee="peer", detached=True)
     # Generate some history so we can assert the cursor seed suppresses replay.
     for i in range(n_events):
         kb.add_comment(conn, tid, author="tester", body=f"event {i}")

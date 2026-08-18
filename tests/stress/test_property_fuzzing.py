@@ -158,7 +158,7 @@ def random_op(rng, conn, kb, task_pool):
         tid = kb.create_task(
             conn,
             title=f"rand {rng.randint(0, 1000)}",
-            assignee=rng.choice(["w1", "w2", "w3", None]),
+            assignee=rng.choice(["w1", "w2", "w3", None]), detached=True,
         )
         task_pool.append(tid)
         return {"op": "create", "tid": tid}
@@ -168,7 +168,7 @@ def random_op(rng, conn, kb, task_pool):
         tid = kb.create_task(
             conn, title=f"child of {parent}",
             assignee=rng.choice(["w1", "w2", "w3", None]),
-            parents=[parent],
+            parents=[parent], detached=True,
         )
         task_pool.append(tid)
         return {"op": "create_child", "tid": tid, "parent": parent}

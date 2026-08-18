@@ -60,7 +60,7 @@ def _make_task():
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        return kb.create_task(conn, title="fork", assignee="peer")
+        return kb.create_task(conn, title="fork", assignee="peer", detached=True)
     finally:
         conn.close()
 

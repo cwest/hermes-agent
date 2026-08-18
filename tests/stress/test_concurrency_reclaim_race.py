@@ -131,7 +131,7 @@ def main():
     conn = kb.connect()
     for i in range(NUM_TASKS):
         kb.create_task(conn, title=f"t{i}", assignee="shared",
-                       tenant="reclaim-race")
+                       tenant="reclaim-race", detached=True)
     conn.close()
     print(f"Seeded {NUM_TASKS} tasks. TTL={TTL}s, work_duration={WORK_DURATION_S}s")
     print("(worker work > TTL guarantees reclaims)")

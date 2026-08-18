@@ -326,7 +326,7 @@ def test_board_query_param_default_overrides_current_board_pointer(client):
     kb.create_board("other")
     other_conn = kb.connect(board="other")
     try:
-        kb.create_task(other_conn, title="other-only")
+        kb.create_task(other_conn, title="other-only", detached=True)
     finally:
         other_conn.close()
 
@@ -1019,14 +1019,14 @@ def test_ws_events_board_query_param_default_overrides_current_board_pointer(tmp
 
     default_conn = kb.connect()
     try:
-        default_task = kb.create_task(default_conn, title="default-live")
+        default_task = kb.create_task(default_conn, title="default-live", detached=True)
     finally:
         default_conn.close()
 
     kb.create_board("other")
     other_conn = kb.connect(board="other")
     try:
-        other_task = kb.create_task(other_conn, title="other-live")
+        other_task = kb.create_task(other_conn, title="other-live", detached=True)
     finally:
         other_conn.close()
 
@@ -1918,8 +1918,8 @@ def test_board_surfaces_warnings_field_for_hallucinated_completions(client):
     """
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="alice")
-        real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
+        parent = kb.create_task(conn, title="parent", assignee="alice", detached=True)
+        real = kb.create_task(conn, title="real", assignee="x", created_by="alice", detached=True)
 
         import pytest as _pytest
         with _pytest.raises(kb.HallucinatedCardsError):
@@ -1952,8 +1952,8 @@ def test_board_warnings_cleared_after_clean_completion(client):
     the warning badge — we don't mark tasks permanently."""
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="alice")
-        real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
+        parent = kb.create_task(conn, title="parent", assignee="alice", detached=True)
+        real = kb.create_task(conn, title="real", assignee="x", created_by="alice", detached=True)
 
         import pytest as _pytest
         with _pytest.raises(kb.HallucinatedCardsError):
@@ -1988,7 +1988,7 @@ def test_reclaim_endpoint_releases_running_claim(client):
     import secrets
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="running", assignee="x")
+        t = kb.create_task(conn, title="running", assignee="x", detached=True)
         lock = secrets.token_hex(8)
         future = int(time.time()) + 3600
         conn.execute(
@@ -2032,7 +2032,7 @@ def test_reclaim_endpoint_409_for_non_running_task(client):
     """Reclaiming a task that's already ready returns 409."""
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="ready", assignee="x")
+        t = kb.create_task(conn, title="ready", assignee="x", detached=True)
     finally:
         conn.close()
 
@@ -2047,7 +2047,7 @@ def test_reassign_endpoint_switches_profile(client):
     """POST /tasks/<id>/reassign changes the assignee field."""
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="task", assignee="orig")
+        t = kb.create_task(conn, title="task", assignee="orig", detached=True)
     finally:
         conn.close()
 
@@ -2073,7 +2073,7 @@ def test_reassign_endpoint_409_on_running_without_reclaim(client):
     import secrets
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="running", assignee="orig")
+        t = kb.create_task(conn, title="running", assignee="orig", detached=True)
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=? WHERE id=?",
             (secrets.token_hex(4), t),
@@ -2095,7 +2095,7 @@ def test_reassign_endpoint_with_reclaim_first_succeeds_on_running(client):
     import secrets
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="running", assignee="orig")
+        t = kb.create_task(conn, title="running", assignee="orig", detached=True)
         lock = secrets.token_hex(4)
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
@@ -2146,8 +2146,8 @@ def test_diagnostics_endpoint_empty_for_clean_board(client):
 def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="alice")
-        real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
+        parent = kb.create_task(conn, title="parent", assignee="alice", detached=True)
+        real = kb.create_task(conn, title="real", assignee="x", created_by="alice", detached=True)
         import pytest as _pytest
         with _pytest.raises(kb.HallucinatedCardsError):
             kb.complete_task(
@@ -2176,11 +2176,11 @@ def test_diagnostics_endpoint_severity_filter(client):
         # A warning-severity diagnostic (prose phantom) on one task.
         # Phantom id must be valid hex — the prose scanner regex
         # requires ``t_[a-f0-9]{8,}``.
-        p1 = kb.create_task(conn, title="prose", assignee="a")
+        p1 = kb.create_task(conn, title="prose", assignee="a", detached=True)
         kb.complete_task(conn, p1, summary="mentioned t_deadbeef1234")
         # An error-severity diagnostic (spawn failures) on another.
         # Keep this below critical severity (failure_threshold * 2).
-        p2 = kb.create_task(conn, title="spawn", assignee="b")
+        p2 = kb.create_task(conn, title="spawn", assignee="b", detached=True)
         conn.execute(
             "UPDATE tasks SET consecutive_failures=2, last_failure_error='x' WHERE id=?",
             (p2,),
@@ -2211,7 +2211,7 @@ def test_board_exposes_diagnostics_list_and_summary(client):
     """
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="crashy", assignee="worker")
+        t = kb.create_task(conn, title="crashy", assignee="worker", detached=True)
         # Simulate 2 consecutive crashes -> repeated_crashes error diag
         for i in range(2):
             conn.execute(
@@ -2451,7 +2451,7 @@ def test_task_detail_exposes_result_and_latest_summary_separately(client):
 def test_task_detail_exposes_latest_summary_when_result_is_empty(client):
     """Summary-only completions remain available to the drawer fallback."""
     conn = kb.connect()
-    task_id = kb.create_task(conn, title="Task with only run summary")
+    task_id = kb.create_task(conn, title="Task with only run summary", detached=True)
     kb.claim_task(conn, task_id)
     kb.complete_task(conn, task_id, summary="Report written to /output/report.md")
     conn.close()
@@ -2479,7 +2479,7 @@ def test_task_detail_latest_summary_none_when_nothing_recorded(client):
 def test_board_tasks_include_latest_summary(client):
     """Board cards already expose the summary used by the drawer fallback."""
     conn = kb.connect()
-    task_id = kb.create_task(conn, title="Board card with summary only")
+    task_id = kb.create_task(conn, title="Board card with summary only", detached=True)
     kb.claim_task(conn, task_id)
     kb.complete_task(conn, task_id, summary="Done: see attachment")
     conn.close()
@@ -2505,8 +2505,8 @@ def test_dashboard_done_final_result_section_rendered_from_summary():
 def test_task_detail_includes_child_result_summaries(client):
     """Parent drawers should receive the child results they need to render."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="Research topic")
-        child = kb.create_task(conn, title="Collect sources")
+        parent = kb.create_task(conn, title="Research topic", detached=True)
+        child = kb.create_task(conn, title="Collect sources", detached=True)
         kb.link_tasks(conn, parent, child)
         kb.complete_task(conn, parent, summary="Delegated research to child tasks.")
         kb.recompute_ready(conn)

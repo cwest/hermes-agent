@@ -54,7 +54,7 @@ def _stage_reviewer_running(
     comment carries the materialized owner map so the acceptance owner is
     resolvable from the board alone.
     """
-    tid = kb.create_task(conn, title="feature work", assignee=author)
+    tid = kb.create_task(conn, title="feature work", assignee=author, detached=True)
     if stamp_owner_map:
         kb.add_comment(
             conn, tid, author="hollis",
@@ -167,7 +167,7 @@ def test_accept_task_refuses_a_non_review_running_card(kanban_home: Path) -> Non
     """accept_task only transitions a card that is under review (``review`` or a
     reviewer-claimed ``running``). A plain ``ready`` card is not acceptable."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="not in review", assignee="eckert")
+        tid = kb.create_task(conn, title="not in review", assignee="eckert", detached=True)
         # ready, never reviewed
         ok = kb.accept_task(conn, tid, acceptance_owner="casey", reason=_PASS_GIST)
         assert ok is False, "accept_task must refuse a card that is not under review"

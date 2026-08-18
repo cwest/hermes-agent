@@ -53,7 +53,7 @@ def test_threadless_channel_sub_is_skipped_when_thread_sub_exists(tmp_path, monk
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="thread-born", assignee="hollis")
+        tid = kb.create_task(conn, title="thread-born", assignee="hollis", detached=True)
         # 1) origin sub stamped at filing: chat + thread both set.
         kb.add_notify_sub(
             conn, task_id=tid, platform="discord",
@@ -89,7 +89,7 @@ def test_threadless_channel_sub_still_allowed_for_a_channel_born_card(tmp_path, 
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="channel-born", assignee="casey")
+        tid = kb.create_task(conn, title="channel-born", assignee="casey", detached=True)
         kb.add_notify_sub(
             conn, task_id=tid, platform="discord",
             chat_id="1515879019269197885", thread_id=None,

@@ -68,7 +68,7 @@ def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
 
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
-        root = kb.create_task(conn, title="build the feature", triage=True)
+        root = kb.create_task(conn, title="build the feature", triage=True, detached=True)
         conn.execute(
             "UPDATE tasks SET workspace_kind='worktree', "
             "workspace_path='/repo/.worktrees/root' WHERE id = ?",
@@ -101,7 +101,7 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
 
 def test_decompose_dir_children_still_inherit_path(kanban_home):
     with kb.connect() as conn:
-        root = kb.create_task(conn, title="ops sweep", triage=True)
+        root = kb.create_task(conn, title="ops sweep", triage=True, detached=True)
         conn.execute(
             "UPDATE tasks SET workspace_kind='dir', "
             "workspace_path='/srv/ops' WHERE id = ?",
@@ -134,7 +134,7 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
             conn,
             title="second sibling",
             workspace_kind="worktree",
-            workspace_path=str(occupied),  # inherited shared/stale path
+            workspace_path=str(occupied), detached=True,  # inherited shared/stale path
         )
         task = kb.get_task(conn, tid)
 
@@ -157,7 +157,7 @@ def test_resolve_worktree_same_branch_still_reuses(kanban_home, tmp_path):
         tid = kb.create_task(
             conn,
             title="returning task",
-            workspace_kind="worktree",
+            workspace_kind="worktree", detached=True,
         )
         own = _add_worktree(repo, repo / ".worktrees" / tid, f"wt/{tid}")
         conn.execute(
@@ -181,7 +181,7 @@ def test_resolve_worktree_own_path_on_foreign_branch_keeps_legacy_reuse(
         tid = kb.create_task(
             conn,
             title="foreign-branch checkout",
-            workspace_kind="worktree",
+            workspace_kind="worktree", detached=True,
         )
         own = _add_worktree(repo, repo / ".worktrees" / tid, "wt/foreign")
         conn.execute(

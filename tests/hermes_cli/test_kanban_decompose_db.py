@@ -28,7 +28,7 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
         body=body,
         assignee=assignee,
         tenant=tenant,
-        triage=True,
+        triage=True, detached=True,
     )
 
 
@@ -82,7 +82,7 @@ def test_decompose_returns_none_when_task_missing(kanban_home):
 
 def test_decompose_returns_none_when_task_not_in_triage(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="already a real task")  # not triage
+        tid = kb.create_task(conn, title="already a real task", detached=True)  # not triage
         result = kb.decompose_triage_task(
             conn,
             tid,
@@ -174,7 +174,7 @@ def test_decompose_children_inherit_dir_workspace(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="codegen root", assignee="worker",
-            workspace_kind="dir", workspace_path=proj, triage=True,
+            workspace_kind="dir", workspace_path=proj, triage=True, detached=True,
         )
         child_ids = kb.decompose_triage_task(
             conn, tid, root_assignee="orchestrator",
@@ -194,7 +194,7 @@ def test_decompose_children_stay_scratch_when_root_scratch(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="scratch root", assignee="worker",
-            workspace_kind="scratch", triage=True,
+            workspace_kind="scratch", triage=True, detached=True,
         )
         child_ids = kb.decompose_triage_task(
             conn, tid, root_assignee="orchestrator",
@@ -212,7 +212,7 @@ def test_decompose_per_child_workspace_override(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="root", assignee="worker",
-            workspace_kind="dir", workspace_path=proj, triage=True,
+            workspace_kind="dir", workspace_path=proj, triage=True, detached=True,
         )
         child_ids = kb.decompose_triage_task(
             conn, tid, root_assignee="orchestrator",

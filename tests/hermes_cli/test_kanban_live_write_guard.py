@@ -88,7 +88,7 @@ def test_connect_allows_isolated_temp_db_in_test_context(tmp_path: Path, monkeyp
     conn = kb.connect()
     try:
         # A card can be created against the isolated store without tripping the guard.
-        tid = kb.create_task(conn, title="isolated", assignee="worker")
+        tid = kb.create_task(conn, title="isolated", assignee="worker", detached=True)
         assert tid
     finally:
         conn.close()

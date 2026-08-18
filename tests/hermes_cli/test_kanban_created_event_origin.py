@@ -140,7 +140,12 @@ def test_created_payload_no_origin_when_detached(kanban_home):
     tests above would fall to this same all-None shape and go red."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="detached", kind="code")
+        # This IS a genuinely origin-less context: no inherited origin and no
+        # live session. The create_task origin guard (card t_b76d0836) refuses a
+        # no-origin filing unless it declares itself detached, so this true
+        # detached context passes detached=True. The recorded payload is
+        # unaffected — origin still resolves to source=none, all fields None.
+        tid = kb.create_task(conn, title="detached", kind="code", detached=True)
         pl = _created_payload(conn, tid)
         assert pl["origin_source"] == "none", pl
         assert pl["origin_platform"] is None, pl

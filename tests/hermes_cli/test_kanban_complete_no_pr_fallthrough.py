@@ -76,7 +76,7 @@ def test_review_owner_reads_prose_routing_map_in_body(kanban_home: Path) -> None
             title="edit in place",
             assignee="eckert",
             body="# Why\nsomething\n\n# Scope\n" + _PROSE_MAP_FULL,
-            workspace_kind="scratch",
+            workspace_kind="scratch", detached=True,
         )
         assert kb._review_owner_from_owner_map(conn, tid) == "lamport"
 
@@ -85,7 +85,7 @@ def test_review_owner_reads_prose_routing_map_in_comment(kanban_home: Path) -> N
     """The prose ``Routing (owner map):`` form is honored in a COMMENT too (the
     fork-core inline-fix filing records it in a ``hollis`` audit comment)."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="edit in place", assignee="eckert")
+        tid = kb.create_task(conn, title="edit in place", assignee="eckert", detached=True)
         kb.add_comment(
             conn, tid, author="hollis",
             body=f"[audit] actor=hollis stage=intake\n{_PROSE_MAP_FULL} · triager: hollis",
@@ -97,7 +97,7 @@ def test_strict_state_owners_form_still_wins(kanban_home: Path) -> None:
     """The strict ``state_owners={…}`` submit-audit form is still resolved (no
     regression from adding the prose arm)."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="gated card", assignee="eckert")
+        tid = kb.create_task(conn, title="gated card", assignee="eckert", detached=True)
         kb.add_comment(
             conn, tid, author="hollis",
             body=(
@@ -124,7 +124,7 @@ def test_no_pr_card_with_prose_review_owner_moves_to_review(kanban_home: Path) -
             title="stamp SOUL block in place",
             assignee="eckert",
             body="# Why\nfoo\n\n# Scope\n" + _PROSE_MAP_FULL,
-            workspace_kind="scratch",
+            workspace_kind="scratch", detached=True,
         )
         kb.claim_task(conn, tid)
         assert kb.get_task(conn, tid).status == "running"
@@ -143,7 +143,7 @@ def test_no_pr_card_with_prose_review_owner_does_not_reach_done(kanban_home: Pat
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="edit in place", assignee="eckert",
-            body="# Scope\n" + _PROSE_MAP_FULL, workspace_kind="scratch",
+            body="# Scope\n" + _PROSE_MAP_FULL, workspace_kind="scratch", detached=True,
         )
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, summary="edited in place")
@@ -172,7 +172,7 @@ def test_no_pr_eligible_card_without_review_owner_is_refused(kanban_home: Path) 
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="edit in place, malformed routing", assignee="eckert",
-            body="# Scope\n" + _PROSE_MAP_NO_REVIEW, workspace_kind="scratch",
+            body="# Scope\n" + _PROSE_MAP_NO_REVIEW, workspace_kind="scratch", detached=True,
         )
         kb.claim_task(conn, tid)
 
@@ -190,7 +190,7 @@ def test_no_pr_eligible_refusal_emits_audit_event(kanban_home: Path) -> None:
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="edit in place, malformed routing", assignee="eckert",
-            body="# Scope\n" + _PROSE_MAP_NO_REVIEW, workspace_kind="scratch",
+            body="# Scope\n" + _PROSE_MAP_NO_REVIEW, workspace_kind="scratch", detached=True,
         )
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, summary="no review lane declared")
@@ -211,7 +211,7 @@ def test_merge_override_bypasses_no_pr_refusal(kanban_home: Path) -> None:
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="edit in place", assignee="eckert",
-            body="# Scope\n" + _PROSE_MAP_NO_REVIEW, workspace_kind="scratch",
+            body="# Scope\n" + _PROSE_MAP_NO_REVIEW, workspace_kind="scratch", detached=True,
         )
         kb.claim_task(conn, tid)
 
@@ -233,7 +233,7 @@ def test_plain_scratch_card_no_map_still_completes_to_done(kanban_home: Path) ->
     genuinely review-EXEMPT — the refusal/redirect must NOT fire; it completes to
     ``done`` (the dispatcher/system-bookkeeping and legacy-test population)."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="bookkeeping tick", assignee="salton")
+        tid = kb.create_task(conn, title="bookkeeping tick", assignee="salton", detached=True)
         kb.claim_task(conn, tid)
 
         assert kb.complete_task(conn, tid, summary="done, no review needed") is True
@@ -247,7 +247,7 @@ def test_body_without_routing_map_is_not_eligible(kanban_home: Path) -> None:
         tid = kb.create_task(
             conn, title="scratch", assignee="salton",
             body="# Why\nfix the thing. config = {a: 1, b: 2}\n",
-            workspace_kind="scratch",
+            workspace_kind="scratch", detached=True,
         )
         kb.claim_task(conn, tid)
 
@@ -266,15 +266,15 @@ def test_card_is_review_eligible_predicate(kanban_home: Path) -> None:
     with kb.connect() as conn:
         prose = kb.create_task(
             conn, title="prose map", assignee="eckert",
-            body="# Scope\n" + _PROSE_MAP_FULL, workspace_kind="scratch",
+            body="# Scope\n" + _PROSE_MAP_FULL, workspace_kind="scratch", detached=True,
         )
         assert kb._card_is_review_eligible(conn, prose) is True
 
         worktree = kb.create_task(
             conn, title="worktree card", assignee="eckert",
-            workspace_kind="worktree", workspace_path="/Users/x/src/repo",
+            workspace_kind="worktree", workspace_path="/Users/x/src/repo", detached=True,
         )
         assert kb._card_is_review_eligible(conn, worktree) is True
 
-        plain = kb.create_task(conn, title="bookkeeping", assignee="salton")
+        plain = kb.create_task(conn, title="bookkeeping", assignee="salton", detached=True)
         assert kb._card_is_review_eligible(conn, plain) is False

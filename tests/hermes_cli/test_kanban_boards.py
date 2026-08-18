@@ -281,7 +281,7 @@ class TestBoardCRUD:
         kb.create_board("recycle")
         # First connect populates _INITIALIZED_PATHS for this DB.
         with kb.connect(board="recycle") as conn:
-            kb.create_task(conn, title="t1", assignee="dev")
+            kb.create_task(conn, title="t1", assignee="dev", detached=True)
         db_path = kb.board_dir("recycle") / "kanban.db"
         assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
 
@@ -320,11 +320,11 @@ class TestConnectionIsolation:
         kb.create_board("beta")
 
         with kb.connect(board="alpha") as conn:
-            kb.create_task(conn, title="alpha-task-1", assignee="dev")
-            kb.create_task(conn, title="alpha-task-2", assignee="dev")
+            kb.create_task(conn, title="alpha-task-1", assignee="dev", detached=True)
+            kb.create_task(conn, title="alpha-task-2", assignee="dev", detached=True)
 
         with kb.connect(board="beta") as conn:
-            kb.create_task(conn, title="beta-only", assignee="dev")
+            kb.create_task(conn, title="beta-only", assignee="dev", detached=True)
 
         with kb.connect(board="alpha") as conn:
             a = kb.list_tasks(conn)
@@ -341,7 +341,7 @@ class TestConnectionIsolation:
         kb.create_board("curr")
         kb.set_current_board("curr")
         with kb.connect() as conn:
-            kb.create_task(conn, title="implicit", assignee="x")
+            kb.create_task(conn, title="implicit", assignee="x", detached=True)
         with kb.connect(board="curr") as conn:
             tasks = kb.list_tasks(conn)
         assert [t.title for t in tasks] == ["implicit"]
@@ -352,7 +352,7 @@ class TestConnectionIsolation:
         kb.set_current_board("persist")
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "envwin")
         with kb.connect() as conn:
-            kb.create_task(conn, title="via-env", assignee="x")
+            kb.create_task(conn, title="via-env", assignee="x", detached=True)
         with kb.connect(board="envwin") as conn:
             assert [t.title for t in kb.list_tasks(conn)] == ["via-env"]
         with kb.connect(board="persist") as conn:
@@ -368,7 +368,7 @@ class TestConnectionIsolation:
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "ephemeral")
 
         with kb.connect() as conn:
-            kb.create_task(conn, title="via-fallback", assignee="x")
+            kb.create_task(conn, title="via-fallback", assignee="x", detached=True)
 
         with kb.connect(board="persist") as conn:
             assert [t.title for t in kb.list_tasks(conn)] == ["via-fallback"]
@@ -514,9 +514,9 @@ class TestCLI:
         assert _cli(["boards", "create", "projB"], env_extra=env).returncode == 0
 
         # Create one task on each via --board.
-        r = _cli(["--board", "projA", "create", "Task A", "--assignee", "dev"], env_extra=env)
+        r = _cli(["--board", "projA", "create", "Task A", "--assignee", "dev", "--detached"], env_extra=env)
         assert r.returncode == 0, r.stderr
-        r = _cli(["--board", "projB", "create", "Task B", "--assignee", "dev"], env_extra=env)
+        r = _cli(["--board", "projB", "create", "Task B", "--assignee", "dev", "--detached"], env_extra=env)
         assert r.returncode == 0, r.stderr
 
         # list on each board only shows its own.

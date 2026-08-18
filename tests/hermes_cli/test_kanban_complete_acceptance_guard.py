@@ -54,7 +54,7 @@ _SIGNOFF_REASON = (
 def _stage_acceptance_card(conn, *, reason: str = _SIGNOFF_REASON) -> str:
     """Leave a card in the acceptance lane: ``blocked`` with a sticky
     ``blocked`` event carrying ``reason``, exactly as a reviewer PASS parks it."""
-    tid = kb.create_task(conn, title="feature work", assignee="casey")
+    tid = kb.create_task(conn, title="feature work", assignee="casey", detached=True)
     kb.claim_task(conn, tid)
     assert kb.block_task(
         conn, tid, reason=reason,
@@ -134,7 +134,7 @@ def test_generic_blocked_card_still_completable(kanban_home: Path) -> None:
     generic ``needs_input`` review-required park) is STILL completable via
     ``complete_task`` — the manual-complete-a-stuck-card flow is unchanged."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="genuinely stuck", assignee="eckert")
+        tid = kb.create_task(conn, title="genuinely stuck", assignee="eckert", detached=True)
         kb.claim_task(conn, tid)
         assert kb.block_task(
             conn, tid,
@@ -155,7 +155,7 @@ def test_review_bounce_blocked_card_still_completable(kanban_home: Path) -> None
     must remain completable — the guard keys on the signoff reason, not on
     ``blocked`` status generally."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="bounced back", assignee="eckert")
+        tid = kb.create_task(conn, title="bounced back", assignee="eckert", detached=True)
         kb.claim_task(conn, tid)
         assert kb.block_task(
             conn, tid,

@@ -74,7 +74,7 @@ def _stage_open_pr_card(
     artifact). ``inflate_recurrences`` pre-loads ``block_recurrences`` to model a
     card that churned; ``status`` sets the parked lane (``blocked`` / ``triage``).
     """
-    tid = kb.create_task(conn, title="accepted work needing a revision", assignee=author)
+    tid = kb.create_task(conn, title="accepted work needing a revision", assignee=author, detached=True)
     kb.claim_task(conn, tid)
     # The implementer posts the PR-URL handoff as a COMMENT (this is exactly what
     # check_respawn_guard's active_pr scan reads -- complete_task stores the result
@@ -288,7 +288,7 @@ def test_inner_auto_route_still_works(kanban_home: Path) -> None:
     ``auto_route_review_bounce`` behavior: a review-changes-requested block still
     auto-routes to the author on the housekeeping tick."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="feature work", assignee="eckert")
+        tid = kb.create_task(conn, title="feature work", assignee="eckert", detached=True)
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, result=f"PR opened: {_PR_URL}")
         with kb.write_txn(conn):

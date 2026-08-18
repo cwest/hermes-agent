@@ -84,7 +84,7 @@ def _install_config(monkeypatch, cfg, secret="test-secret"):
 
 
 def _running_task(conn, title="t"):
-    tid = kb.create_task(conn, title=title, assignee="worker")
+    tid = kb.create_task(conn, title=title, assignee="worker", detached=True)
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     assert kb.claim_task(conn, tid, claimer="worker") is not None
@@ -109,7 +109,7 @@ def test_assigned_transition_delivers_chat_ping(tmp_path, monkeypatch):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="assign me", assignee="worker")
+        tid = kb.create_task(conn, title="assign me", assignee="worker", detached=True)
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-1",
             notifier_profile="default",
@@ -151,7 +151,7 @@ def test_assigned_to_casey_renders_ready_for_you_with_pr_url(tmp_path, monkeypat
             conn,
             title="feat: a thing",
             body=f"Ready for merge.\n{pr_url}\n<!-- card:x -->",
-            assignee="worker",
+            assignee="worker", detached=True,
         )
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-1",
@@ -196,7 +196,7 @@ def test_assigned_to_non_casey_stays_generic_reassignment(tmp_path, monkeypatch)
             conn,
             title="feat: another thing",
             body="https://github.com/cwest/hermes-agent/pull/99",
-            assignee="worker",
+            assignee="worker", detached=True,
         )
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-1",

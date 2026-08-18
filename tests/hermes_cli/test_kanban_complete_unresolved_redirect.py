@@ -63,7 +63,7 @@ def _worktree_card_with_pr(conn, *, stamped: bool) -> str:
         title="feature work",
         assignee="eckert",
         workspace_kind="worktree",
-        workspace_path="/Users/x/src/repo",
+        workspace_path="/Users/x/src/repo", detached=True,
     )
     if stamped:
         kb.add_comment(
@@ -188,7 +188,7 @@ def _dir_card_with_pr(conn, *, stamped: bool) -> str:
         title="writing card",
         assignee="orwell",
         workspace_kind="dir",
-        workspace_path="/Users/x/src/cwest.github.io",
+        workspace_path="/Users/x/src/cwest.github.io", detached=True,
     )
     if stamped:
         kb.add_comment(
@@ -286,7 +286,7 @@ def test_scratch_card_without_review_owner_still_done(kanban_home: Path) -> None
     """A plain ``scratch`` task is NOT PR-requiring and has no review lane — the
     refusal must NOT fire; it completes to ``done`` exactly as before."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="scratch task", assignee="salton")
+        tid = kb.create_task(conn, title="scratch task", assignee="salton", detached=True)
         kb.claim_task(conn, tid)
         assert kb.get_task(conn, tid).workspace_kind == "scratch"
 
@@ -300,7 +300,7 @@ def test_dir_card_without_review_owner_still_done(kanban_home: Path) -> None:
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="dir build", assignee="salton",
-            workspace_kind="dir", workspace_path="/Users/x/src/repo",
+            workspace_kind="dir", workspace_path="/Users/x/src/repo", detached=True,
         )
         kb.claim_task(conn, tid)
 
@@ -315,7 +315,7 @@ def test_hermes_home_worktree_without_review_owner_still_done(kanban_home: Path)
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="edit config in place", assignee="salton",
-            workspace_kind="worktree", workspace_path=hermes_dir,
+            workspace_kind="worktree", workspace_path=hermes_dir, detached=True,
         )
         kb.claim_task(conn, tid)
 

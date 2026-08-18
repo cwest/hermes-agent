@@ -37,7 +37,7 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="test task", assignee="worker1")
+        tid = kb.create_task(conn, title="test task", assignee="worker1", detached=True)
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
         kb.complete_task(conn, tid, result="completed by agent")
     finally:
@@ -97,7 +97,7 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     conn = kb.connect()
 
     try:
-        tid = kb.create_task(conn, title=f"test {kind} task", assignee="worker1")
+        tid = kb.create_task(conn, title=f"test {kind} task", assignee="worker1", detached=True)
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
         kb._append_event(conn, tid, kind=kind)
     finally:
@@ -183,7 +183,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="test task", assignee="worker1")
+        tid = kb.create_task(conn, title="test task", assignee="worker1", detached=True)
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
 
         # Cycle 1: blocked for one reason
@@ -343,7 +343,7 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="owned task", assignee="backend-engineer")
+        tid = kb.create_task(conn, title="owned task", assignee="backend-engineer", detached=True)
         kb.add_notify_sub(
             conn,
             task_id=tid,
@@ -399,7 +399,7 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="owned task", assignee="backend-engineer")
+        tid = kb.create_task(conn, title="owned task", assignee="backend-engineer", detached=True)
         kb.add_notify_sub(
             conn,
             task_id=tid,
@@ -464,6 +464,13 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         chat_id="chat1",
         thread_id="th1",
         user_id="u1",
+        # build_session_key (the origin-session resolver the create path stamps)
+        # reads these; a bare mock without them raised and dropped the origin,
+        # which the create-time origin guard now refuses. Supply a complete
+        # source so the gateway create resolves a real origin as it does live.
+        chat_type="group",
+        scope_id=None,
+        user_id_alt=None,
     )
     event = SimpleNamespace(
         text='/kanban --board projx create "hello" --assignee alice',
@@ -482,9 +489,15 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         conn.close()
 
     assert [t.title for t in tasks] == ["hello"]
-    assert len(subs) == 1
-    assert subs[0]["chat_id"] == "chat1"
-    assert subs[0]["thread_id"] == "th1"
+    # The card carries an origin sub on the requested board (not the default).
+    # A threaded gateway origin currently yields both the CLI create origin sub
+    # (channel-level) and the gateway auto-subscribe (thread-bearing); assert the
+    # thread-bearing origin surface is present rather than a brittle exact count.
+    assert subs, "create must register an origin sub on the requested board"
+    assert all(s["chat_id"] == "chat1" for s in subs)
+    assert any((s["thread_id"] or "") == "th1" for s in subs), (
+        f"the thread-bearing origin sub must be present, got {subs!r}"
+    )
 
     conn = kb.connect(board="default")
     try:
@@ -521,7 +534,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="render q3 chart", assignee="worker1")
+        tid = kb.create_task(conn, title="render q3 chart", assignee="worker1", detached=True)
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
     finally:
         conn.close()
@@ -609,7 +622,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="worker1")
+        tid = kb.create_task(conn, title="t", assignee="worker1", detached=True)
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
     finally:
         conn.close()

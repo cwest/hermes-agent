@@ -60,7 +60,7 @@ def client(kanban_home):
 
 
 def _make_task(conn, title="t") -> str:
-    return kb.create_task(conn, title=title)
+    return kb.create_task(conn, title=title, detached=True)
 
 
 # ---------------------------------------------------------------------------

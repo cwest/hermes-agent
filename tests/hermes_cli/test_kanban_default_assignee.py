@@ -42,7 +42,7 @@ def test_unassigned_task_skipped_without_default_assignee(isolated_kanban_home):
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee=None)
+        task_id = kb.create_task(conn, title="t1", assignee=None, detached=True)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
     assert res.skipped_unassigned == [task_id]
@@ -60,7 +60,7 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee=None)
+        task_id = kb.create_task(conn, title="t1", assignee=None, detached=True)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
@@ -96,7 +96,7 @@ def test_dry_run_with_default_assignee_reports_without_mutating(isolated_kanban_
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee=None)
+        task_id = kb.create_task(conn, title="t1", assignee=None, detached=True)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
@@ -117,7 +117,7 @@ def test_whitespace_default_assignee_treated_as_none(isolated_kanban_home):
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee=None)
+        task_id = kb.create_task(conn, title="t1", assignee=None, detached=True)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
@@ -134,7 +134,7 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee="default")
+        task_id = kb.create_task(conn, title="t1", assignee="default", detached=True)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,

@@ -111,7 +111,7 @@ def test_single_reader_is_the_authoritative_implementation():
 
 def test_run_scoped_review_run_reads_true(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="review", assignee="reviewer")
+        tid = kb.create_task(conn, title="review", assignee="reviewer", detached=True)
         _to_review(conn, tid, "reviewer")
         claimed = kb.claim_review_task(conn, tid)
         assert claimed is not None
@@ -121,7 +121,7 @@ def test_run_scoped_review_run_reads_true(kanban_home):
 
 def test_run_scoped_build_run_reads_false(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="build", assignee="builder")
+        tid = kb.create_task(conn, title="build", assignee="builder", detached=True)
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
         run_id = _latest_claimed_run_id(conn, tid)
@@ -133,7 +133,7 @@ def test_history_does_not_leak_a_build_run_into_review(kanban_home):
     classified by its CURRENT run — the build run stays False, the review run
     True — proving the run-scoping, not a task-wide latest read."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="build then review", assignee="worker")
+        tid = kb.create_task(conn, title="build then review", assignee="worker", detached=True)
         kb.claim_task(conn, tid)
         build_run = _latest_claimed_run_id(conn, tid)
         # Release the build run, move to review, claim from review.
@@ -159,7 +159,7 @@ def test_history_does_not_leak_a_build_run_into_review(kanban_home):
 
 def test_latest_fallback_reads_review_when_last_claim_is_review(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="review", assignee="reviewer")
+        tid = kb.create_task(conn, title="review", assignee="reviewer", detached=True)
         _to_review(conn, tid, "reviewer")
         kb.claim_review_task(conn, tid)
         # run_id unknown → falls back to the latest claimed event, which is review.
@@ -168,7 +168,7 @@ def test_latest_fallback_reads_review_when_last_claim_is_review(kanban_home):
 
 def test_latest_fallback_reads_build_when_last_claim_is_build(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="build", assignee="builder")
+        tid = kb.create_task(conn, title="build", assignee="builder", detached=True)
         kb.claim_task(conn, tid)
         assert kb._run_claimed_from_review(conn, tid, None) is False
 
@@ -180,7 +180,7 @@ def test_latest_fallback_reads_build_when_last_claim_is_build(kanban_home):
 
 def test_missing_claimed_event_reads_false(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="no claim yet", assignee="worker")
+        tid = kb.create_task(conn, title="no claim yet", assignee="worker", detached=True)
         # No claim has happened → no claimed event at all.
         assert kb._run_claimed_from_review(conn, tid, None) is False
         assert kb._run_claimed_from_review(conn, tid, 999999) is False
@@ -188,7 +188,7 @@ def test_missing_claimed_event_reads_false(kanban_home):
 
 def test_malformed_payload_reads_false(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="malformed", assignee="worker")
+        tid = kb.create_task(conn, title="malformed", assignee="worker", detached=True)
         # Hand-write a claimed event with a non-JSON payload.
         with kb.write_txn(conn):
             _insert_claimed(conn, tid, "not-json-{", 1)
@@ -198,7 +198,7 @@ def test_malformed_payload_reads_false(kanban_home):
 
 def test_non_review_source_status_reads_false(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="other source", assignee="worker")
+        tid = kb.create_task(conn, title="other source", assignee="worker", detached=True)
         with kb.write_txn(conn):
             _insert_claimed(conn, tid, json.dumps({"source_status": "ready"}), 1)
         assert kb._run_claimed_from_review(conn, tid, 1) is False
@@ -206,7 +206,7 @@ def test_non_review_source_status_reads_false(kanban_home):
 
 def test_non_dict_payload_reads_false(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="list payload", assignee="worker")
+        tid = kb.create_task(conn, title="list payload", assignee="worker", detached=True)
         with kb.write_txn(conn):
             _insert_claimed(conn, tid, json.dumps(["review"]), 1)
         assert kb._run_claimed_from_review(conn, tid, 1) is False
@@ -231,7 +231,7 @@ def test_both_call_sites_agree_across_source_status(kanban_home, source_status, 
     alone carries the contract."""
     payload = {} if source_status is None else {"source_status": source_status}
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="agree", assignee="worker")
+        tid = kb.create_task(conn, title="agree", assignee="worker", detached=True)
         with kb.write_txn(conn):
             _insert_claimed(conn, tid, json.dumps(payload), 1)
         completion_verdict = kb._run_claimed_from_review(conn, tid, 1)

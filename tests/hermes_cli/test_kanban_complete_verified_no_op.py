@@ -65,7 +65,7 @@ def _stage_running_worktree_card(
         title="audit the corpus for drift",
         assignee="easley",
         workspace_kind="worktree",
-        workspace_path=workspace_path,
+        workspace_path=workspace_path, detached=True,
     )
     if with_owner_map:
         kb.add_comment(

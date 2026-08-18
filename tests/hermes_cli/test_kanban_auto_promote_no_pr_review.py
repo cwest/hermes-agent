@@ -96,7 +96,7 @@ def _stage_no_pr_review_block(
     handler's liveness guard (author-pid must be DEAD) passes; ``dead_pid=False``
     stamps THIS process's live pid to exercise the live-pid guard.
     """
-    tid = kb.create_task(conn, title="edit-in-place fix", assignee=author)
+    tid = kb.create_task(conn, title="edit-in-place fix", assignee=author, detached=True)
     if stamp_owner_map:
         _stamp_owner_map(conn, tid, ready=author, review=reviewer)
     claimed = kb.claim_task(conn, tid)

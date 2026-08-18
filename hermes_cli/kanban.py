@@ -344,6 +344,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "was born in). Persisted so a later terminal "
                                "transition can wake that session and report back "
                                "to its origin thread.")
+    p_create.add_argument("--detached", action="store_true", dest="detached",
+                          help="Declare a genuinely origin-less card (no "
+                               "originating session to wake). Required when "
+                               "creating a card without --session-id; otherwise "
+                               "the create is refused so a real filing path "
+                               "cannot silently lose its origin.")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
                                "(repeatable). The kanban lifecycle is already "
@@ -1519,32 +1525,40 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         return 2
     with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            branch_name=branch_name,
-            project_id=getattr(args, "project", None),
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            triage=bool(getattr(args, "triage", False)),
-            kind=getattr(args, "kind", None),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            session_id=getattr(args, "session_id", None) or None,
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
-        )
+        try:
+            task_id = kb.create_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
+                branch_name=branch_name,
+                project_id=getattr(args, "project", None),
+                tenant=args.tenant,
+                priority=args.priority,
+                parents=tuple(args.parent or ()),
+                triage=bool(getattr(args, "triage", False)),
+                kind=getattr(args, "kind", None),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime,
+                skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries,
+                model_override=getattr(args, "model_override", None),
+                provider_override=getattr(args, "provider_override", None),
+                session_id=getattr(args, "session_id", None) or None,
+                detached=bool(getattr(args, "detached", False)),
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                initial_status=getattr(args, "initial_status", "running"),
+            )
+        except ValueError as exc:
+            # Origin guard + other create-time validation (workspace kind,
+            # provider/model pairing, unknown parents). Surface as a clean CLI
+            # error, not a traceback.
+            print(f"kanban create: {exc}", file=sys.stderr)
+            return 2
         # Register the origin notify subscription so every terminal transition of
         # this card wakes back to the session/thread it was born in. Without this
         # a card filed with --session-id records the origin on the task row but

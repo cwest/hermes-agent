@@ -87,7 +87,7 @@ def test_extract_json_blob_returns_none_for_unparseable():
 
 def test_specify_task_happy_path(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="rough", triage=True)
+        tid = kb.create_task(conn, title="rough", triage=True, detached=True)
 
     content = jsonlib.dumps({
         "title": "Refined rough",
@@ -111,7 +111,7 @@ def test_specify_task_happy_path(kanban_home):
 
 def test_specify_task_falls_back_to_body_only_on_bad_json(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="keep title", triage=True)
+        tid = kb.create_task(conn, title="keep title", triage=True, detached=True)
 
     # Model returned plain markdown, no JSON object.
     content = "Goal: Do a thing.\nApproach: Steps here."
@@ -130,7 +130,7 @@ def test_specify_task_falls_back_to_body_only_on_bad_json(kanban_home):
 
 def test_specify_task_rejects_non_triage_task(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="ready task")
+        tid = kb.create_task(conn, title="ready task", detached=True)
 
     p, client = _patch_aux_client("unused")
     with p:
@@ -153,7 +153,7 @@ def test_specify_task_unknown_id(kanban_home):
 
 def test_specify_task_no_aux_client_configured(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="rough", triage=True)
+        tid = kb.create_task(conn, title="rough", triage=True, detached=True)
 
     with patch(
         "agent.auxiliary_client.call_llm",
@@ -171,7 +171,7 @@ def test_specify_task_no_aux_client_configured(kanban_home):
 
 def test_specify_task_llm_api_error_keeps_task_in_triage(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="rough", triage=True)
+        tid = kb.create_task(conn, title="rough", triage=True, detached=True)
 
     client = MagicMock()
     with patch(
@@ -188,7 +188,7 @@ def test_specify_task_llm_api_error_keeps_task_in_triage(kanban_home):
 
 def test_specify_task_empty_llm_response(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="rough", triage=True)
+        tid = kb.create_task(conn, title="rough", triage=True, detached=True)
 
     p, _ = _patch_aux_client("")
     with p:
@@ -201,9 +201,9 @@ def test_specify_task_empty_llm_response(kanban_home):
 
 def test_list_triage_ids(kanban_home):
     with kb.connect() as conn:
-        a = kb.create_task(conn, title="a", triage=True)
-        b = kb.create_task(conn, title="b", triage=True, tenant="proj-1")
-        kb.create_task(conn, title="c")  # not triage — excluded
+        a = kb.create_task(conn, title="a", triage=True, detached=True)
+        b = kb.create_task(conn, title="b", triage=True, tenant="proj-1", detached=True)
+        kb.create_task(conn, title="c", detached=True)  # not triage — excluded
 
     ids_all = spec.list_triage_ids()
     assert set(ids_all) == {a, b}
@@ -233,7 +233,7 @@ def test_cli_specify_requires_id_or_all(kanban_home, capsys):
 
 def test_cli_specify_rejects_both_id_and_all(kanban_home, capsys):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="rough", triage=True)
+        tid = kb.create_task(conn, title="rough", triage=True, detached=True)
     rc = _run_cli("specify", tid, "--all")
     assert rc == 2
     err = capsys.readouterr().err
@@ -242,7 +242,7 @@ def test_cli_specify_rejects_both_id_and_all(kanban_home, capsys):
 
 def test_cli_specify_single_id_success(kanban_home, capsys):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="rough", triage=True)
+        tid = kb.create_task(conn, title="rough", triage=True, detached=True)
 
     content = jsonlib.dumps({"title": "clean", "body": "body"})
     p, _ = _patch_aux_client(content)
@@ -256,8 +256,8 @@ def test_cli_specify_single_id_success(kanban_home, capsys):
 
 def test_cli_specify_all_success_and_json(kanban_home, capsys):
     with kb.connect() as conn:
-        a = kb.create_task(conn, title="a", triage=True)
-        b = kb.create_task(conn, title="b", triage=True)
+        a = kb.create_task(conn, title="a", triage=True, detached=True)
+        b = kb.create_task(conn, title="b", triage=True, detached=True)
 
     content = jsonlib.dumps({"title": "spec", "body": "body"})
     p, _ = _patch_aux_client(content)
@@ -281,8 +281,8 @@ def test_cli_specify_all_empty_triage_column(kanban_home, capsys):
 
 def test_cli_specify_all_returns_1_when_every_task_fails(kanban_home, capsys):
     with kb.connect() as conn:
-        kb.create_task(conn, title="a", triage=True)
-        kb.create_task(conn, title="b", triage=True)
+        kb.create_task(conn, title="a", triage=True, detached=True)
+        kb.create_task(conn, title="b", triage=True, detached=True)
 
     with patch(
         "agent.auxiliary_client.call_llm",
@@ -295,9 +295,9 @@ def test_cli_specify_all_returns_1_when_every_task_fails(kanban_home, capsys):
 
 def test_cli_specify_tenant_filter(kanban_home, capsys):
     with kb.connect() as conn:
-        outside = kb.create_task(conn, title="outside", triage=True)
+        outside = kb.create_task(conn, title="outside", triage=True, detached=True)
         inside = kb.create_task(
-            conn, title="inside", triage=True, tenant="proj-a",
+            conn, title="inside", triage=True, tenant="proj-a", detached=True,
         )
 
     content = jsonlib.dumps({"title": "spec", "body": "body"})
@@ -322,7 +322,7 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
 
 def test_cli_specify_author_passed_through(kanban_home, capsys):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="rough", triage=True)
+        tid = kb.create_task(conn, title="rough", triage=True, detached=True)
 
     content = jsonlib.dumps({"title": "fresh title", "body": "fresh body"})
     p, _ = _patch_aux_client(content)

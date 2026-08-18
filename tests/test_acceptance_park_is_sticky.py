@@ -24,21 +24,21 @@ def _park(c, task_id, by):
 
 def test_accept_card_park_is_sticky(conn):
     """accept_card is the real acceptance verb; its park must not auto-recover."""
-    t = kanban_db.create_task(conn, title="accepted card")
+    t = kanban_db.create_task(conn, title="accepted card", detached=True)
     _park(conn, t, "onecard:accept_card")
     assert kanban_db._has_sticky_block(conn, t) is True
 
 
 def test_move_card_park_still_sticky(conn):
     """Regression guard: the original move_card path keeps working."""
-    t = kanban_db.create_task(conn, title="moved card")
+    t = kanban_db.create_task(conn, title="moved card", detached=True)
     _park(conn, t, "onecard:move_card")
     assert kanban_db._has_sticky_block(conn, t) is True
 
 
 def test_move_back_to_ready_clears_stickiness(conn):
     """A deliberate move out of blocked still clears it."""
-    t = kanban_db.create_task(conn, title="unparked card")
+    t = kanban_db.create_task(conn, title="unparked card", detached=True)
     _park(conn, t, "onecard:accept_card")
     kanban_db._append_event(
         conn, t, "status_changed", {"to": "ready", "by": "onecard:move_card"}

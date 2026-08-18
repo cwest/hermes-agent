@@ -56,7 +56,7 @@ def test_hooks_are_registered_as_valid():
 def test_claim_fires_hook(kanban_home, captured_hooks):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="worker")
+        tid = kb.create_task(conn, title="t", assignee="worker", detached=True)
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
     finally:
@@ -73,7 +73,7 @@ def test_claim_fires_hook(kanban_home, captured_hooks):
 def test_complete_fires_hook_with_summary(kanban_home, captured_hooks):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="worker")
+        tid = kb.create_task(conn, title="t", assignee="worker", detached=True)
         kb.claim_task(conn, tid)
         assert kb.complete_task(conn, tid, summary="all done")
     finally:
@@ -89,7 +89,7 @@ def test_complete_fires_hook_with_summary(kanban_home, captured_hooks):
 def test_block_fires_hook_with_reason(kanban_home, captured_hooks):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="worker")
+        tid = kb.create_task(conn, title="t", assignee="worker", detached=True)
         kb.claim_task(conn, tid)
         assert kb.block_task(conn, tid, reason="needs human")
     finally:
@@ -124,7 +124,7 @@ def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
     try:
         conn = kb.connect()
         try:
-            tid = kb.create_task(conn, title="t", assignee="worker")
+            tid = kb.create_task(conn, title="t", assignee="worker", detached=True)
             kb.claim_task(conn, tid)
             # Despite the raising hook, completion succeeds and persists.
             assert kb.complete_task(conn, tid, summary="ok") is True

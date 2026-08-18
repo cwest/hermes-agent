@@ -47,7 +47,7 @@ def seed_tasks(conn, kb, n, assignee="bench-worker", with_parents=False):
             parents = ()
         tid = kb.create_task(
             conn, title=f"bench {i}", assignee=assignee,
-            tenant="bench", parents=parents,
+            tenant="bench", parents=parents, detached=True,
         )
         ids.append(tid)
     return ids
@@ -118,7 +118,7 @@ def main():
         # Create parents, complete them with summaries+metadata
         parent_ids = []
         for i in range(parent_count):
-            pid = kb.create_task(conn, title=f"parent {i}", assignee="p")
+            pid = kb.create_task(conn, title=f"parent {i}", assignee="p", detached=True)
             kb.claim_task(conn, pid)
             kb.complete_task(
                 conn, pid,
@@ -128,7 +128,7 @@ def main():
             )
             parent_ids.append(pid)
         child_id = kb.create_task(
-            conn, title="child", assignee="c", parents=parent_ids,
+            conn, title="child", assignee="c", parents=parent_ids, detached=True,
         )
         r = bench(
             f"build_worker_context (parents={parent_count})",
@@ -186,7 +186,7 @@ def main():
         kb._INITIALIZED_PATHS.clear()
         kb.init_db()
         conn = kb.connect()
-        tid = kb.create_task(conn, title="x", assignee="w")
+        tid = kb.create_task(conn, title="x", assignee="w", detached=True)
         # Create N attempts via claim/release
         for i in range(n):
             kb.claim_task(conn, tid, ttl_seconds=0)

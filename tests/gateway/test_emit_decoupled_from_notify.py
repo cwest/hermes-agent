@@ -43,7 +43,7 @@ def _mk_task_with_sub(conn):
         title="test: decouple emit from notify",
         body="# Why\nx\n# What\nx\n# Done when\nx\n# Scope\nx\n",
         assignee="eckert",
-        initial_status="running",
+        initial_status="running", detached=True,
     )
     # Register a subscription for the origin thread.
     conn.execute(

@@ -64,7 +64,7 @@ def _stage_running_worktree_card(
         title="feature work",
         assignee="eckert",
         workspace_kind=workspace_kind,
-        workspace_path=workspace_path,
+        workspace_path=workspace_path, detached=True,
     )
     kb.claim_task(conn, tid)
     assert kb.get_task(conn, tid).status == "running"
@@ -170,7 +170,7 @@ def test_complete_allows_scratch_card_without_pr(kanban_home: Path) -> None:
     """A ``scratch`` (no git worktree) card is NOT PR-requiring and completes
     with no PR — the default, most common card shape is unchanged."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="scratch task", assignee="salton")
+        tid = kb.create_task(conn, title="scratch task", assignee="salton", detached=True)
         kb.claim_task(conn, tid)
         assert kb.get_task(conn, tid).workspace_kind == "scratch"
 
@@ -187,7 +187,7 @@ def test_complete_allows_edit_in_place_hermes_home_card(kanban_home: Path) -> No
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="edit config in place", assignee="salton",
-            workspace_kind="worktree", workspace_path=hermes_dir,
+            workspace_kind="worktree", workspace_path=hermes_dir, detached=True,
         )
         kb.claim_task(conn, tid)
 

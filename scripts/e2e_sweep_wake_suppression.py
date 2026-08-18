@@ -70,7 +70,7 @@ def main() -> int:
     try:
         # 1. The sweep card, given a REAL non-Home origin sub, to prove suppression
         #    is by CARD CLASS, not merely the no-origin fallback path.
-        sweep_tid = kb.create_task(conn, title=SWEEP_TITLE, assignee="avram")
+        sweep_tid = kb.create_task(conn, title=SWEEP_TITLE, assignee="avram", detached=True)
         kb.add_notify_sub(
             conn, task_id=sweep_tid, platform="discord",
             chat_id=RESEARCH_CHANNEL, notifier_profile="default",
@@ -79,7 +79,7 @@ def main() -> int:
 
         # 2. A no-origin card whose ONLY sub is the thread-less Home-fallback sub
         #    (exactly what the notifier persists for a sub-less transition).
-        noorigin_tid = kb.create_task(conn, title=NOORIGIN_TITLE, assignee="worker")
+        noorigin_tid = kb.create_task(conn, title=NOORIGIN_TITLE, assignee="worker", detached=True)
         kb.add_notify_sub(
             conn, task_id=noorigin_tid, platform="discord",
             chat_id=HOME, notifier_profile="default",
@@ -87,7 +87,7 @@ def main() -> int:
         kb.block_task(conn, noorigin_tid, reason="no human origin")
 
         # 3. A real #research-thread-origin card: MUST still wake its origin.
-        synopsis_tid = kb.create_task(conn, title=SYNOPSIS_TITLE, assignee="avram")
+        synopsis_tid = kb.create_task(conn, title=SYNOPSIS_TITLE, assignee="avram", detached=True)
         kb.add_notify_sub(
             conn, task_id=synopsis_tid, platform="discord",
             chat_id=RESEARCH_CHANNEL, thread_id=RESEARCH_THREAD,

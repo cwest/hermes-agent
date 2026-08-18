@@ -100,7 +100,7 @@ def test_e2e_inherited_origin_wake_targets_human_thread(home, monkeypatch):
     # 1) A human-origin card exists with its origin notify-sub (the workstream root).
     conn = kb.connect()
     try:
-        root_tid = kb.create_task(conn, title="root", assignee="peer")
+        root_tid = kb.create_task(conn, title="root", assignee="peer", detached=True)
         kb.add_notify_sub(
             conn, task_id=root_tid, platform="discord", chat_id="HUMAN_CHAN",
             thread_id="HUMAN_THREAD", user_id="HUMAN_USER", notifier_profile="p",
@@ -149,7 +149,7 @@ def test_e2e_reassigned_origin_wake_targets_new_thread(home, monkeypatch):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="fork-me", assignee="peer")
+        tid = kb.create_task(conn, title="fork-me", assignee="peer", detached=True)
         kb.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id="CHAN",
             thread_id="OLD_THREAD", notifier_profile="p",

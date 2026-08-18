@@ -53,7 +53,7 @@ def _make_runner(adapter):
 def _create_completed_subscription(summary="done once"):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="notify once", assignee="worker")
+        tid = kb.create_task(conn, title="notify once", assignee="worker", detached=True)
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         kb.complete_task(conn, tid, summary=summary)
         return tid
@@ -135,7 +135,7 @@ def test_kanban_db_path_is_test_isolated_from_real_home():
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(conn, title="x", assignee="worker", detached=True)
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
     finally:
         conn.close()
@@ -410,7 +410,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="cycle test", assignee="worker")
+        tid = kb.create_task(conn, title="cycle test", assignee="worker", detached=True)
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         # First crash — fired by the dispatcher when the worker PID dies.
         kb._append_event(conn, tid, kind="crashed")
@@ -473,7 +473,7 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="owned by beta", assignee="worker")
+        tid = kb.create_task(conn, title="owned by beta", assignee="worker", detached=True)
         # Subscription is owned by profile "beta".
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-beta",

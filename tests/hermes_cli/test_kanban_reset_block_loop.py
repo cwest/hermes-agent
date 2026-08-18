@@ -53,7 +53,7 @@ def _blocked_with_recurrences(conn, *, recurrences: int, assignee: str = "eckert
     lane. Emits a real ``blocked`` event carrying ``reason`` so the sticky-reason
     detectors see a genuine block.
     """
-    tid = kb.create_task(conn, title="stuck card", assignee=assignee)
+    tid = kb.create_task(conn, title="stuck card", assignee=assignee, detached=True)
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET status='blocked', block_recurrences=?, block_kind='needs_input' "
@@ -167,7 +167,7 @@ def test_same_finding_loop_still_escalates_to_triage(kanban_home: Path) -> None:
     cause (no reset) escalates to triage exactly as before — the recovery path does
     not weaken the breaker."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="genuinely looping", assignee="eckert")
+        tid = kb.create_task(conn, title="genuinely looping", assignee="eckert", detached=True)
         landed = None
         for _ in range(kb.BLOCK_RECURRENCE_LIMIT + 1):
             kb.claim_task(conn, tid)
@@ -191,7 +191,7 @@ def _stage_bounce_with_prior_different_finding(conn, *, author="eckert", reviewe
                                                recurrences: int = 3) -> str:
     """A review-bounce card whose current sticky finding DIFFERS from the prior
     round's finding, with an inflated counter — the genuine author-rework case."""
-    tid = kb.create_task(conn, title="feature work", assignee=author)
+    tid = kb.create_task(conn, title="feature work", assignee=author, detached=True)
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='blocked', assignee=?, block_recurrences=? "
                      "WHERE id=?", (reviewer, recurrences, tid))
@@ -244,7 +244,7 @@ def test_auto_route_preserves_counter_on_same_finding(kanban_home: Path) -> None
         author, reviewer = "eckert", "lamport"
         same = ("review-changes-requested: finding ALPHA unchanged; "
                 "see https://github.com/cwest/hermes-agent/pull/71")
-        tid = kb.create_task(conn, title="feature work", assignee=author)
+        tid = kb.create_task(conn, title="feature work", assignee=author, detached=True)
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='blocked', assignee=?, block_recurrences=1 "
                          "WHERE id=?", (reviewer, tid))
@@ -314,7 +314,7 @@ def test_cli_unblock_reset_loop_recovers_card_stuck_in_triage(
     subsequent normal cycle no longer re-trips to triage."""
     from hermes_cli import kanban as kb_cli
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="stuck in triage", assignee="eckert")
+        tid = kb.create_task(conn, title="stuck in triage", assignee="eckert", detached=True)
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status='triage', block_recurrences=5 WHERE id=?", (tid,)
@@ -376,7 +376,7 @@ def _triage_with_open_pr(conn, *, assignee: str = "orwell",
     """
     if recurrences is None:
         recurrences = kb.BLOCK_RECURRENCE_LIMIT
-    tid = kb.create_task(conn, title="writing card, casey feedback", assignee=assignee)
+    tid = kb.create_task(conn, title="writing card, casey feedback", assignee=assignee, detached=True)
     now = int(time.time())
     with kb.write_txn(conn):
         conn.execute(
@@ -444,8 +444,8 @@ def test_unblock_from_triage_rechecks_parent_gate(kanban_home: Path) -> None:
     when unblocked — the same parent-completion invariant unblock_task enforces
     for blocked/scheduled cards applies to the triage path too."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent", assignee="a")
-        child = kb.create_task(conn, title="child", assignee="a", parents=[parent])
+        parent = kb.create_task(conn, title="parent", assignee="a", detached=True)
+        child = kb.create_task(conn, title="child", assignee="a", parents=[parent], detached=True)
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (child,))
         # Parent still open -> child unblocks to 'todo', not 'ready'.
