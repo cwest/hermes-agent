@@ -1,7 +1,7 @@
 # Spec: Refuse to create a card with no resolvable origin
 
 Status: design gate approved via card body; TDD in progress
-Base: `cwest/integration` @ `252151c33`
+Base: `cwest/integration` @ `7a9f2e91e` (#128)
 Card: t_b76d0836
 Scope: make an origin-less card **impossible to create** at the one
 `kanban_db.create_task` chokepoint every filing path funnels through — reject a
@@ -13,9 +13,11 @@ marker. This is the "impossible by construction" half of the origin fix; PR #127
 ## 1. Ground truth (verified against HEAD)
 
 - `create_task(conn, *, ..., session_id: Optional[str] = None, ...)` passes
-  `session_id` straight through to the `INSERT` with **no** resolution and **no**
-  guard (`hermes_cli/kanban_db.py`). A card filed with `session_id=None`/`""` is
-  created successfully and silently.
+  `session_id` straight through to the `INSERT` with **no guard** — a card filed
+  with `session_id=None`/`""` and no ambient origin is created successfully and
+  silently (`hermes_cli/kanban_db.py`). #128 added ambient origin *resolution*
+  (`_resolve_created_origin()`) for the `created` event payload, but it only
+  records the resolved origin — it does not refuse a card that resolves none.
 - The `tasks.session_id` column IS the card's stamped origin (per its schema
   comment: "originating agent/chat session id ... Lets clients render a
   per-session board"). `parse_origin_session` turns that string into the origin
@@ -39,16 +41,29 @@ structurally broken card. That fix moved the *owner map* guarantee into
 
 ### 2.1 The marker is a per-call keyword `detached: bool = False`
 
-`create_task` gains `detached: bool = False`. The guard:
+`create_task` gains `detached: bool = False`. The guard resolves an origin from
+BOTH the explicit `session_id` kwarg AND the ambient surface — the same origin
+#128's `created` event records (an inherited `HERMES_KANBAN_ORIGIN` across a
+spawn boundary, or a live `HERMES_SESSION_*` capture) — via the shared
+`_resolve_created_origin()` helper, and refuses only when neither yields an
+origin and `detached` is unset:
 
 ```python
-if not (session_id and session_id.strip()) and not detached:
+session_id = (session_id or "").strip() or None
+created_origin = _resolve_created_origin()
+_has_ambient_origin = created_origin.get("origin_source") != "none"
+if session_id is None and not _has_ambient_origin and not detached:
     raise ValueError(
-        "create_task: no resolvable origin — pass session_id=<origin> or "
-        "detached=True for a genuinely origin-less context (test, cron, "
-        "detached CLI, dashboard, diagnostic script)."
+        "create_task: no resolvable origin — pass session_id=<origin> so the "
+        "card can wake its originating session, file it from a live/inherited "
+        "gateway session, or pass detached=True for a genuinely origin-less "
+        "context (test, cron, detached CLI, dashboard, diagnostic script)."
     )
 ```
+
+The `created_origin` resolution is computed once here and threaded down to the
+`created` event payload, so the origin the guard checks and the origin the event
+records can never drift.
 
 **Why a keyword, NOT an env var / module-global default.** The card's own
 constraint: the legitimate origin-less contexts "need an explicit opt-out marker
@@ -74,14 +89,24 @@ intended, auditable outcome.
 
 ### 2.3 "Resolves no origin" is evaluated at the chokepoint
 
-`create_task` does not read env or ContextVars to resolve origin — `session_id`
-is purely the passed argument. So "resolves no origin" at the chokepoint means
-`session_id` is falsy (None / empty / whitespace). Callers that resolve origin
-from richer sources (the `kanban_create` tool folds
-`args → _current_origin_session_id() → HERMES_SESSION_ID`) do that resolution
-BEFORE calling and pass the result as `session_id`; the chokepoint sees only the
-resolved value. This keeps the guard a pure function of its arguments — no hidden
-ambient state, matching §2.1's anti-silent-default posture.
+`create_task` resolves an origin from two sources: the explicit `session_id`
+argument AND the ambient surface (`HERMES_KANBAN_ORIGIN` inherited across a spawn
+boundary → live `HERMES_SESSION_*` capture), read through the shared
+`_resolve_created_origin()` helper — the same resolution #128's `created` event
+uses. So "resolves no origin" at the chokepoint means `session_id` is falsy
+(None / empty / whitespace) AND the ambient resolution yields nothing
+(`origin_source == "none"`). A card filed inside a live gateway session, or one
+that inherited a human origin across a spawn boundary, therefore has a routable
+origin and passes the guard with no `session_id` kwarg — refusing it would be a
+regression against #128.
+
+Callers that resolve origin from richer sources (the `kanban_create` tool folds
+`args → _current_origin_session_id() → HERMES_SESSION_ID`) still do that
+resolution BEFORE calling and pass the result as `session_id`; the guard honors
+an explicit kwarg first and falls back to the ambient surface only when the
+kwarg is absent. Consulting the ambient surface here is deliberate — it makes the
+guard agree with the origin the `created` event records, rather than a narrower
+argument-only view that would refuse cards #128 considers origin-bearing.
 
 ## 3. In-tree callers (each supplies an origin or declares detached)
 
