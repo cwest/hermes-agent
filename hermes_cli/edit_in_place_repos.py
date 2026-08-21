@@ -31,7 +31,29 @@ from __future__ import annotations
 
 from pathlib import Path
 
-__all__ = ["edit_in_place_roots", "is_edit_in_place_root"]
+__all__ = [
+    "edit_in_place_roots",
+    "is_edit_in_place_root",
+    "WorkspaceFilingError",
+]
+
+
+class WorkspaceFilingError(ValueError):
+    """A DETERMINISTIC workspace mis-filing — never a transient failure.
+
+    Raised when a card's declared workspace is a contradiction that no retry can
+    resolve: the canonical case is a ``workspace_kind='worktree'`` card aimed at
+    an edit-in-place repo ROOT (``~/.hermes`` — the live install), which is the
+    deploy target itself and must be edited in place, not from an isolated
+    worktree/branch. Attempt N+1 is guaranteed to fail identically.
+
+    It subclasses :class:`ValueError` so every existing ``except ValueError`` /
+    ``except Exception`` caller is unaffected — the resolver still refuses loudly.
+    The dedicated type only lets the dispatcher CLASSIFY the refusal (by type,
+    not by matching a message string): a filing error must NOT decrement the
+    retry budget or emit a false ``gave_up`` "retries exhausted" alarm; it is
+    surfaced once as a cleanly-blocked card naming the correct filing.
+    """
 
 
 def edit_in_place_roots() -> frozenset[Path]:
