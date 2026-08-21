@@ -63,7 +63,7 @@ def _stage_review_bounce(conn, *, author: str = "eckert", reviewer: str = "lampo
     review``) -> reviewer emits the clean bounce ``kanban_block``. Returns the card id
     left in ``blocked`` + reviewer, exactly as the dispatcher would see it.
     """
-    tid = kb.create_task(conn, title="feature work", assignee=author)
+    tid = kb.create_task(conn, title="feature work", assignee=author, detached=True)
     # Author's build run.
     kb.claim_task(conn, tid)
     kb.complete_task(conn, tid, result="PR opened: https://github.com/cwest/hermes-agent/pull/71")
@@ -216,7 +216,7 @@ def test_non_review_block_does_not_route(kanban_home: Path) -> None:
     """A block whose reason is NOT a review-changes-requested bounce (e.g. a generic
     operator block) must be left untouched by the auto-router."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="needs human", assignee="eckert")
+        tid = kb.create_task(conn, title="needs human", assignee="eckert", detached=True)
         kb.claim_task(conn, tid)
         kb.block_task(conn, tid, reason="review-required: please verify ACL change",
                       expected_run_id=kb.get_task(conn, tid).current_run_id)
@@ -231,7 +231,7 @@ def test_circuit_breaker_block_does_not_route(kanban_home: Path) -> None:
     """A circuit-breaker block (``gave_up`` event, no ``blocked`` event) must not be
     treated as a review bounce."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="flaky", assignee="eckert")
+        tid = kb.create_task(conn, title="flaky", assignee="eckert", detached=True)
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
             conn.execute(
@@ -280,7 +280,7 @@ def _stage_needs_input_bounce_unresolvable_author(
     route this card is the card's stamped ``state_owners[ready]`` owner map. The
     reviewer's terminal block is ``kind='needs_input'`` (the live shape).
     """
-    tid = kb.create_task(conn, title="feature work", assignee=author)
+    tid = kb.create_task(conn, title="feature work", assignee=author, detached=True)
     _stamp_owner_map(conn, tid, ready=author, review=reviewer)
     kb.claim_task(conn, tid)
     kb.complete_task(
@@ -335,7 +335,7 @@ def test_needs_input_non_bounce_block_stays_parked(kanban_home: Path) -> None:
     is a genuine human-input block and must STAY ``blocked`` -- even when the card
     carries a stamped owner map (routing keys on the reason prefix, not the kind)."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="needs a human call", assignee="lamport")
+        tid = kb.create_task(conn, title="needs a human call", assignee="lamport", detached=True)
         _stamp_owner_map(conn, tid, ready="eckert", review="lamport")
         kb.claim_task(conn, tid)
         kb.block_task(

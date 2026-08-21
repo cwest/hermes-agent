@@ -108,7 +108,7 @@ def test_dir_edit_in_place_root_resolves_in_place_not_worktree(kanban_home, tmp_
             conn,
             title="chore(config): edit the live install",
             workspace_kind="dir",
-            workspace_path=str(kanban_home),
+            workspace_path=str(kanban_home), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -132,7 +132,7 @@ def test_dir_edit_in_place_root_persists_no_branch_name(kanban_home, tmp_path):
             title="chore(config): edit the live install",
             assignee="easley",
             workspace_kind="dir",
-            workspace_path=str(kanban_home),
+            workspace_path=str(kanban_home), detached=True,
         )
         # Resolve directly (no dispatch needed) to inspect the persisted row.
         task = kb.get_task(conn, tid)
@@ -161,7 +161,7 @@ def test_dir_edit_in_place_root_guard_does_not_run_on_detached_head(
             conn,
             title="chore(config): edit with detached head",
             workspace_kind="dir",
-            workspace_path=str(kanban_home),
+            workspace_path=str(kanban_home), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -191,7 +191,7 @@ def test_dispatch_edit_in_place_dir_hands_worker_in_place_no_branch(
             title="chore(config): a card that used to open an unwanted PR",
             assignee="easley",
             workspace_kind="dir",
-            workspace_path=str(kanban_home),
+            workspace_path=str(kanban_home), detached=True,
         )
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         conn.commit()
@@ -227,7 +227,7 @@ def test_worktree_kind_on_edit_in_place_root_is_refused(kanban_home, tmp_path):
             conn,
             title="worktree card wrongly aimed at the live install",
             workspace_kind="worktree",
-            workspace_path=str(kanban_home),
+            workspace_path=str(kanban_home), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -250,7 +250,7 @@ def test_dir_non_edit_in_place_repo_root_still_redirects(kanban_home, tmp_path):
             conn,
             title="feat(office): ordinary repo still redirects",
             workspace_kind="dir",
-            workspace_path=str(repo),
+            workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -269,7 +269,7 @@ def test_dir_non_edit_in_place_repo_root_still_guards(kanban_home, tmp_path):
             conn,
             title="feat(office): guard must still fire",
             workspace_kind="dir",
-            workspace_path=str(repo),
+            workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 

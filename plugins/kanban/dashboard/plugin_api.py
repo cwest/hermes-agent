@@ -623,6 +623,11 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             body=payload.body,
             assignee=payload.assignee,
             created_by="dashboard",
+            # The dashboard is a browser UI with no chat/session origin. Declare
+            # the detached context explicitly so the origin guard files the card
+            # rather than refusing it. (A future enhancement could thread a
+            # dashboard session origin; out of scope here.)
+            detached=True,
             workspace_kind=payload.workspace_kind,
             workspace_path=payload.workspace_path,
             tenant=payload.tenant,

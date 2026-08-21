@@ -96,7 +96,7 @@ def test_workers_active_with_running_task(client):
     """A running task with an open run row and worker_pid appears in the list."""
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="active-worker", assignee="alice")
+        task_id = kb.create_task(conn, title="active-worker", assignee="alice", detached=True)
         conn.execute(
             "UPDATE tasks SET status='running' WHERE id=?", (task_id,),
         )
@@ -120,7 +120,7 @@ def test_workers_active_excludes_ended_runs(client):
     """Runs with ended_at set are excluded even if task is running."""
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="ended-run", assignee="bob")
+        task_id = kb.create_task(conn, title="ended-run", assignee="bob", detached=True)
         conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
         _insert_run(conn, task_id, worker_pid=99999, ended_at=int(time.time()) - 60)
     finally:
@@ -135,7 +135,7 @@ def test_workers_active_excludes_runs_without_pid(client):
     """Runs with no worker_pid are not considered active workers."""
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="no-pid", assignee="carol")
+        task_id = kb.create_task(conn, title="no-pid", assignee="carol", detached=True)
         conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
         _insert_run(conn, task_id, worker_pid=None)
     finally:
@@ -161,7 +161,7 @@ def test_get_run_ok(client):
     """Existing run row returns 200 with expected shape."""
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="run-lookup", assignee="dave")
+        task_id = kb.create_task(conn, title="run-lookup", assignee="dave", detached=True)
         run_id = _insert_run(conn, task_id, worker_pid=55555)
     finally:
         conn.close()
@@ -191,7 +191,7 @@ def test_inspect_run_already_ended(client):
     """Run with ended_at set returns alive=false with reason."""
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="ended", assignee="eve")
+        task_id = kb.create_task(conn, title="ended", assignee="eve", detached=True)
         run_id = _insert_run(conn, task_id, worker_pid=11111, ended_at=int(time.time()) - 10)
     finally:
         conn.close()
@@ -207,7 +207,7 @@ def test_inspect_run_no_pid(client):
     """Run with no worker_pid returns alive=false with reason."""
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="no-pid-inspect", assignee="frank")
+        task_id = kb.create_task(conn, title="no-pid-inspect", assignee="frank", detached=True)
         run_id = _insert_run(conn, task_id, worker_pid=None)
     finally:
         conn.close()
@@ -223,7 +223,7 @@ def test_inspect_run_dead_pid(client, monkeypatch):
     """Run with a non-existent PID returns alive=false via psutil.NoSuchProcess."""
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="dead-pid", assignee="grace")
+        task_id = kb.create_task(conn, title="dead-pid", assignee="grace", detached=True)
         run_id = _insert_run(conn, task_id, worker_pid=999999)
     finally:
         conn.close()
@@ -258,7 +258,7 @@ def test_inspect_run_live_pid(client, monkeypatch):
     """Run with a live PID returns alive=true with psutil fields."""
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="live-pid", assignee="heidi")
+        task_id = kb.create_task(conn, title="live-pid", assignee="heidi", detached=True)
         run_id = _insert_run(conn, task_id, worker_pid=12345)
     finally:
         conn.close()
@@ -313,7 +313,7 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
     tasks.claim_lock, tasks.worker_pid; inserts task_runs row with the
     same claim_lock so reclaim_task's preconditions are satisfied.
     """
-    task_id = kb.create_task(conn, title=title, assignee=assignee)
+    task_id = kb.create_task(conn, title=title, assignee=assignee, detached=True)
     lock = secrets.token_hex(8)
     future = int(time.time()) + 3600
     conn.execute(
@@ -345,7 +345,7 @@ def test_terminate_run_409_already_ended(client):
     """POST against a run with ended_at set returns 409."""
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="ended-terminate", assignee="ivy")
+        task_id = kb.create_task(conn, title="ended-terminate", assignee="ivy", detached=True)
         run_id = _insert_run(
             conn, task_id, worker_pid=22222, ended_at=int(time.time()) - 30,
         )
@@ -407,7 +407,7 @@ def test_terminate_run_409_task_not_reclaimable(client, monkeypatch):
     """Open run row whose task is no longer claimable returns 409."""
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="ghost-run", assignee="ken")
+        task_id = kb.create_task(conn, title="ghost-run", assignee="ken", detached=True)
         # Task left in default 'ready' state with no claim_lock — task_run
         # exists but reclaim_task will refuse because status != 'running'
         # and claim_lock is NULL.

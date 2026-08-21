@@ -110,7 +110,7 @@ def test_self_owned_review_completion_parks_for_acceptance(kanban_home: Path) ->
     (``blocked`` + the ``blocked-acceptance`` owner, sticky
     ``awaiting-casey-signoff``)."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="draft the launch post", assignee="lawrence")
+        tid = kb.create_task(conn, title="draft the launch post", assignee="lawrence", detached=True)
         _stamp_owner_map(
             conn, tid,
             "ready: lawrence, review: perkins, blocked-acceptance: casey",
@@ -142,7 +142,7 @@ def test_self_owned_review_completion_emits_no_review_move(kanban_home: Path) ->
     """No ``status_changed {to: review, by: onecard:complete-task}`` self-handoff
     event lands, and the card is NOT re-dispatchable (not left in review)."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="draft the post", assignee="lawrence")
+        tid = kb.create_task(conn, title="draft the post", assignee="lawrence", detached=True)
         _stamp_owner_map(
             conn, tid,
             "ready: lawrence, review: perkins, blocked-acceptance: casey",
@@ -176,7 +176,7 @@ def test_self_owned_review_park_reason_is_awaiting_signoff(kanban_home: Path) ->
     """The parked card carries a sticky ``awaiting-casey-signoff`` block reason so
     the acceptance guard holds it and the acceptance notification fires."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="draft the post", assignee="lawrence")
+        tid = kb.create_task(conn, title="draft the post", assignee="lawrence", detached=True)
         _stamp_owner_map(
             conn, tid,
             "ready: lawrence, review: perkins, blocked-acceptance: casey",
@@ -211,7 +211,7 @@ def test_first_author_completion_still_moves_to_review(kanban_home: Path) -> Non
     author, not the review owner) must STILL MOVE to review — the self-handoff
     discriminator must not fire on the ordinary author handoff."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="draft the post", assignee="lawrence")
+        tid = kb.create_task(conn, title="draft the post", assignee="lawrence", detached=True)
         _stamp_owner_map(
             conn, tid,
             "ready: lawrence, review: perkins, blocked-acceptance: casey",
@@ -232,7 +232,7 @@ def test_engineering_self_owned_review_completion_parks(kanban_home: Path) -> No
     claimed from review and completed by lamport parks for acceptance, not a
     self-handoff into review."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="fix the kanban redirect", assignee="easley")
+        tid = kb.create_task(conn, title="fix the kanban redirect", assignee="easley", detached=True)
         _stamp_owner_map(
             conn, tid,
             "ready: easley, review: lamport, blocked-acceptance: casey",
@@ -264,7 +264,7 @@ def test_research_self_owned_review_completion_still_done(kanban_home: Path) -> 
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="curate: write-time sweep", assignee="reddy",
-            workspace_kind="scratch",
+            workspace_kind="scratch", detached=True,
         )
         _stamp_owner_map(conn, tid, "ready: reddy, review: avram", team="research")
         kb.claim_task(conn, tid)

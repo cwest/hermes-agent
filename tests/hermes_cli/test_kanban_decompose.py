@@ -77,7 +77,7 @@ def _patch_list_profiles(names: list[str]):
 
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="ship a feature", triage=True)
+        tid = kb.create_task(conn, title="ship a feature", triage=True, detached=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -115,7 +115,7 @@ def test_decompose_with_fanout_creates_children(kanban_home):
 
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="just one thing", triage=True)
+        tid = kb.create_task(conn, title="just one thing", triage=True, detached=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": False,
@@ -155,7 +155,7 @@ def test_decompose_fanout_false_preserves_existing_assignee(kanban_home):
             conn,
             title="already routed",
             assignee="engineer",
-            triage=True,
+            triage=True, detached=True,
         )
 
     llm_payload = jsonlib.dumps({
@@ -189,7 +189,7 @@ def test_decompose_fanout_false_preserves_existing_assignee(kanban_home):
 
 def test_decompose_fanout_false_uses_valid_llm_assignee(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="route me", triage=True)
+        tid = kb.create_task(conn, title="route me", triage=True, detached=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": False,
@@ -221,7 +221,7 @@ def test_decompose_fanout_false_uses_valid_llm_assignee(kanban_home):
 
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="route me safely", triage=True)
+        tid = kb.create_task(conn, title="route me safely", triage=True, detached=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": False,
@@ -253,7 +253,7 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
 
 def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="x", triage=True)
+        tid = kb.create_task(conn, title="x", triage=True, detached=True)
 
     # Roster only has 'orchestrator' and 'fallback'; LLM picks 'made_up'.
     llm_payload = jsonlib.dumps({
@@ -295,7 +295,7 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
 
 def test_decompose_handles_malformed_llm_json(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="x", triage=True)
+        tid = kb.create_task(conn, title="x", triage=True, detached=True)
 
     patches = _patch_list_profiles(["orchestrator"])
     for p in patches:
@@ -313,7 +313,7 @@ def test_decompose_handles_malformed_llm_json(kanban_home):
 
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="x")  # ready, not triage
+        tid = kb.create_task(conn, title="x", detached=True)  # ready, not triage
 
     patches = _patch_list_profiles(["orchestrator"])
     for p in patches:
@@ -329,7 +329,7 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
 
 def test_decompose_no_aux_client_configured(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="x", triage=True)
+        tid = kb.create_task(conn, title="x", triage=True, detached=True)
 
     patches = _patch_list_profiles(["orchestrator"])
     for p in patches:

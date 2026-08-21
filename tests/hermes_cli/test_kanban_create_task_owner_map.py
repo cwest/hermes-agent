@@ -71,7 +71,7 @@ def test_raw_create_task_research_resolves_to_research_reviewer(kanban_home):
     — must still resolve. filed kind == resolved kind == owner-map reviewer."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="research card", kind="research")
+        tid = kb.create_task(conn, title="research card", kind="research", detached=True)
         want_reviewer = kb.materialize_owner_map("research")["review"]
         # Reader agreement: the stamped map resolves the review lane.
         assert kb._review_owner_from_owner_map(conn, tid) == want_reviewer
@@ -90,7 +90,7 @@ def test_raw_create_task_code_is_stamped_not_fallback(kanban_home):
     AND be provably STAMPED (declares a map), not the un-stamped fallback."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="code card", kind="code")
+        tid = kb.create_task(conn, title="code card", kind="code", detached=True)
         assert kb.resolve_card_kind(conn, tid) == "code"
         assert kb._card_declares_owner_map(conn, tid) is True
         assert kb._review_owner_from_owner_map(conn, tid) == (
@@ -106,7 +106,7 @@ def test_raw_create_task_no_kind_defaults_visibly_to_code(kanban_home):
     A post-change card therefore never reaches the silent legacy fallback."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="unkinded card")
+        tid = kb.create_task(conn, title="unkinded card", detached=True)
         # Map is written even with no kind -> declares a map (not un-stamped).
         assert kb._card_declares_owner_map(conn, tid) is True
         assert kb.resolve_card_kind(conn, tid) == "code"
@@ -124,7 +124,7 @@ def test_raw_create_task_no_kind_defaults_visibly_to_code(kanban_home):
 def test_explicit_kind_records_explicit_source(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="explicit", kind="writing")
+        tid = kb.create_task(conn, title="explicit", kind="writing", detached=True)
         joined = "\n".join(c.body for c in kb.list_comments(conn, tid))
         assert "kind_source=explicit" in joined
     finally:
@@ -134,7 +134,7 @@ def test_explicit_kind_records_explicit_source(kanban_home):
 def test_writing_card_resolves_to_writing_reviewer(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="writing card", kind="writing")
+        tid = kb.create_task(conn, title="writing card", kind="writing", detached=True)
         assert kb.resolve_card_kind(conn, tid) == "writing"
         assert kb._review_owner_from_owner_map(conn, tid) == (
             kb.materialize_owner_map("writing")["review"]
@@ -147,7 +147,7 @@ def test_create_task_rejects_unknown_kind(kanban_home):
     conn = kb.connect()
     try:
         with pytest.raises(Exception):
-            kb.create_task(conn, title="bad", kind="nonsense")
+            kb.create_task(conn, title="bad", kind="nonsense", detached=True)
     finally:
         conn.close()
 
@@ -159,7 +159,7 @@ def test_stamped_map_parses_back_to_the_materialized_map(kanban_home):
     parses back (via parse_owner_map_from_notes) to the materialized map."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="rt", kind="research")
+        tid = kb.create_task(conn, title="rt", kind="research", detached=True)
         want = kb.materialize_owner_map("research")
         # Find the submit-stage audit comment and parse its notes.
         got = {}
@@ -197,6 +197,9 @@ def test_worker_auto_subscribe_stamps_delivering_profile(kanban_home, monkeypatc
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
     monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-1")
+    # A real gateway worker carries an origin session id; the create-time origin
+    # guard requires it (the tool resolves session_id from HERMES_SESSION_ID).
+    monkeypatch.setenv("HERMES_SESSION_ID", "discord:chat-1:thread-1")
 
     out = kt._handle_create({"title": "auto-sub", "assignee": "peer", "kind": "code"})
     d = json.loads(out)
@@ -252,7 +255,7 @@ def test_intentional_strict_map_omitting_review_returns_none_not_defaulted(kanba
     try:
         # create_task with no kind stamps the DEFAULTED code map (carries a
         # real review-lane owner: the code reviewer).
-        tid = kb.create_task(conn, title="intentional strict omit review")
+        tid = kb.create_task(conn, title="intentional strict omit review", detached=True)
         defaulted_reviewer = kb.materialize_owner_map("code")["review"]
         author = kb.materialize_owner_map("research")["ready"]
         # Now stamp an INTENTIONAL strict map naming only ready.
@@ -280,7 +283,7 @@ def test_intentional_prose_map_omitting_review_returns_none_not_defaulted(kanban
         tid = kb.create_task(
             conn,
             title="intentional prose omit review",
-            body=f"Routing (owner map): {{ready: {author}}}",
+            body=f"Routing (owner map): {{ready: {author}}}", detached=True,
         )
         defaulted_reviewer = kb.materialize_owner_map("code")["review"]
         assert kb._owner_from_owner_map(conn, tid, "ready") == author
@@ -295,7 +298,7 @@ def test_intentional_strict_map_with_review_supersedes_defaulted(kanban_home):
     co-present defaulted-code stamp — the supersedes relationship, both ways."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="intentional strict with review")
+        tid = kb.create_task(conn, title="intentional strict with review", detached=True)
         research_map = kb.materialize_owner_map("research")
         intentional_reviewer = research_map["review"]
         defaulted_reviewer = kb.materialize_owner_map("code")["review"]
@@ -322,7 +325,7 @@ def test_intentional_strict_map_with_review_supersedes_defaulted(kanban_home):
 def test_declares_intentional_false_for_defaulted_only(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="defaulted only")
+        tid = kb.create_task(conn, title="defaulted only", detached=True)
         # It DOES declare a map (routing always resolves)...
         assert kb._card_declares_owner_map(conn, tid) is True
         # ...but NOT an intentional one — the chokepoint default is routing-only.
@@ -334,7 +337,7 @@ def test_declares_intentional_false_for_defaulted_only(kanban_home):
 def test_declares_intentional_true_for_explicit_kind(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="explicit kind", kind="research")
+        tid = kb.create_task(conn, title="explicit kind", kind="research", detached=True)
         assert kb._card_declares_intentional_owner_map(conn, tid) is True
     finally:
         conn.close()
@@ -348,7 +351,7 @@ def test_declares_intentional_true_for_prose_routing_line(kanban_home):
             conn,
             title="prose routing",
             body=f"Routing (owner map): {{ready: {author}, review: "
-            f"{kb.materialize_owner_map('writing')['review']}}}",
+            f"{kb.materialize_owner_map('writing')['review']}}}", detached=True,
         )
         assert kb._card_declares_intentional_owner_map(conn, tid) is True
     finally:
@@ -360,7 +363,7 @@ def test_declares_intentional_true_for_submit_gated_stamp(kanban_home):
     with NO kind_source field) is intentional even without an explicit kind."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="submit gated")
+        tid = kb.create_task(conn, title="submit gated", detached=True)
         wmap = kb.materialize_owner_map("writing")
         # submit_card's stamp shape: no kind_source marker at all.
         body = (

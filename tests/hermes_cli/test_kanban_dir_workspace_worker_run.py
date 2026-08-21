@@ -113,7 +113,7 @@ def test_worker_run_leaves_dir_repo_root_on_main_clean(
             title="feat(office): a card that used to corrupt the deploy clone",
             assignee="easley",
             workspace_kind="dir",
-            workspace_path=str(deploy),
+            workspace_path=str(deploy), detached=True,
         )
         # Move it into the dispatchable lane (a freshly-created card with no
         # parents promotes to ready; be explicit so the tick can claim it).
@@ -182,7 +182,7 @@ def test_dir_repo_root_anchor_survives_dispatch(kanban_home, tmp_path, monkeypat
             title="feat(office): anchor must survive dispatch",
             assignee="easley",
             workspace_kind="dir",
-            workspace_path=str(deploy),
+            workspace_path=str(deploy), detached=True,
         )
         _dispatch_ready_card(conn, tid, _spawn_recording(spawned))
         task_after = kb.get_task(conn, tid)
@@ -221,7 +221,7 @@ def test_dir_repo_root_redispatch_resolves_same_worktree_no_nesting(
             title="feat(office): re-dispatch must not nest",
             assignee="easley",
             workspace_kind="dir",
-            workspace_path=str(deploy),
+            workspace_path=str(deploy), detached=True,
         )
         # Run 1: a real dispatcher tick (claim → resolve → set_workspace_path → spawn).
         _dispatch_ready_card(conn, tid, _spawn_recording(spawned))
@@ -262,7 +262,7 @@ def test_worktree_kind_write_back_persists_resolved_path(
             title="worktree card: write-back unchanged",
             assignee="easley",
             workspace_kind="worktree",
-            workspace_path=str(deploy),
+            workspace_path=str(deploy), detached=True,
         )
         _dispatch_ready_card(conn, tid, _spawn_recording(spawned))
         task_after = kb.get_task(conn, tid)

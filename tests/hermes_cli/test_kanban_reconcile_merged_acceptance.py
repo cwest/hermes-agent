@@ -71,7 +71,7 @@ def _stage_acceptance_card(
     ``blocked`` + owner ``casey`` + sticky ``awaiting-casey-signoff`` reason,
     with the PR URL linked in a comment (the implementer's ready-for-review
     handoff)."""
-    tid = kb.create_task(conn, title="feature work", assignee="casey")
+    tid = kb.create_task(conn, title="feature work", assignee="casey", detached=True)
     kb.claim_task(conn, tid)
     if pr_url:
         kb.add_comment(
@@ -235,7 +235,7 @@ def test_reconcile_refuses_non_acceptance_card(
         kb, "_resolve_pr_merge_commit", lambda url: ("merged", _MERGE_OID)
     )
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="generic block", assignee="eckert")
+        tid = kb.create_task(conn, title="generic block", assignee="eckert", detached=True)
         kb.claim_task(conn, tid)
         kb.add_comment(
             conn, tid, author="easley",
@@ -263,7 +263,7 @@ def test_reconcile_refuses_running_card(
         kb, "_resolve_pr_merge_commit", lambda url: ("merged", _MERGE_OID)
     )
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="in flight", assignee="easley")
+        tid = kb.create_task(conn, title="in flight", assignee="easley", detached=True)
         kb.claim_task(conn, tid)
         kb.add_comment(
             conn, tid, author="easley", body=f"Draft PR opened: {_PR_URL}",

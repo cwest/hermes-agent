@@ -126,14 +126,29 @@ def test_cli_create_channel_session_id_registers_channel_sub(kanban_home):
 
 
 def test_cli_create_without_session_id_registers_no_sub(kanban_home):
-    """No --session-id => no sub. Must not regress the no-origin case."""
-    out = kc.run_slash("create 'no-origin' --assignee eckert")
+    """A detached card (no --session-id) files with no origin => no sub. The
+    origin guard requires --detached to file without a session; the resulting
+    origin-less card must still have no notify sub."""
+    out = kc.run_slash("create 'no-origin' --assignee eckert --detached")
     tid = _created_id(out)
 
     conn = kb.connect()
     try:
         subs = [s for s in kb.list_notify_subs(conn) if s["task_id"] == tid]
         assert subs == [], f"a card with no origin must have no sub, got {subs!r}"
+    finally:
+        conn.close()
+
+
+def test_cli_create_without_session_id_or_detached_is_refused(kanban_home):
+    """The origin guard: a CLI create with neither --session-id nor --detached
+    is refused with a clean error, not silently filed."""
+    out = kc.run_slash("create 'orphan' --assignee eckert")
+    assert "no resolvable origin" in out.lower()
+    conn = kb.connect()
+    try:
+        titles = [t.title for t in kb.list_tasks(conn, include_archived=True)]
+        assert "orphan" not in titles, "a refused create must file no card"
     finally:
         conn.close()
 

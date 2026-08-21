@@ -37,7 +37,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 def test_goal_mode_defaults_off(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="plain task", assignee="worker")
+        tid = kb.create_task(conn, title="plain task", assignee="worker", detached=True)
         task = kb.get_task(conn, tid)
     assert task.goal_mode is False
     assert task.goal_max_turns is None
@@ -50,7 +50,7 @@ def test_goal_mode_persists(kanban_home):
             title="open-ended task",
             assignee="worker",
             goal_mode=True,
-            goal_max_turns=7,
+            goal_max_turns=7, detached=True,
         )
         task = kb.get_task(conn, tid)
     assert task.goal_mode is True
@@ -60,7 +60,7 @@ def test_goal_mode_persists(kanban_home):
 def test_goal_mode_without_max_turns(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(
-            conn, title="t", assignee="worker", goal_mode=True
+            conn, title="t", assignee="worker", goal_mode=True, detached=True
         )
         task = kb.get_task(conn, tid)
     assert task.goal_mode is True
@@ -139,7 +139,7 @@ def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
             title="goal task",
             assignee="default",
             goal_mode=True,
-            goal_max_turns=5,
+            goal_max_turns=5, detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -162,7 +162,7 @@ def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
     monkeypatch.setattr("subprocess.Popen", _fake_popen)
 
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="plain", assignee="default")
+        tid = kb.create_task(conn, title="plain", assignee="default", detached=True)
         task = kb.get_task(conn, tid)
 
     kb._default_spawn(task, str(kanban_home))

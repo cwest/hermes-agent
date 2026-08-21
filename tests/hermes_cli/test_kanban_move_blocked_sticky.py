@@ -88,7 +88,7 @@ def test_move_card_acceptance_block_is_not_auto_promoted(kanban_home: Path) -> N
     transition (``move_card``) must stay blocked across dispatcher ticks —
     it is waiting on a human and must NOT auto-recover."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="pr passed, awaiting sign-off")
+        tid = kb.create_task(conn, title="pr passed, awaiting sign-off", detached=True)
         kb.claim_task(conn, tid)
         # Reviewer's atomic PASS→acceptance move: review → blocked + casey.
         _simulate_move_card_to_blocked(
@@ -110,7 +110,7 @@ def test_move_card_block_makes_has_sticky_block_true(kanban_home: Path) -> None:
     transition as sticky (the explicit ``by=onecard:move_card`` marker),
     not just an emitted ``blocked`` event."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="acceptance card")
+        tid = kb.create_task(conn, title="acceptance card", detached=True)
         kb.claim_task(conn, tid)
         _simulate_move_card_to_blocked(
             conn, tid,
@@ -127,8 +127,8 @@ def test_move_card_acceptance_block_sticky_even_with_done_parents(
     built for, so it's the most dangerous false-positive: even with every
     parent done, a move_card acceptance block must stay blocked."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
+        parent = kb.create_task(conn, title="parent", detached=True)
+        child = kb.create_task(conn, title="child", parents=[parent], detached=True)
         kb.complete_task(conn, parent, result="parent ok")
 
         kb.claim_task(conn, child)
@@ -154,8 +154,8 @@ def test_circuit_breaker_gave_up_still_auto_recovers(kanban_home: Path) -> None:
     ``status_changed``), so the fix must leave it auto-recoverable —
     otherwise transient crashes would wedge forever."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
+        parent = kb.create_task(conn, title="parent", detached=True)
+        child = kb.create_task(conn, title="child", parents=[parent], detached=True)
         kb.complete_task(conn, parent, result="ok")
 
         conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (child,))
@@ -176,8 +176,8 @@ def test_move_card_to_ready_does_not_make_sticky(kanban_home: Path) -> None:
     non-blocked status carrying the same ``by=onecard:move_card`` marker
     (e.g. a bounce back to ``ready``) must NOT trip the sticky guard."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
+        parent = kb.create_task(conn, title="parent", detached=True)
+        child = kb.create_task(conn, title="child", parents=[parent], detached=True)
         kb.complete_task(conn, parent, result="ok")
 
         # move_card review → ready + eckert (a bounce), then a later
@@ -205,7 +205,7 @@ def test_unblock_after_move_card_block_clears_sticky(kanban_home: Path) -> None:
     sticky state — the ``unblocked`` event is the most recent signal and
     wins over the earlier move-driven blocked."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="t")
+        tid = kb.create_task(conn, title="t", detached=True)
         kb.claim_task(conn, tid)
         _simulate_move_card_to_blocked(
             conn, tid,
@@ -225,7 +225,7 @@ def test_gave_up_after_move_card_block_stays_sticky(kanban_home: Path) -> None:
     event must never silently override a deliberate human-gated acceptance.
     This mirrors the #28712 loop guard for the move_card path."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="acceptance then spurious gave_up")
+        tid = kb.create_task(conn, title="acceptance then spurious gave_up", detached=True)
         kb.claim_task(conn, tid)
         _simulate_move_card_to_blocked(
             conn, tid,

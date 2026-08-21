@@ -3594,6 +3594,7 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    detached: bool = False,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -3633,11 +3634,57 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``session_id`` is the card's originating session — the seed
+    ``parse_origin_session`` turns into the notify-sub a per-card transition wake
+    fires from. An origin is STRUCTURALLY REQUIRED, but it may be supplied
+    explicitly via this kwarg OR resolved from the ambient surface the same way
+    #128's ``created`` event records it (an inherited ``HERMES_KANBAN_ORIGIN``
+    across a spawn boundary, or a live ``HERMES_SESSION_*`` capture). A call that
+    resolves no origin from EITHER source and does not pass ``detached=True``
+    raises ``ValueError`` rather than filing a card that could never wake anyone.
+    Pass ``detached=True`` ONLY for a genuinely origin-less context (test, cron,
+    detached CLI, dashboard, diagnostic script); it is a per-call marker, so a
+    real filing path cannot inherit it by accident.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+
+    # Origin guarantee (card t_b76d0836): a card filed with no origin produces
+    # transitions that can never wake anyone, so an origin-less card must be
+    # IMPOSSIBLE to create here rather than merely discouraged (the ``submit_card``
+    # gate enforced it, but as one path among several). Reject a call that
+    # resolves NO origin unless it carries an explicit ``detached=True`` marker.
+    #
+    # "Resolvable origin" is the SAME thing #128 records in the ``created`` event:
+    # an explicit ``session_id`` kwarg OR an origin resolved from the ambient
+    # surface (``HERMES_KANBAN_ORIGIN`` inherited across a spawn boundary → live
+    # ``HERMES_SESSION_*`` capture). A card created inside a live gateway session,
+    # or one that inherited a human origin, HAS a routable origin even with no
+    # ``session_id`` kwarg — refusing it would be a regression against #128. So
+    # resolve the ambient origin via the same helper the payload uses, and refuse
+    # only when the kwarg AND the ambient resolution BOTH yield nothing.
+    #
+    # The resolution is computed ONCE here and threaded down to the ``created``
+    # payload below (one read, no drift between what the guard checks and what the
+    # event records). ``detached`` is a per-call keyword — NOT an env var or
+    # module-global default — so a genuinely origin-less context (test, cron,
+    # detached CLI, dashboard, diagnostic script) declares itself AT ITS OWN CALL
+    # SITE, and a real filing path that loses its origin fails LOUD here instead
+    # of silently on the board. A global default would be exactly the silent
+    # fallthrough this guard exists to close.
+    session_id = (session_id or "").strip() or None
+    created_origin = _resolve_created_origin()
+    _has_ambient_origin = created_origin.get("origin_source") != "none"
+    if session_id is None and not _has_ambient_origin and not detached:
+        raise ValueError(
+            "create_task: no resolvable origin — pass session_id=<origin> so the "
+            "card can wake its originating session, file it from a live/inherited "
+            "gateway session, or pass detached=True for a genuinely origin-less "
+            "context (test, cron, detached CLI, dashboard, diagnostic script)."
+        )
 
     # Owner-map guarantee (card t_0c8744a1): every card minted here carries a
     # kind-correct ``state_owners`` map, so no caller — worker, script, CLI, or
@@ -3870,11 +3917,12 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
-    # Resolve the card origin ONCE, before the id-collision retry loop, so an
-    # id retry cannot re-read a context that shifted mid-call. This snapshots the
-    # resolved delivery surface + its resolution source + the creating pid into
-    # the immutable ``created`` event payload below.
-    created_origin = _resolve_created_origin()
+    # ``created_origin`` was resolved once at the top of this function (in the
+    # origin guarantee above), well before the id-collision retry loop — so an id
+    # retry cannot re-read a context that shifted mid-call, and the guard's origin
+    # check and the ``created`` event payload below use the SAME resolution. It
+    # snapshots the resolved delivery surface + its resolution source + the
+    # creating pid into the immutable ``created`` event payload below.
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):

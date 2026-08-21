@@ -168,7 +168,7 @@ def worker_env(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
+        tid = kb.create_task(conn, title="worker-test", assignee="test-worker", detached=True)
         kb.claim_task(conn, tid)
     finally:
         conn.close()
@@ -192,7 +192,7 @@ def test_show_explicit_task_id(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="other task", assignee="peer")
+        other = kb.create_task(conn, title="other task", assignee="peer", detached=True)
     finally:
         conn.close()
     from tools import kanban_tools as kt
@@ -207,9 +207,9 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="alpha", assignee="factory", priority=5)
-        b = kb.create_task(conn, title="beta", assignee="reviewer")
-        c = kb.create_task(conn, title="gamma", assignee="factory", tenant="other")
+        a = kb.create_task(conn, title="alpha", assignee="factory", priority=5, detached=True)
+        b = kb.create_task(conn, title="beta", assignee="reviewer", detached=True)
+        c = kb.create_task(conn, title="gamma", assignee="factory", tenant="other", detached=True)
     finally:
         conn.close()
 
@@ -251,8 +251,8 @@ def test_list_parses_include_archived_string_false(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        live = kb.create_task(conn, title="live task", assignee="factory")
-        archived = kb.create_task(conn, title="archived task", assignee="factory")
+        live = kb.create_task(conn, title="live task", assignee="factory", detached=True)
+        archived = kb.create_task(conn, title="archived task", assignee="factory", detached=True)
         assert kb.archive_task(conn, archived)
     finally:
         conn.close()
@@ -272,8 +272,8 @@ def test_list_parses_include_archived_string_true(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        live = kb.create_task(conn, title="live task", assignee="factory")
-        archived = kb.create_task(conn, title="archived task", assignee="factory")
+        live = kb.create_task(conn, title="live task", assignee="factory", detached=True)
+        archived = kb.create_task(conn, title="archived task", assignee="factory", detached=True)
         assert kb.archive_task(conn, archived)
     finally:
         conn.close()
@@ -325,7 +325,7 @@ def _stage_worktree_task_for_worker(assignee: str = "test-worker") -> str:
     try:
         tid = kb.create_task(
             conn, title="audit sweep", assignee=assignee,
-            workspace_kind="worktree", workspace_path="/Users/x/src/repo",
+            workspace_kind="worktree", workspace_path="/Users/x/src/repo", detached=True,
         )
         kb.claim_task(conn, tid)
     finally:
@@ -709,7 +709,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
-            body="Must achieve X with verified evidence.", goal_mode=True
+            body="Must achieve X with verified evidence.", goal_mode=True, detached=True
         )
         kb.claim_task(conn, goal_task_id)
     finally:
@@ -767,7 +767,7 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
-            body="Must achieve X with verified evidence.", goal_mode=True
+            body="Must achieve X with verified evidence.", goal_mode=True, detached=True
         )
         kb.claim_task(conn, goal_task_id)
     finally:
@@ -893,7 +893,7 @@ def test_submit_for_review_rejects_foreign_task(worker_env):
 
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="not mine", assignee="peer")
+        other = kb.create_task(conn, title="not mine", assignee="peer", detached=True)
     finally:
         conn.close()
 
@@ -949,7 +949,7 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-block-test", assignee="test-worker",
-            body="Must achieve X.", goal_mode=True,
+            body="Must achieve X.", goal_mode=True, detached=True,
         )
         kb.claim_task(conn, goal_task_id)
     finally:
@@ -1256,7 +1256,7 @@ def test_create_default_child_does_not_implicitly_share_worker_dir(
     try:
         self_tid = kb.create_task(
             conn, title="dir worker", assignee="test-worker",
-            workspace_kind="dir", workspace_path=proj,
+            workspace_kind="dir", workspace_path=proj, detached=True,
         )
         kb.claim_task(conn, self_tid)
     finally:
@@ -1285,7 +1285,7 @@ def test_create_explicit_dir_workspace_shares_parent_path(monkeypatch, worker_en
     try:
         self_tid = kb.create_task(
             conn, title="dir worker", assignee="test-worker",
-            workspace_kind="dir", workspace_path=proj,
+            workspace_kind="dir", workspace_path=proj, detached=True,
         )
         kb.claim_task(conn, self_tid)
     finally:
@@ -1326,7 +1326,7 @@ def test_create_explicit_scratch_beats_parent_workspace(monkeypatch, worker_env)
     try:
         self_tid = kb.create_task(
             conn, title="dir worker", assignee="test-worker",
-            workspace_kind="dir", workspace_path="/home/teknium/proj",
+            workspace_kind="dir", workspace_path="/home/teknium/proj", detached=True,
         )
         kb.claim_task(conn, self_tid)
     finally:
@@ -1410,7 +1410,7 @@ def test_create_default_child_inherits_project_without_reusing_worktree(
     try:
         parent_id = kb.create_task(
             conn, title="implementation", assignee="test-worker",
-            project_id=project_id,
+            project_id=project_id, detached=True,
         )
         kb.claim_task(conn, parent_id)
         parent = kb.get_task(conn, parent_id)
@@ -1476,7 +1476,7 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
             conn,
             title="parent implementation",
             assignee="worker",
-            project_id=project_id,
+            project_id=project_id, detached=True,
         )
         kb.claim_task(conn, parent_id)
         parent = kb.get_task(conn, parent_id)
@@ -1863,8 +1863,8 @@ def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="A", assignee="x")
-        b = kb.create_task(conn, title="B", assignee="x")
+        a = kb.create_task(conn, title="A", assignee="x", detached=True)
+        b = kb.create_task(conn, title="B", assignee="x", detached=True)
     finally:
         conn.close()
     from tools import kanban_tools as kt
@@ -1890,8 +1890,8 @@ def test_link_rejects_cycle(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="A", assignee="x")
-        b = kb.create_task(conn, title="B", assignee="x", parents=[a])
+        a = kb.create_task(conn, title="A", assignee="x", detached=True)
+        b = kb.create_task(conn, title="B", assignee="x", parents=[a], detached=True)
     finally:
         conn.close()
     from tools import kanban_tools as kt
@@ -1904,7 +1904,7 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="blocked", assignee="worker")
+        tid = kb.create_task(conn, title="blocked", assignee="worker", detached=True)
         kb.block_task(conn, tid, reason="waiting")
     finally:
         conn.close()
@@ -1936,8 +1936,8 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
-        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
+        parent = kb.create_task(conn, title="parent", assignee="worker", detached=True)
+        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent], detached=True)
         conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (child,))
         conn.commit()
     finally:
@@ -2201,7 +2201,7 @@ def test_worker_complete_rejects_foreign_task_id(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="sibling")
+        other = kb.create_task(conn, title="sibling", detached=True)
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
         conn.commit()
     finally:
@@ -2226,7 +2226,7 @@ def test_worker_block_rejects_foreign_task_id(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="sibling")
+        other = kb.create_task(conn, title="sibling", detached=True)
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
         conn.commit()
     finally:
@@ -2249,7 +2249,7 @@ def test_worker_heartbeat_rejects_foreign_task_id(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="sibling")
+        other = kb.create_task(conn, title="sibling", detached=True)
         # Put sibling in running state so heartbeat would otherwise succeed.
         conn.execute("UPDATE tasks SET status='running' WHERE id=?", (other,))
         conn.commit()
@@ -2274,7 +2274,7 @@ def test_worker_can_comment_on_foreign_task(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="sibling")
+        other = kb.create_task(conn, title="sibling", detached=True)
     finally:
         conn.close()
 
@@ -2311,7 +2311,7 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="blocked sibling", assignee="peer")
+        other = kb.create_task(conn, title="blocked sibling", assignee="peer", detached=True)
         kb.block_task(conn, other, reason="waiting")
     finally:
         conn.close()
@@ -2402,7 +2402,7 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="child to close out")
+        tid = kb.create_task(conn, title="child to close out", detached=True)
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         conn.commit()
     finally:
@@ -2453,7 +2453,7 @@ def multi_board_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         seed_default = kb.create_task(
-            conn, title="seed-default", assignee="worker-d"
+            conn, title="seed-default", assignee="worker-d", detached=True
         )
     finally:
         conn.close()
@@ -2461,7 +2461,7 @@ def multi_board_env(monkeypatch, tmp_path):
     conn = kb.connect(board="alt")
     try:
         seed_alt = kb.create_task(
-            conn, title="seed-alt", assignee="worker-a"
+            conn, title="seed-alt", assignee="worker-a", detached=True
         )
     finally:
         conn.close()
@@ -2662,7 +2662,7 @@ def test_board_param_routes_heartbeat_to_alt_board(monkeypatch, tmp_path):
     kb._INITIALIZED_PATHS.clear()
     # Seed the alt board with a claimed task.
     with kb.connect(board="alt") as conn:
-        tid = kb.create_task(conn, title="alt hb", assignee="alt-worker")
+        tid = kb.create_task(conn, title="alt hb", assignee="alt-worker", detached=True)
         kb.claim_task(conn, tid)
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
 
@@ -2683,8 +2683,8 @@ def test_board_param_routes_link_to_alt_board(multi_board_env):
     from tools import kanban_tools as kt
 
     with kb.connect(board="alt") as conn:
-        a = kb.create_task(conn, title="A-alt", assignee="x")
-        b = kb.create_task(conn, title="B-alt", assignee="x")
+        a = kb.create_task(conn, title="A-alt", assignee="x", detached=True)
+        b = kb.create_task(conn, title="B-alt", assignee="x", detached=True)
 
     out = kt._handle_link({
         "parent_id": a,
@@ -3056,7 +3056,7 @@ def test_attach_enforces_worker_task_ownership(worker_env):
 
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="someone else's task", assignee="peer")
+        other = kb.create_task(conn, title="someone else's task", assignee="peer", detached=True)
     finally:
         conn.close()
 
@@ -3407,6 +3407,9 @@ def _make_worker_card(monkeypatch, **create_kwargs):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
+        # Detached test context (no origin session); declare it so the origin
+        # guard files the card. create_kwargs may override (e.g. session_id).
+        create_kwargs.setdefault("detached", True)
         tid = kb.create_task(conn, assignee="test-worker", **create_kwargs)
         kb.claim_task(conn, tid)
     finally:
@@ -3564,7 +3567,7 @@ def test_complete_already_terminal_still_reports_terminal(worker_env, monkeypatc
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="one-off", assignee="orch")
+        tid = kb.create_task(conn, title="one-off", assignee="orch", detached=True)
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         conn.commit()
         assert kb.complete_task(conn, tid, summary="first, real completion") is True

@@ -41,11 +41,11 @@ def _stuck_todo(conn, *, parents_done=True, n_parents=1):
     have closed as 'done' without the auto-promote logic firing.
     """
     parent_ids = [
-        kb.create_task(conn, title=f"parent{i}", assignee="setup")
+        kb.create_task(conn, title=f"parent{i}", assignee="setup", detached=True)
         for i in range(n_parents)
     ]
     child_id = kb.create_task(
-        conn, title="child", parents=parent_ids, assignee="setup"
+        conn, title="child", parents=parent_ids, assignee="setup", detached=True
     )
     assert kb.get_task(conn, child_id).status == "todo"
     if parents_done:
@@ -136,7 +136,7 @@ def test_promote_dry_run_reports_dependency_failure(conn):
 
 
 def test_promote_rejects_non_todo_status(conn):
-    tid = kb.create_task(conn, title="standalone")
+    tid = kb.create_task(conn, title="standalone", detached=True)
     assert kb.get_task(conn, tid).status == "ready"
     ok, err = kb.promote_task(conn, tid, actor="tester")
     assert ok is False
@@ -150,7 +150,7 @@ def test_promote_rejects_unknown_task(conn):
 
 
 def test_promote_blocked_task_works(conn):
-    tid = kb.create_task(conn, title="t")
+    tid = kb.create_task(conn, title="t", detached=True)
     conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
     ok, err = kb.promote_task(
         conn, tid, actor="tester", reason="ready now"
@@ -179,9 +179,9 @@ def _promote_ns(task_id, *, ids=None, reason=None, force=False,
 
 def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
+        parent = kb.create_task(conn, title="parent", detached=True)
         children = [
-            kb.create_task(conn, title=f"c{i}", parents=[parent])
+            kb.create_task(conn, title=f"c{i}", parents=[parent], detached=True)
             for i in range(3)
         ]
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
@@ -198,8 +198,8 @@ def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
 def test_cli_promote_bulk_partial_failure_exits_1(kanban_home, capsys):
     """Bulk with one bad id: good ones still promote, exit code reflects failure."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        good = kb.create_task(conn, title="good", parents=[parent])
+        parent = kb.create_task(conn, title="parent", detached=True)
+        good = kb.create_task(conn, title="good", parents=[parent], detached=True)
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
     rc = kb_cli._cmd_promote(_promote_ns(good, ids=["t_nope"]))
     assert rc == 1
@@ -212,9 +212,9 @@ def test_cli_promote_bulk_partial_failure_exits_1(kanban_home, capsys):
 
 def test_cli_promote_bulk_json_emits_list(kanban_home, capsys):
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        a = kb.create_task(conn, title="a", parents=[parent])
-        b = kb.create_task(conn, title="b", parents=[parent])
+        parent = kb.create_task(conn, title="parent", detached=True)
+        a = kb.create_task(conn, title="a", parents=[parent], detached=True)
+        b = kb.create_task(conn, title="b", parents=[parent], detached=True)
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
     rc = kb_cli._cmd_promote(_promote_ns(a, ids=[b], as_json=True))
     assert rc == 0
@@ -227,8 +227,8 @@ def test_cli_promote_bulk_json_emits_list(kanban_home, capsys):
 def test_cli_promote_single_json_stays_flat_object(kanban_home, capsys):
     """Back-compat: single-id JSON is still a flat object, not a list."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="c", parents=[parent])
+        parent = kb.create_task(conn, title="parent", detached=True)
+        child = kb.create_task(conn, title="c", parents=[parent], detached=True)
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
     rc = kb_cli._cmd_promote(_promote_ns(child, as_json=True))
     assert rc == 0
@@ -240,8 +240,8 @@ def test_cli_promote_single_json_stays_flat_object(kanban_home, capsys):
 def test_cli_promote_dedupes_duplicate_ids(kanban_home, capsys):
     """Same id in positional + --ids must only attempt the promotion once."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="c", parents=[parent])
+        parent = kb.create_task(conn, title="parent", detached=True)
+        child = kb.create_task(conn, title="c", parents=[parent], detached=True)
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
     rc = kb_cli._cmd_promote(_promote_ns(child, ids=[child, child]))
     assert rc == 0

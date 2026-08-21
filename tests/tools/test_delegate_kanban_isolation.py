@@ -47,7 +47,7 @@ def _make_running_kanban_task(monkeypatch, tmp_path):
             title="parent",
             assignee="parent-worker",
             workspace_kind="scratch",
-            workspace_path=str(workspace),
+            workspace_path=str(workspace), detached=True,
         )
         claim = kb.claim_task(conn, tid)
         assert claim is not None

@@ -53,7 +53,7 @@ def _add_task_with_body(body: str, *, title: str = "Look at this") -> str:
             title=title,
             body=body,
             assignee="worker-a",
-            tenant=None,
+            tenant=None, detached=True,
         )
     finally:
         conn.close()

@@ -29,9 +29,9 @@ def _status(c, task_id):
 
 def _blocked_child_in(c, lane, *, suffix):
     """Parent done, child sitting in `lane`, then blocked on the dependency."""
-    parent = kanban_db.create_task(c, title=f"parent {suffix}")
+    parent = kanban_db.create_task(c, title=f"parent {suffix}", detached=True)
     c.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
-    child = kanban_db.create_task(c, title=f"child {suffix}", assignee="lamport")
+    child = kanban_db.create_task(c, title=f"child {suffix}", assignee="lamport", detached=True)
     kanban_db.link_tasks(c, parent_id=parent, child_id=child)
     c.execute("UPDATE tasks SET status = ? WHERE id = ?", (lane, child))
     c.commit()

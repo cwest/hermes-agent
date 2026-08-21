@@ -1258,6 +1258,17 @@ def _handle_create(args: dict, **kw) -> str:
         or _current_origin_session_id()
         or os.environ.get("HERMES_SESSION_ID")
     )
+    # The card-origin guard in ``create_task`` requires either a resolved origin
+    # session_id or an explicit detached marker. The tool's wake mechanism is the
+    # notify-sub (registered by ``_maybe_auto_subscribe`` below from the richer
+    # gateway/tui/configured-target origin), NOT the ``session_id`` column — a
+    # gateway card legitimately carries a routable sub with a NULL session_id
+    # (see test_thread_origin_autonomy.test_create_task_persists_origin_session_id).
+    # So when no session_id resolves, declare the create detached w.r.t. the
+    # column; the sub still gives the card a real wake surface. This is an
+    # explicit per-call marker driven by the tool's actual resolution result, not
+    # a silent global default.
+    _detached = not (session_id and str(session_id).strip())
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
     # mean a fresh scratch workspace, even when a dispatcher-spawned worker
@@ -1345,6 +1356,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                detached=_detached,
                 kind=kind,
             )
             new_task = kb.get_task(conn, new_tid)

@@ -69,7 +69,7 @@ def client(kanban_home):
 
 
 def test_set_and_clear_model_override(conn):
-    tid = kb.create_task(conn, title="t", assignee="worker")
+    tid = kb.create_task(conn, title="t", assignee="worker", detached=True)
     assert kb.set_model_override(conn, tid, "gpt-5.6-sol", provider="openai")
     t = kb.get_task(conn, tid)
     assert t.model_override == "gpt-5.6-sol"
@@ -83,7 +83,7 @@ def test_set_and_clear_model_override(conn):
 
 
 def test_set_model_override_events(conn):
-    tid = kb.create_task(conn, title="t", assignee="worker")
+    tid = kb.create_task(conn, title="t", assignee="worker", detached=True)
     kb.set_model_override(conn, tid, "sonnet-x", provider="anthropic")
     events = kb.list_events(conn, tid)
     kinds = [e.kind for e in events]
@@ -94,12 +94,12 @@ def test_set_model_override_events(conn):
 
 
 def test_provider_without_model_rejected(conn):
-    tid = kb.create_task(conn, title="t", assignee="worker")
+    tid = kb.create_task(conn, title="t", assignee="worker", detached=True)
     with pytest.raises(ValueError):
         kb.set_model_override(conn, tid, None, provider="openrouter")
     with pytest.raises(ValueError):
         kb.create_task(
-            conn, title="t2", assignee="worker", provider_override="openrouter",
+            conn, title="t2", assignee="worker", provider_override="openrouter", detached=True,
         )
 
 
@@ -108,7 +108,7 @@ def test_set_model_override_unknown_task(conn):
 
 
 def test_set_model_override_archived_task_rejected(conn):
-    tid = kb.create_task(conn, title="t", assignee="worker")
+    tid = kb.create_task(conn, title="t", assignee="worker", detached=True)
     assert kb.archive_task(conn, tid)
     with pytest.raises(RuntimeError):
         kb.set_model_override(conn, tid, "some-model")
@@ -117,7 +117,7 @@ def test_set_model_override_archived_task_rejected(conn):
 def test_set_model_override_allowed_on_running(conn):
     """The rate-limit recovery flow: override a running task so the NEXT
     dispatch (after reclaim/retry) picks up the new model."""
-    tid = kb.create_task(conn, title="t", assignee="worker")
+    tid = kb.create_task(conn, title="t", assignee="worker", detached=True)
     claimed = kb.claim_task(conn, tid, claimer="worker")
     assert claimed is not None
     assert kb.set_model_override(conn, tid, "fallback-model", provider="nous")
@@ -130,7 +130,7 @@ def test_set_model_override_allowed_on_running(conn):
 def test_create_task_with_model_and_provider(conn):
     tid = kb.create_task(
         conn, title="t", assignee="worker",
-        model_override="qwen-max", provider_override="openrouter",
+        model_override="qwen-max", provider_override="openrouter", detached=True,
     )
     t = kb.get_task(conn, tid)
     assert t.model_override == "qwen-max"
@@ -173,7 +173,7 @@ def _spawn_and_capture(monkeypatch, tmp_path, task):
 def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
     tid = kb.create_task(
         conn, title="t", assignee="elias",
-        model_override="glm-5", provider_override="openrouter",
+        model_override="glm-5", provider_override="openrouter", detached=True,
     )
     task = kb.get_task(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
@@ -186,7 +186,7 @@ def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
 
 def test_spawn_model_only_omits_provider_flag(monkeypatch, tmp_path, conn):
     tid = kb.create_task(
-        conn, title="t", assignee="elias", model_override="glm-5",
+        conn, title="t", assignee="elias", model_override="glm-5", detached=True,
     )
     task = kb.get_task(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
@@ -195,7 +195,7 @@ def test_spawn_model_only_omits_provider_flag(monkeypatch, tmp_path, conn):
 
 
 def test_spawn_no_override_omits_both_flags(monkeypatch, tmp_path, conn):
-    tid = kb.create_task(conn, title="t", assignee="elias")
+    tid = kb.create_task(conn, title="t", assignee="elias", detached=True)
     task = kb.get_task(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     assert "-m" not in cmd

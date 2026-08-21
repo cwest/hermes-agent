@@ -72,7 +72,7 @@ def _stamp_owner_map(conn, tid: str, owner_map: str) -> None:
 
 def _author_card(conn, *, owner_map: str | None, assignee: str = "eckert") -> str:
     """A running author-lane card, optionally stamped with an owner map."""
-    tid = kb.create_task(conn, title="feature work", assignee=assignee)
+    tid = kb.create_task(conn, title="feature work", assignee=assignee, detached=True)
     if owner_map is not None:
         _stamp_owner_map(conn, tid, owner_map)
     kb.claim_task(conn, tid)
@@ -145,7 +145,7 @@ def test_code_author_completion_moves_to_review(kanban_home: Path) -> None:
 def test_ready_lane_author_completion_moves_to_review(kanban_home: Path) -> None:
     """A never-claimed ``ready`` card completed via the CLI is still redirected."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="feature work", assignee="eckert")
+        tid = kb.create_task(conn, title="feature work", assignee="eckert", detached=True)
         _stamp_owner_map(
             conn, tid, "ready: eckert, review: lamport, blocked-acceptance: casey"
         )
@@ -262,7 +262,7 @@ def test_generic_blocked_card_still_completes_to_done(kanban_home: Path) -> None
     the redirect fires only from the author lane (running/ready), and a generic
     blocked card stays completable to ``done`` (manual-complete-a-stuck-card)."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="genuinely stuck", assignee="eckert")
+        tid = kb.create_task(conn, title="genuinely stuck", assignee="eckert", detached=True)
         _stamp_owner_map(
             conn, tid, "ready: eckert, review: lamport, blocked-acceptance: casey"
         )

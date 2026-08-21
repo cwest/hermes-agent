@@ -106,7 +106,7 @@ def _stage_review_with_reviewer(conn, *, author: str = "eckert",
     in ``review`` (the lane, not yet claimed to running) — the state the stray-lane
     bug decorates with an ``assign casey`` that forgets the ``block``.
     """
-    tid = kb.create_task(conn, title="feature work", assignee=author)
+    tid = kb.create_task(conn, title="feature work", assignee=author, detached=True)
     kb.claim_task(conn, tid)
     kb.complete_task(conn, tid, result=f"PR opened: {_PR_URL}")
     with kb.write_txn(conn):

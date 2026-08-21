@@ -118,6 +118,7 @@ def create_swarm(
             f"Goal:\n{goal}"
         ),
         assignee=created_by,
+        detached=True,  # swarm cards are decomposition children; the root is the audit anchor, not a human origin
         created_by=created_by,
         tenant=tenant,
         priority=priority,
@@ -161,6 +162,7 @@ def create_swarm(
             title=spec.title,
             body=(spec.body or "") + context_suffix,
             assignee=spec.profile,
+            detached=True,  # decomposition child of the swarm root
             created_by=created_by,
             parents=[root],
             tenant=tenant,
@@ -183,6 +185,7 @@ def create_swarm(
         title=verifier_title,
         body=verifier_body,
         assignee=verifier_assignee,
+        detached=True,  # decomposition child of the swarm root
         created_by=created_by,
         parents=worker_ids,
         tenant=tenant,
@@ -202,6 +205,7 @@ def create_swarm(
         title=synthesizer_title,
         body=synthesizer_body,
         assignee=synthesizer_assignee,
+        detached=True,  # decomposition child of the swarm root
         created_by=created_by,
         parents=[verifier],
         tenant=tenant,

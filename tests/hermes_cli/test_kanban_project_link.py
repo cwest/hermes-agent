@@ -28,7 +28,7 @@ def _make_project(name="Web App", repo="/tmp/webapp"):
 
 def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn):
     proj = _make_project()
-    tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug)
+    tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug, detached=True)
     task = kb.get_task(kanban_conn, tid)
 
     assert task.project_id == proj.id
@@ -47,14 +47,14 @@ def test_explicit_branch_overrides_project_default(kanban_conn):
         title="x",
         project_id=proj.slug,
         workspace_kind="worktree",
-        branch_name="feature/custom",
+        branch_name="feature/custom", detached=True,
     )
     task = kb.get_task(kanban_conn, tid)
     assert task.branch_name == "feature/custom"
 
 
 def test_unlinked_task_unchanged(kanban_conn):
-    tid = kb.create_task(kanban_conn, title="plain")
+    tid = kb.create_task(kanban_conn, title="plain", detached=True)
     task = kb.get_task(kanban_conn, tid)
 
     assert task.project_id is None
@@ -67,7 +67,7 @@ def test_unlinked_task_unchanged(kanban_conn):
 def test_unknown_project_id_falls_back_gracefully(kanban_conn):
     # A project id that doesn't resolve must not crash task creation; the task
     # is created as-is (scratch) and project_id stays unset.
-    tid = kb.create_task(kanban_conn, title="x", project_id="does-not-exist")
+    tid = kb.create_task(kanban_conn, title="x", project_id="does-not-exist", detached=True)
     task = kb.get_task(kanban_conn, tid)
     assert task.workspace_kind == "scratch"
     assert task.project_id is None

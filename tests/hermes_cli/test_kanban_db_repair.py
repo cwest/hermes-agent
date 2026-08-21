@@ -22,7 +22,7 @@ def _build_board_db(db_path: Path, tasks: int = 12) -> None:
     kb.init_db(db_path=db_path)
     with kb.connect(db_path=db_path) as conn:
         for i in range(tasks):
-            kb.create_task(conn, title=f"task-{i}")
+            kb.create_task(conn, title=f"task-{i}", detached=True)
     conn.close()
     # Force the next connect() to re-run the health guard.
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
@@ -190,7 +190,7 @@ def test_repaired_db_connects_normally_afterwards(tmp_path):
     before = set(tmp_path.glob("kanban.db.corrupt.*.bak"))
     conn = kb.connect(db_path=db_path)
     try:
-        kb.create_task(conn, title="post-repair")
+        kb.create_task(conn, title="post-repair", detached=True)
         assert "post-repair" in {t.title for t in kb.list_tasks(conn)}
     finally:
         conn.close()
@@ -368,7 +368,7 @@ def test_wal_checkpoint_truncates_wal_file(tmp_path, monkeypatch):
     try:
         # Generate WAL frames.
         for i in range(30):
-            kb.create_task(conn, title=f"wal-{i}")
+            kb.create_task(conn, title=f"wal-{i}", detached=True)
         wal = tmp_path / "kanban.db-wal"
         assert wal.exists() and wal.stat().st_size > 0
 

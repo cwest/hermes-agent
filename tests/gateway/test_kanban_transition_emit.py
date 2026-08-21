@@ -290,7 +290,7 @@ def _enable_emit(monkeypatch, kinds=None):
 def _make_blocked_sub(reason="awaiting-casey-signoff: merge PR #1"):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="emit me", assignee="worker")
+        tid = kb.create_task(conn, title="emit me", assignee="worker", detached=True)
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-1",
             notifier_profile="default",
@@ -370,7 +370,7 @@ def test_notifier_skips_bridge_for_unconfigured_kind(tmp_path, monkeypatch):
     # A COMPLETED event (done) — not in the default emit set.
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="done not emitted", assignee="worker")
+        tid = kb.create_task(conn, title="done not emitted", assignee="worker", detached=True)
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-1",
             notifier_profile="default",
@@ -422,7 +422,7 @@ def test_notifier_suppresses_wake_for_write_time_sweep_card(tmp_path, monkeypatc
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="curate: write-time sweep @ 9c63aa9", assignee="avram",
+            conn, title="curate: write-time sweep @ 9c63aa9", assignee="avram", detached=True,
         )
         # A real (non-Home) origin sub — proves the suppression is by CARD CLASS,
         # not merely by the no-origin fallback path.
@@ -467,7 +467,7 @@ def test_notifier_suppresses_wake_for_home_fallback_no_origin_card(
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="some no-origin bookkeeping card", assignee="worker",
+            conn, title="some no-origin bookkeeping card", assignee="worker", detached=True,
         )
         # Thread-less sub pointed at the Home fallback channel — the synthesized
         # no-origin fallback the notifier persists for a sub-less transition.
@@ -511,7 +511,7 @@ def test_notifier_still_fires_wake_for_real_origin_card(tmp_path, monkeypatch):
         tid = kb.create_task(
             conn,
             title="curate: audit & steward the intent-driven-development brief",
-            assignee="avram",
+            assignee="avram", detached=True,
         )
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="real-thread-chat",

@@ -29,7 +29,7 @@ def conn(tmp_path, monkeypatch):
 
 
 def test_worker_origin_env_from_thread_bearing_sub(conn):
-    tid = kb.create_task(conn, title="t", assignee="peer")
+    tid = kb.create_task(conn, title="t", assignee="peer", detached=True)
     kb.add_notify_sub(
         conn, task_id=tid, platform="discord", chat_id="CHAN",
         thread_id="THREAD", user_id="U", notifier_profile="p",
@@ -44,7 +44,7 @@ def test_worker_origin_env_from_thread_bearing_sub(conn):
 
 def test_worker_origin_env_prefers_thread_bearing_over_threadless(conn):
     """When both a thread sub and a bare-channel sub exist, prefer the thread one."""
-    tid = kb.create_task(conn, title="t", assignee="peer")
+    tid = kb.create_task(conn, title="t", assignee="peer", detached=True)
     # (add_notify_sub's guard actually blocks the second here, but assert the
     # selection is robust regardless of insert order.)
     kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id="CHAN",
@@ -55,12 +55,12 @@ def test_worker_origin_env_prefers_thread_bearing_over_threadless(conn):
 
 
 def test_worker_origin_env_none_when_no_sub(conn):
-    tid = kb.create_task(conn, title="t", assignee="peer")
+    tid = kb.create_task(conn, title="t", assignee="peer", detached=True)
     assert kb.worker_origin_env(conn, tid) is None
 
 
 def test_worker_origin_env_ignores_tui_and_report_back_only(conn):
     """A 'tui' sub is a local UI channel, not a routable chat origin → skip it."""
-    tid = kb.create_task(conn, title="t", assignee="peer")
+    tid = kb.create_task(conn, title="t", assignee="peer", detached=True)
     kb.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="sess-key")
     assert kb.worker_origin_env(conn, tid) is None

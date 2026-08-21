@@ -99,7 +99,7 @@ def _(home, kb):
             ("null\x00bytes", "nullbyte"),
         ]
         for title, kind in cases:
-            tid = kb.create_task(conn, title=title, assignee="w")
+            tid = kb.create_task(conn, title=title, assignee="w", detached=True)
             back = kb.get_task(conn, tid)
             assert back.title == title, (
                 f"[{kind}] round-trip mismatch: {title!r} → {back.title!r}"
@@ -107,7 +107,7 @@ def _(home, kb):
         print(f"  {len(cases)} unicode titles round-tripped")
 
         # Metadata with non-ASCII + emoji
-        tid = kb.create_task(conn, title="with meta", assignee="w")
+        tid = kb.create_task(conn, title="with meta", assignee="w", detached=True)
         kb.claim_task(conn, tid)
         meta = {
             "作者": "张三",
@@ -143,7 +143,7 @@ def _(home, kb):
         for _ in range(50):
             meta = {"nested": meta}
         tid = kb.create_task(
-            conn, title="huge task", body=huge_body, assignee="w",
+            conn, title="huge task", body=huge_body, assignee="w", detached=True,
         )
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, summary=huge_summary, metadata=meta)
@@ -175,7 +175,7 @@ def _(home, kb):
         ]
         for p in payloads:
             tid = kb.create_task(
-                conn, title=p, body=p, assignee=p, tenant=p,
+                conn, title=p, body=p, assignee=p, tenant=p, detached=True,
             )
             back = kb.get_task(conn, tid)
             assert back.title == p
@@ -199,7 +199,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="multiline", assignee="w")
+        tid = kb.create_task(conn, title="multiline", assignee="w", detached=True)
         kb.claim_task(conn, tid)
         multi = "line 1\nline 2\tindented\n\nline 4"
         kb.complete_task(conn, tid, summary=multi)
@@ -221,7 +221,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="meta test", assignee="w")
+        tid = kb.create_task(conn, title="meta test", assignee="w", detached=True)
         kb.claim_task(conn, tid)
     finally:
         conn.close()
@@ -264,8 +264,8 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="A", assignee="w")
-        b = kb.create_task(conn, title="B", assignee="w", parents=[a])
+        a = kb.create_task(conn, title="A", assignee="w", detached=True)
+        b = kb.create_task(conn, title="B", assignee="w", parents=[a], detached=True)
         # Try to link A back to B — creating the cycle
         try:
             kb.link_tasks(conn, parent_id=b, child_id=a)
@@ -301,7 +301,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="self", assignee="w")
+        tid = kb.create_task(conn, title="self", assignee="w", detached=True)
         try:
             kb.link_tasks(conn, parent_id=tid, child_id=tid)
             raise AssertionError("self-parenting should be rejected")
@@ -318,12 +318,12 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        root = kb.create_task(conn, title="root", assignee="w")
+        root = kb.create_task(conn, title="root", assignee="w", detached=True)
         kb.claim_task(conn, root)
         kb.complete_task(conn, root, result="ready")
-        a = kb.create_task(conn, title="A", assignee="w", parents=[root])
-        b = kb.create_task(conn, title="B", assignee="w", parents=[root])
-        leaf = kb.create_task(conn, title="leaf", assignee="w", parents=[a, b])
+        a = kb.create_task(conn, title="A", assignee="w", parents=[root], detached=True)
+        b = kb.create_task(conn, title="B", assignee="w", parents=[root], detached=True)
+        leaf = kb.create_task(conn, title="leaf", assignee="w", parents=[a, b], detached=True)
 
         # A done but B not → leaf stays todo
         kb.claim_task(conn, a)
@@ -354,9 +354,9 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="root", assignee="w")
+        parent = kb.create_task(conn, title="root", assignee="w", detached=True)
         children = [
-            kb.create_task(conn, title=f"c{i}", assignee="w", parents=[parent])
+            kb.create_task(conn, title=f"c{i}", assignee="w", parents=[parent], detached=True)
             for i in range(500)
         ]
         kb.claim_task(conn, parent)
@@ -383,10 +383,10 @@ def _(home, kb):
     conn = kb.connect()
     try:
         parents = [
-            kb.create_task(conn, title=f"p{i}", assignee="w") for i in range(500)
+            kb.create_task(conn, title=f"p{i}", assignee="w", detached=True) for i in range(500)
         ]
         child = kb.create_task(
-            conn, title="leaf", assignee="w", parents=parents,
+            conn, title="leaf", assignee="w", parents=parents, detached=True,
         )
         # Complete 499 parents
         for p in parents[:-1]:
@@ -422,7 +422,7 @@ def _(home, kb):
             conn, title="path-traversal",
             assignee="w",
             workspace_kind="dir",
-            workspace_path="../../../tmp/attacker",
+            workspace_path="../../../tmp/attacker", detached=True,
         )
         task = kb.get_task(conn, tid)
         # Document what actually happens — is the path stored verbatim?
@@ -458,7 +458,7 @@ def _(home, kb):
         tid = kb.create_task(
             conn, title="bad-workspace", assignee="w",
             workspace_kind="dir",
-            workspace_path="/nonexistent/path/that/does/not/exist",
+            workspace_path="/nonexistent/path/that/does/not/exist", detached=True,
         )
         # Run dispatch_once with a dummy spawn_fn
         result = kb.dispatch_once(conn, spawn_fn=lambda *_: 99999)
@@ -495,7 +495,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="time-travel", assignee="w")
+        tid = kb.create_task(conn, title="time-travel", assignee="w", detached=True)
         kb.claim_task(conn, tid)
         # Force a future started_at via raw SQL
         future = int(time.time()) + 3600
@@ -540,7 +540,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="spaced", assignee="w")
+        tid = kb.create_task(conn, title="spaced", assignee="w", detached=True)
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, summary="path has spaces")
         runs = kb.list_runs(conn, tid)
@@ -566,7 +566,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="unicode home", assignee="w")
+        tid = kb.create_task(conn, title="unicode home", assignee="w", detached=True)
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, summary="ok")
         assert (Path(weird) / "kanban.db").exists()
@@ -592,7 +592,7 @@ def _(home, kb):
         kb._INITIALIZED_PATHS.clear()
         kb.init_db()
         conn1 = kb.connect()
-        kb.create_task(conn1, title="t1", assignee="w")
+        kb.create_task(conn1, title="t1", assignee="w", detached=True)
         conn1.close()
 
         # Switch to link2 pointing at the same dir
@@ -626,7 +626,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="retry-heavy", assignee="w")
+        tid = kb.create_task(conn, title="retry-heavy", assignee="w", detached=True)
         # Force reclaims by manually closing runs
         for i in range(1000):
             kb.claim_task(conn, tid)
@@ -667,7 +667,7 @@ def _(home, kb):
                 kb.create_task(
                     conn, title=f"tenant-{t}-task-{i}",
                     tenant=f"tenant_{t:03d}",
-                    assignee="w",
+                    assignee="w", detached=True,
                 )
         t0 = time.monotonic()
         stats = kb.board_stats(conn)
@@ -701,7 +701,7 @@ def _idempotency_race_worker(hermes_home: str, key: str, result_file: str,
     try:
         tid = kb.create_task(
             conn, title=f"race pid={os.getpid()}",
-            assignee="w", idempotency_key=key,
+            assignee="w", idempotency_key=key, detached=True,
         )
     finally:
         conn.close()
@@ -776,7 +776,7 @@ def _(home, kb):
             "",  # empty string
         ]
         for a in assignees:
-            tid = kb.create_task(conn, title=f"for {a!r}", assignee=a or None)
+            tid = kb.create_task(conn, title=f"for {a!r}", assignee=a or None, detached=True)
             back = kb.get_task(conn, tid)
             # Empty string is coerced to None by kernel, or stored verbatim?
             if a:
@@ -793,7 +793,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="terminal", assignee="w")
+        tid = kb.create_task(conn, title="terminal", assignee="w", detached=True)
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, summary="all done")
         # Try to re-claim a done task
@@ -816,7 +816,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="archive-me", assignee="w")
+        tid = kb.create_task(conn, title="archive-me", assignee="w", detached=True)
         kb.archive_task(conn, tid)
         # Archived task shouldn't appear in default list
         tasks = kb.list_tasks(conn)
@@ -846,7 +846,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="orphan", assignee=None)
+        tid = kb.create_task(conn, title="orphan", assignee=None, detached=True)
         assert kb.get_task(conn, tid).status == "ready"
         result = kb.dispatch_once(conn, spawn_fn=lambda *_: 42)
         assert tid in result.skipped_unassigned
@@ -865,7 +865,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="chatty", assignee="w")
+        tid = kb.create_task(conn, title="chatty", assignee="w", detached=True)
         for i in range(1000):
             kb.add_comment(conn, tid, author=f"user{i % 5}", body=f"comment number {i}")
         # Exclude the create_task owner-map stamp (author 'kanban', t_0c8744a1).
@@ -890,18 +890,18 @@ def _(home, kb):
     try:
         # Empty title → reject
         try:
-            kb.create_task(conn, title="", assignee="w")
+            kb.create_task(conn, title="", assignee="w", detached=True)
             raise AssertionError("empty title should have been rejected")
         except ValueError:
             pass
         # Whitespace-only title → reject
         try:
-            kb.create_task(conn, title="   \t\n  ", assignee="w")
+            kb.create_task(conn, title="   \t\n  ", assignee="w", detached=True)
             raise AssertionError("whitespace-only title should have been rejected")
         except ValueError:
             pass
         # Empty body → accept (legitimate: just title says it all)
-        tid = kb.create_task(conn, title="empty body ok", body="", assignee="w")
+        tid = kb.create_task(conn, title="empty body ok", body="", assignee="w", detached=True)
         assert kb.get_task(conn, tid).body in {"", None}
         # Empty summary on complete → accept
         kb.claim_task(conn, tid)
@@ -922,7 +922,7 @@ def _(home, kb):
     conn = kb.connect()
     try:
         weird_tenant = "line1\nline2\tindented"
-        tid = kb.create_task(conn, title="weird tenant", assignee="w", tenant=weird_tenant)
+        tid = kb.create_task(conn, title="weird tenant", assignee="w", tenant=weird_tenant, detached=True)
         back = kb.get_task(conn, tid)
         assert back.tenant == weird_tenant
         # board_stats groups by tenant — verify it doesn't fall over
@@ -940,15 +940,15 @@ def _(home, kb):
     conn = kb.connect()
     try:
         # Create one parent in each possible non-done state
-        p_ready = kb.create_task(conn, title="p-ready", assignee="w")
-        p_running = kb.create_task(conn, title="p-running", assignee="w")
+        p_ready = kb.create_task(conn, title="p-ready", assignee="w", detached=True)
+        p_running = kb.create_task(conn, title="p-running", assignee="w", detached=True)
         kb.claim_task(conn, p_running)
-        p_blocked = kb.create_task(conn, title="p-blocked", assignee="w")
+        p_blocked = kb.create_task(conn, title="p-blocked", assignee="w", detached=True)
         kb.block_task(conn, p_blocked, reason="stuck")
-        p_triage = kb.create_task(conn, title="p-triage", assignee="w", triage=True)
-        p_archived = kb.create_task(conn, title="p-archived", assignee="w")
+        p_triage = kb.create_task(conn, title="p-triage", assignee="w", triage=True, detached=True)
+        p_archived = kb.create_task(conn, title="p-archived", assignee="w", detached=True)
         kb.archive_task(conn, p_archived)
-        p_done = kb.create_task(conn, title="p-done", assignee="w")
+        p_done = kb.create_task(conn, title="p-done", assignee="w", detached=True)
         kb.claim_task(conn, p_done)
         kb.complete_task(conn, p_done)
 
@@ -962,7 +962,7 @@ def _(home, kb):
             (p_done, "ready"),     # only done parent unblocks child
         ]:
             child = kb.create_task(
-                conn, title=f"child-of-{parent}", assignee="w", parents=[parent],
+                conn, title=f"child-of-{parent}", assignee="w", parents=[parent], detached=True,
             )
             kb.recompute_ready(conn)
             actual = kb.get_task(conn, child).status

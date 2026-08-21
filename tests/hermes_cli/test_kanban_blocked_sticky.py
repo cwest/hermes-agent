@@ -59,7 +59,7 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
     Before #28712's fix, ``recompute_ready`` would silently flip it
     back to ``ready`` on the very next tick."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="needs human review")
+        tid = kb.create_task(conn, title="needs human review", detached=True)
         kb.claim_task(conn, tid)
         assert kb.block_task(
             conn, tid,
@@ -82,8 +82,8 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
     every parent is done, a worker-initiated block on the child must
     stay blocked."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
+        parent = kb.create_task(conn, title="parent", detached=True)
+        child = kb.create_task(conn, title="child", parents=[parent], detached=True)
         kb.complete_task(conn, parent, result="parent ok")
 
         kb.claim_task(conn, child)
@@ -119,8 +119,8 @@ def test_circuit_breaker_block_still_auto_promotes(kanban_home: Path) -> None:
     the two never disagree.
     """
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
+        parent = kb.create_task(conn, title="parent", detached=True)
+        child = kb.create_task(conn, title="child", parents=[parent], detached=True)
         kb.complete_task(conn, parent, result="ok")
 
         # Simulate a transient circuit-breaker / direct triage that flips
@@ -149,8 +149,8 @@ def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> No
     as sticky — otherwise we'd regress the safety net for genuinely
     transient crashes."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
+        parent = kb.create_task(conn, title="parent", detached=True)
+        child = kb.create_task(conn, title="child", parents=[parent], detached=True)
         kb.complete_task(conn, parent, result="ok")
 
         # Status + event match what _record_task_failure writes when
@@ -181,7 +181,7 @@ def test_unblock_clears_sticky_state_and_lets_block_recover(kanban_home: Path) -
     unblock, a *subsequent* circuit-breaker block on the same task
     must again be eligible for auto-recovery."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="t")
+        tid = kb.create_task(conn, title="t", detached=True)
         kb.claim_task(conn, tid)
         kb.block_task(
             conn, tid,
@@ -232,7 +232,7 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
     leaves the task blocked.
     """
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="loop reproducer")
+        tid = kb.create_task(conn, title="loop reproducer", detached=True)
         kb.claim_task(conn, tid)
         kb.block_task(
             conn, tid,

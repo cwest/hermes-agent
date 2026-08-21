@@ -31,7 +31,7 @@ def _status(c, task_id):
 
 
 def _running_card(c, title):
-    task_id = kanban_db.create_task(c, title=title, assignee="easley")
+    task_id = kanban_db.create_task(c, title=title, assignee="easley", detached=True)
     c.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,))
     c.commit()
     return task_id

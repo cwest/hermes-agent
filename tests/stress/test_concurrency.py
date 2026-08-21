@@ -132,7 +132,7 @@ def main():
     for i in range(NUM_TASKS):
         tid = kb.create_task(
             conn, title=f"task #{i}", assignee="shared",
-            tenant="concurrency-test",
+            tenant="concurrency-test", detached=True,
         )
         tids.append(tid)
     conn.close()

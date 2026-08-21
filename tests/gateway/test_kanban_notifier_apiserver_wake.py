@@ -85,6 +85,10 @@ def _create_completed_subscription(platform, chat_id, session_id=None):
     try:
         tid = kb.create_task(
             conn, title="notify once", assignee="worker", session_id=session_id,
+            # The origin lives in the notify sub added just below, not the
+            # session_id column; declare detached when no session_id is supplied
+            # so the origin guard files the card.
+            detached=not (session_id and str(session_id).strip()),
         )
         kb.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
         kb.complete_task(conn, tid, summary="done once")

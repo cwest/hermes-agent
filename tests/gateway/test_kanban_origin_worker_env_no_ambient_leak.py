@@ -93,7 +93,7 @@ def test_spawn_seeds_this_cards_origin_over_ambient(spawn_env, monkeypatch, tmp_
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="coder")
+        tid = kb.create_task(conn, title="t", assignee="coder", detached=True)
         kb.add_notify_sub(
             conn,
             task_id=tid,

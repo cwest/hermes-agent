@@ -68,7 +68,7 @@ def test_subscription_defaults_to_delivery_profile_not_creator(tmp_path, monkeyp
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="worker-created", assignee="salton")
+        tid = kb.create_task(conn, title="worker-created", assignee="salton", detached=True)
         # Subscribe WITHOUT an explicit notifier_profile — must default to the
         # delivering gateway's profile, not the creator's.
         kb.add_notify_sub(
@@ -106,7 +106,7 @@ def test_create_task_persists_origin_session_id(tmp_path, monkeypatch):
         assert task.session_id == sid, "origin session_id must persist on the card"
 
         # No session context => None (non-thread origin), not a crash.
-        tid2 = kb.create_task(conn, title="no-origin", assignee="hollis")
+        tid2 = kb.create_task(conn, title="no-origin", assignee="hollis", detached=True)
         assert kb.get_task(conn, tid2).session_id in (None, ""), (
             "a card with no origin session must have empty session_id"
         )

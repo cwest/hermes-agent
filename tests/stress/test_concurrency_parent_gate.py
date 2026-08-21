@@ -50,7 +50,7 @@ def run() -> int:
     try:
         for i in range(10):
             parent_ids.append(
-                kb.create_task(conn, title=f"parent-{i}", assignee="a")
+                kb.create_task(conn, title=f"parent-{i}", assignee="a", detached=True)
             )
     finally:
         conn.close()
@@ -74,7 +74,7 @@ def run() -> int:
                 parents = random.sample(parent_ids, k=2)
                 # Step 1: insert child WITHOUT parents (ends up ready).
                 child = kb.create_task(
-                    conn, title="child", assignee="a", parents=[],
+                    conn, title="child", assignee="a", parents=[], detached=True,
                 )
                 # Tiny delay so worker threads get a chance to see the
                 # ready row before the links are inserted.

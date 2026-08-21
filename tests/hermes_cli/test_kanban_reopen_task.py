@@ -36,7 +36,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def _done_card(conn) -> str:
     """A card sitting at ``done`` (via Casey's merge override, so setup itself
     doesn't depend on the very fall-through under test)."""
-    tid = kb.create_task(conn, title="reached done off-merge", assignee="eckert")
+    tid = kb.create_task(conn, title="reached done off-merge", assignee="eckert", detached=True)
     kb.claim_task(conn, tid)
     kb.complete_task(conn, tid, summary="self-completed", allow_acceptance_complete=True)
     assert kb.get_task(conn, tid).status == "done"
@@ -96,7 +96,7 @@ def test_reopen_refuses_a_non_done_card(kanban_home: Path) -> None:
     """Only a ``done`` card is reconcilable via reopen — a live card is a no-op
     (returns False, no mutation)."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="still running", assignee="eckert")
+        tid = kb.create_task(conn, title="still running", assignee="eckert", detached=True)
         kb.claim_task(conn, tid)
         assert kb.get_task(conn, tid).status == "running"
 

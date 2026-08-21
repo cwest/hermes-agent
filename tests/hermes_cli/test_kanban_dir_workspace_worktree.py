@@ -108,7 +108,7 @@ def test_dir_repo_root_resolves_to_worktree_not_in_place(kanban_home, tmp_path):
             conn,
             title="office feature",
             workspace_kind="dir",
-            workspace_path=str(repo),
+            workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -131,11 +131,11 @@ def test_dir_repo_root_concurrent_tasks_get_distinct_worktrees(kanban_home, tmp_
     with kb.connect() as conn:
         t1 = kb.create_task(
             conn, title="card one",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         t2 = kb.create_task(
             conn, title="card two",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         task1 = kb.get_task(conn, t1)
         task2 = kb.get_task(conn, t2)
@@ -167,7 +167,7 @@ def test_dir_repo_root_runtime_files_not_carried_into_worker_branch(
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="office feature",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -190,7 +190,7 @@ def test_dir_plain_directory_still_returns_directory(kanban_home, tmp_path):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="ops sweep",
-            workspace_kind="dir", workspace_path=str(opsdir),
+            workspace_kind="dir", workspace_path=str(opsdir), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -212,7 +212,7 @@ def test_dir_subdir_of_repo_still_returns_directory(kanban_home, tmp_path):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="scoped work",
-            workspace_kind="dir", workspace_path=str(subdir),
+            workspace_kind="dir", workspace_path=str(subdir), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -234,7 +234,7 @@ def test_dir_deploy_clone_untracked_branch_fails_loudly(kanban_home, tmp_path):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="office feature",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -284,7 +284,7 @@ def test_dir_fork_clone_on_tracked_non_main_branch_dispatches(kanban_home, tmp_p
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="fork feature",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -314,7 +314,7 @@ def test_dir_clone_detached_at_ancestor_of_upstream_self_heals(kanban_home, tmp_
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="office feature",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -352,7 +352,7 @@ def test_dir_clone_detached_at_ancestor_ff_advances_to_upstream(kanban_home, tmp
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="office feature",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -383,7 +383,7 @@ def test_dir_clone_detached_at_commit_not_upstream_fails_loudly(kanban_home, tmp
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="office feature",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -409,7 +409,7 @@ def test_dir_clone_dirty_detached_head_fails_loudly(kanban_home, tmp_path):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="office feature",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -434,7 +434,7 @@ def test_dir_clone_named_local_only_branch_still_fails(kanban_home, tmp_path):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="office feature",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -468,7 +468,7 @@ def test_dir_linked_worktree_on_topic_branch_dispatches(kanban_home, tmp_path):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="work in a linked worktree",
-            workspace_kind="dir", workspace_path=str(worktree),
+            workspace_kind="dir", workspace_path=str(worktree), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -506,7 +506,7 @@ def test_dir_repo_root_excludes_worktrees_dir_from_anchor(kanban_home, tmp_path)
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="office feature",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
@@ -527,11 +527,11 @@ def test_dir_repo_root_exclude_is_idempotent(kanban_home, tmp_path):
     with kb.connect() as conn:
         t1 = kb.create_task(
             conn, title="card one",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         t2 = kb.create_task(
             conn, title="card two",
-            workspace_kind="dir", workspace_path=str(repo),
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
         )
         task1 = kb.get_task(conn, t1)
         task2 = kb.get_task(conn, t2)
@@ -555,7 +555,7 @@ def test_worktree_kind_repo_root_also_excludes_worktrees_dir(kanban_home, tmp_pa
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="worktree card",
-            workspace_kind="worktree", workspace_path=str(repo),
+            workspace_kind="worktree", workspace_path=str(repo), detached=True,
         )
         task = kb.get_task(conn, tid)
 
