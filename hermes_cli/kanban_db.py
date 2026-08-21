@@ -10182,6 +10182,11 @@ def archive_task(
         if termination is not None:
             payload = {"reaped_worker": termination}
         _append_event(conn, task_id, "archived", payload, run_id=run_id)
+        # Prune-on-terminal: an archived card's notify subs are fossils —
+        # ``archived`` events are silent (no wake), so nothing needs to read
+        # the sub row after this point. Delete in the SAME txn as the status
+        # write so the row can never outlive the card.
+        _prune_notify_subs_inline(conn, task_id)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
@@ -15006,6 +15011,35 @@ def parse_origin_session(
     return platform, chat_id, thread_id
 
 
+# Statuses a task never leaves under normal flow. A subscription that
+# backs a task in one of these states is a fossil the moment it lands
+# there (there is no further wake to deliver) and can be swept.
+_NOTIFY_TERMINAL_STATUSES = ("done", "archived")
+
+
+def _prune_notify_subs_inline(conn: sqlite3.Connection, task_id: str) -> int:
+    """Delete all subscription rows for ``task_id``. Caller owns the txn.
+
+    Used by terminal transitions (``archive_task``) to garbage-collect a
+    task's ``kanban_notify_subs`` rows in the SAME write transaction as
+    the status write, so the row can never outlive the card. Returns the
+    number of rows removed.
+
+    Only safe to call inline for transitions whose terminal event carries
+    NO wake — i.e. ``archived`` (the notifier treats archived/unblocked as
+    silent). The ``done`` transition (``complete_task``) is deliberately
+    NOT pruned inline: its ``completed`` event drives a wake that the
+    gateway notifier must still be able to read from a live sub row, so
+    the notifier removes that row only AFTER delivering. The backlog
+    sweep (:func:`gc_terminal_notify_subs`) is the safety net that reaps
+    ``done`` subs left behind when no gateway was running to deliver.
+    """
+    cur = conn.execute(
+        "DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
+    )
+    return int(cur.rowcount or 0)
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -15462,6 +15496,104 @@ def gc_events(
             (cutoff,),
         )
     return int(cur.rowcount or 0)
+
+
+def gc_terminal_notify_subs(
+    conn: sqlite3.Connection, *, dry_run: bool = False,
+) -> dict:
+    """Sweep fossil ``kanban_notify_subs`` rows and collapse duplicates.
+
+    Two independent cleanups, reported separately:
+
+    1. **Deduplicate.** Collapse legacy duplicate rows that share a
+       ``(task_id, platform, chat_id, thread_id)`` target down to a
+       single row (keeping the lowest ``rowid``). The current schema's
+       primary key prevents new duplicates, but boards created before the
+       PK still carry them, and they are a source of paired/duplicate
+       wake deliveries.
+    2. **Prune terminal.** Delete every subscription whose task is already
+       in a terminal status (``done`` / ``archived``). Live-card
+       subscriptions (ready / running / blocked / todo / triage / …) are
+       never touched.
+
+    Order matters: dedup runs first so the prune count reflects the
+    post-dedup row set (a duplicate on a terminal card is collapsed by
+    dedup, then the survivor is removed by the prune — never
+    double-counted).
+
+    ``dry_run=True`` computes the counts WITHOUT mutating and reports them
+    under ``would_deduplicate`` / ``would_remove``; the real-delete keys
+    are ``deduplicated`` / ``removed``. ``by_status`` is a per-terminal-
+    status breakdown of the rows the prune targets. The sweep is
+    idempotent: a second run on an already-swept board reports zeros.
+    """
+    # --- 1. Duplicate detection: rows that are NOT the lowest rowid within
+    #     their (task, platform, chat, thread) group.
+    dup_rowids = [
+        int(r["rowid"])
+        for r in conn.execute(
+            "SELECT rowid FROM kanban_notify_subs WHERE rowid NOT IN ("
+            "  SELECT MIN(rowid) FROM kanban_notify_subs"
+            "  GROUP BY task_id, platform, chat_id, thread_id"
+            ")"
+        ).fetchall()
+    ]
+    dup_count = len(dup_rowids)
+
+    # --- 2. Terminal-task subscription rows. Computed AFTER excluding the
+    #     duplicate rowids so a terminal duplicate is attributed to dedup,
+    #     not double-counted by the prune. Grouped by task status for the
+    #     human-facing breakdown.
+    by_status: dict[str, int] = {}
+    placeholders = ",".join("?" for _ in _NOTIFY_TERMINAL_STATUSES)
+    prune_rows = conn.execute(
+        f"SELECT t.status AS status, s.rowid AS rowid "
+        f"FROM kanban_notify_subs s "
+        f"JOIN tasks t ON t.id = s.task_id "
+        f"WHERE t.status IN ({placeholders})",
+        tuple(_NOTIFY_TERMINAL_STATUSES),
+    ).fetchall()
+    dup_set = set(dup_rowids)
+    prune_rowids = [
+        int(r["rowid"]) for r in prune_rows if int(r["rowid"]) not in dup_set
+    ]
+    for r in prune_rows:
+        if int(r["rowid"]) in dup_set:
+            continue
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+    prune_count = len(prune_rowids)
+
+    if dry_run:
+        return {
+            "would_deduplicate": dup_count,
+            "would_remove": prune_count,
+            "deduplicated": 0,
+            "removed": 0,
+            "by_status": by_status,
+        }
+
+    removed = 0
+    deduplicated = 0
+    with write_txn(conn):
+        if dup_rowids:
+            conn.executemany(
+                "DELETE FROM kanban_notify_subs WHERE rowid = ?",
+                [(rid,) for rid in dup_rowids],
+            )
+            deduplicated = dup_count
+        if prune_rowids:
+            conn.executemany(
+                "DELETE FROM kanban_notify_subs WHERE rowid = ?",
+                [(rid,) for rid in prune_rowids],
+            )
+            removed = prune_count
+    return {
+        "would_deduplicate": 0,
+        "would_remove": 0,
+        "deduplicated": deduplicated,
+        "removed": removed,
+        "by_status": by_status,
+    }
 
 
 def gc_worker_logs(
