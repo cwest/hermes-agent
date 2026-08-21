@@ -948,6 +948,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
+    p_gc.add_argument("--dry-run", action="store_true",
+                      help="Report what the notify-subscription sweep would remove "
+                           "(terminal-task rows + duplicates) without deleting anything")
 
     # --- repair ---
     p_repair = sub.add_parser(
@@ -3186,9 +3189,32 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove scratch workspaces of archived tasks, prune old events, and
-    delete old worker logs."""
+    """Remove scratch workspaces of archived tasks, prune old events, delete
+    old worker logs, and sweep fossil notify subscriptions."""
     import shutil
+
+    dry_run = getattr(args, "dry_run", False)
+
+    # --dry-run is a non-mutating preview of the notify-subscription sweep
+    # only (the destructive workspace/event/log cleanups have their own
+    # retention windows and are not previewed). Report the count + a
+    # per-status breakdown and exit without touching the DB.
+    if dry_run:
+        with kb.connect_closing() as conn:
+            report = kb.gc_terminal_notify_subs(conn, dry_run=True)
+        breakdown = ", ".join(
+            f"{status}={count}"
+            for status, count in sorted(report["by_status"].items())
+        ) or "none"
+        print(
+            "GC dry-run: would remove "
+            f"{report['would_remove']} terminal notify-sub row(s) "
+            f"[{breakdown}] and collapse "
+            f"{report['would_deduplicate']} duplicate row(s); "
+            "no changes made."
+        )
+        return 0
+
     scratch_root = kb.workspaces_root()
     removed_ws = 0
     with kb.connect_closing() as conn:
@@ -3218,11 +3244,16 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         removed_events = kb.gc_events(
             conn, older_than_seconds=event_days * 24 * 3600,
         )
+        sub_report = kb.gc_terminal_notify_subs(conn, dry_run=False)
     removed_logs = kb.gc_worker_logs(
         older_than_seconds=log_days * 24 * 3600,
     )
+    removed_subs = sub_report["removed"]
+    deduped_subs = sub_report["deduplicated"]
     print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+          f"{removed_events} event row(s), {removed_logs} log file(s), "
+          f"{removed_subs} terminal notify-sub row(s) removed "
+          f"({deduped_subs} duplicate(s) collapsed)")
     return 0
 
 
