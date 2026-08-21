@@ -10775,10 +10775,13 @@ def _resolve_worktree_workspace(
     # than silently coercing to the in-place path, so the filing mistake is caught
     # instead of masked. The declaration is shared with the dir resolver, so the
     # two agree on which roots are edit-in-place.
-    from hermes_cli.edit_in_place_repos import is_edit_in_place_root
+    from hermes_cli.edit_in_place_repos import (
+        WorkspaceFilingError,
+        is_edit_in_place_root,
+    )
 
     if is_edit_in_place_root(requested_resolved):
-        raise ValueError(
+        raise WorkspaceFilingError(
             f"task {task.id} has workspace_kind=worktree aimed at edit-in-place "
             f"repo root {task.workspace_path!r}: that checkout is the deploy "
             f"target itself and must be edited in place, not from an isolated "
@@ -11473,6 +11476,14 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    misfiled: list[str] = field(default_factory=list)
+    """Task ids terminally blocked by a DETERMINISTIC workspace-filing error
+    (a ``WorkspaceFilingError`` — e.g. a ``worktree`` card aimed at an
+    edit-in-place repo root). Distinct from ``auto_blocked``: a filing error is
+    NOT a transient failure, so it never consumes the retry budget and never
+    emits ``gave_up``. The card is blocked once with a ``filing-error`` reason
+    naming the correct filing. Bucketed separately so dashboards/telemetry can
+    tell a mis-filed card apart from one that exhausted real retries."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -12965,6 +12976,65 @@ def _record_spawn_failure(
     )
 
 
+def _record_filing_error(
+    conn: sqlite3.Connection,
+    task_id: str,
+    error: str,
+) -> None:
+    """Terminally block a card whose workspace is DETERMINISTICALLY mis-filed.
+
+    The non-retryable sibling of :func:`_record_spawn_failure`. A
+    ``WorkspaceFilingError`` (e.g. a ``worktree`` card aimed at an edit-in-place
+    root) cannot succeed on retry — attempt N+1 fails identically. Funnelling it
+    through ``_record_spawn_failure`` (which increments ``consecutive_failures``
+    and, at the limit, emits a ``gave_up`` event the gateway notifier delivers as
+    a false "retries exhausted" alarm) burned two retries and alerted on a card
+    that was not actually broken (t_c9c6432b).
+
+    So this path:
+
+      * does NOT touch ``consecutive_failures`` — a deterministic caller error is
+        not a transient failure and must never consume the retry budget or trip
+        the circuit breaker, no matter how many ticks hit it;
+      * emits NO ``gave_up`` event — no false "retries exhausted" alarm;
+      * moves the card ``running → blocked`` ONCE with a distinct
+        ``filing-error`` reason that names the correct filing (the same fix the
+        dispatch-time guard names), so a human sees the misfiling clearly and
+        exactly once. ``blocked`` is a notifiable transition, so the operator is
+        told — but with the accurate "this card is mis-filed" framing, not the
+        spurious retry-exhaustion one;
+      * closes the open run with a distinct ``misfiled`` outcome so run history
+        and telemetry can tell a filing error apart from a real spawn failure.
+
+    The dispatch-time GUARD is unchanged — it still refuses the illegal
+    combination. This only changes what the dispatcher DOES with that refusal.
+    """
+    reason = f"filing-error: {error}"
+    with write_txn(conn):
+        # Close the open run terminally (distinct outcome), without incrementing
+        # the failure counter.
+        run_id = _end_run(
+            conn, task_id,
+            outcome="misfiled", status="misfiled",
+            error=error[:500],
+            metadata={"trigger_outcome": "workspace_filing_error"},
+        )
+        # running → blocked, clearing the claim so the card doesn't look live.
+        # consecutive_failures is deliberately left untouched.
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, "
+            "last_failure_error = ? "
+            "WHERE id = ? AND status IN ('running', 'ready')",
+            (error[:500], task_id),
+        )
+        _append_event(
+            conn, task_id, "blocked",
+            {"reason": reason, "kind": "filing_error"},
+            run_id=run_id,
+        )
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -13793,6 +13863,19 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            # A DETERMINISTIC workspace-filing error (a WorkspaceFilingError —
+            # e.g. a worktree card aimed at an edit-in-place root) can never
+            # succeed on retry: attempt N+1 fails identically. Do NOT run it
+            # through the retry/circuit-breaker path (that burned two retries and
+            # fired a false "retries exhausted" gave_up alarm — t_c9c6432b).
+            # Block it once with a filing-error reason naming the correct filing,
+            # without touching consecutive_failures or emitting gave_up.
+            from hermes_cli.edit_in_place_repos import WorkspaceFilingError
+
+            if isinstance(exc, WorkspaceFilingError):
+                _record_filing_error(conn, claimed.id, str(exc))
+                result.misfiled.append(claimed.id)
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -13888,6 +13971,19 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            # A DETERMINISTIC workspace-filing error (a WorkspaceFilingError —
+            # e.g. a worktree card aimed at an edit-in-place root) can never
+            # succeed on retry: attempt N+1 fails identically. Do NOT run it
+            # through the retry/circuit-breaker path (that burned two retries and
+            # fired a false "retries exhausted" gave_up alarm — t_c9c6432b).
+            # Block it once with a filing-error reason naming the correct filing,
+            # without touching consecutive_failures or emitting gave_up.
+            from hermes_cli.edit_in_place_repos import WorkspaceFilingError
+
+            if isinstance(exc, WorkspaceFilingError):
+                _record_filing_error(conn, claimed.id, str(exc))
+                result.misfiled.append(claimed.id)
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
