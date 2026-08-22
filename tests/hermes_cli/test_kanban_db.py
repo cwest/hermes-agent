@@ -736,6 +736,13 @@ def test_dangling_claim_on_nonrunning_card_is_released(
     be a leaked claim from a lane exit. ``release_stale_claims`` clears it,
     even without waiting for the TTL, so the handed-off author no longer
     gates the reviewer.
+
+    This is the self-heal case: the author worker that opened the PR ends
+    its run, so its PID is DEAD by the time the webhook MOVEs the card to
+    review. A leaked claim on a dead host-local PID must be released. (The
+    live-PID case — where releasing would spawn a duplicate beside a still-
+    running worker — is covered by the D1 liveness gate; see
+    ``test_lane_exit_release_holds_leaked_claim_on_live_worker``.)
     """
     import hermes_cli.kanban_db as _kb
 
@@ -755,9 +762,9 @@ def test_dangling_claim_on_nonrunning_card_is_released(
             "claim_expires = ? WHERE id = ?",
             (now + 3600, t),
         )
-        # PID may still be alive (author process winding down) — irrelevant:
-        # the claim is on the wrong lane and must go regardless.
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        # Author process has exited (it ended its run after opening the PR),
+        # so the leaked claim points at a DEAD PID and must be released.
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
 
         reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
         assert reclaimed == 1
@@ -781,6 +788,193 @@ def test_dangling_claim_on_nonrunning_card_is_released(
             (t,),
         ).fetchone()
         assert spawnable is not None
+
+
+def test_lane_exit_release_holds_leaked_claim_on_live_worker(
+    kanban_home, monkeypatch,
+):
+    """D1: a leaked claim on a card in a NON-running lane whose host-local
+    ``worker_pid`` is still ALIVE must NOT be released.
+
+    Reproduces the live-2026-08-22 duplicate-spawn trace on t_7fb3ac14: a
+    reviewer worker was legitimately spawned onto a ``review`` card (holding
+    the claim + its live PID), then a REPEATED ``status_changed
+    running->review`` webhook re-leaked that same live claim onto the review
+    lane. The lane-exit release then freed the claim *while the reviewer was
+    still alive*, letting the review-spawn path claim + spawn a SECOND
+    reviewer beside the first — two live processes curating the same PR on
+    the same branch concurrently.
+
+    The lane-exit release must verify the claiming PID is actually dead
+    before releasing. A live host-local worker's claim is HELD (deferred) —
+    and, unlike the TTL-stale / wedged-worker paths, the live worker is NOT
+    terminated: it is doing legitimate work in its current lane. So the
+    review-spawn predicate (``claim_lock IS NULL``) never matches and no
+    duplicate spawns.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="curate", assignee="reviewer", detached=True)
+        host = _kb._claimer_id().split(":", 1)[0]
+        # A reviewer worker was spawned onto the review card and holds the
+        # claim + a LIVE pid. Model it as review->running->(re-leaked to
+        # review) with the live claim still attached.
+        kb.claim_task(conn, t, claimer=f"{host}:reviewer")
+        live_pid = os.getpid()
+        kb._set_worker_pid(conn, t, live_pid)
+        now = int(time.time())
+        conn.execute(
+            # Repeated status_changed re-MOVEd the card to review while the
+            # reviewer's claim (live pid) was still attached: a lane-exit
+            # leak, but the claiming worker is genuinely ALIVE.
+            "UPDATE tasks SET status = 'review', claim_expires = ? "
+            "WHERE id = ?",
+            (now + 3600, t),
+        )
+        # The claiming worker is alive.
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        # Spy on the kill path: a legitimately-working reviewer must NOT be
+        # signalled — the hold only extends the TTL, it never terminates.
+        killed: list[int] = []
+
+        reclaimed = kb.release_stale_claims(
+            conn, signal_fn=lambda p, _s: killed.append(p),
+        )
+        # Nothing reclaimed: the live worker's claim is held.
+        assert reclaimed == 0
+        assert killed == []  # live legitimate worker not killed
+
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.claim_lock is not None
+        assert task.worker_pid == live_pid
+        # The review-spawn predicate must NOT match, so no duplicate spawns.
+        spawnable = conn.execute(
+            "SELECT id FROM tasks "
+            "WHERE status = 'review' AND claim_lock IS NULL AND id = ?",
+            (t,),
+        ).fetchone()
+        assert spawnable is None
+
+        # The hold is visible in the event log for operators.
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (t,),
+            ).fetchall()
+        ]
+        assert "reclaim_deferred" in kinds
+        assert "claim_released_lane_exit" not in kinds
+
+
+def test_duplicate_status_changed_spawns_no_second_worker(
+    kanban_home, monkeypatch,
+):
+    """D2 (dispatcher expression): a repeated lifecycle event that re-leaks a
+    LIVE worker's claim onto a review card must be a no-op on the claim/spawn
+    path — exactly ONE worker, original claim retained.
+
+    End-to-end over ``dispatch_once``: first the reviewer is spawned onto the
+    review card (claim + live pid), then the duplicate ``status_changed
+    running->review`` re-leaks the live claim and a second dispatch tick runs.
+    Before the fix the second tick released the live claim and spawned a
+    duplicate; after it, the tick spawns nothing and the invariant holds.
+    """
+    import hermes_cli.kanban_db as _kb
+    import hermes_cli.profiles as profiles
+
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, **kwargs):
+        # Simulate a live worker: return a real live pid so subsequent
+        # liveness checks see it as alive.
+        spawns.append(task.id)
+        return os.getpid()
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+    # Keep workspace resolution trivial for the review-spawn path.
+    monkeypatch.setattr(_kb, "resolve_workspace", lambda task, board=None: "/tmp")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="curate", assignee="reviewer", detached=True)
+        _set_task_status(conn, t, "review")
+
+        # First delivery: dispatcher claims the review card + spawns reviewer #1.
+        kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert spawns == [t]
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.claim_lock is not None
+        first_pid = task.worker_pid
+        assert first_pid == os.getpid()
+
+        # DUPLICATE status_changed running->review: the webhook re-MOVEs the
+        # card to review with the LIVE reviewer's claim still attached.
+        conn.execute(
+            "UPDATE tasks SET status = 'review' WHERE id = ?", (t,),
+        )
+
+        # Second dispatch tick processes the duplicate. It must NOT release
+        # the live claim and must NOT spawn a second reviewer.
+        kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert spawns == [t], "duplicate status_changed spawned a second worker"
+
+        task = kb.get_task(conn, t)
+        assert task.claim_lock is not None
+        assert task.worker_pid == first_pid
+
+        # Invariant: no card holds two concurrent running run rows with two
+        # live pids. At most one run row is open (status='running') for it.
+        open_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs "
+            "WHERE task_id = ? AND status = 'running'",
+            (t,),
+        ).fetchone()[0]
+        assert open_runs == 1
+
+
+def test_dead_reviewer_leaked_claim_still_reclaimed(kanban_home, monkeypatch):
+    """The self-heal must NOT regress: a leaked claim on a review card whose
+    host-local ``worker_pid`` is DEAD is still released so the reviewer can
+    respawn (this fired correctly for the dead pid 29080 in the live trace).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="curate", assignee="reviewer", detached=True)
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:reviewer")
+        kb._set_worker_pid(conn, t, 29080)
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET status = 'review', claim_expires = ? "
+            "WHERE id = ?",
+            (now + 3600, t),
+        )
+        # The reviewer process has died (exited without closing its run row).
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        # Now spawnable again — the self-heal restored the review lane.
+        spawnable = conn.execute(
+            "SELECT id FROM tasks "
+            "WHERE status = 'review' AND claim_lock IS NULL AND id = ?",
+            (t,),
+        ).fetchone()
+        assert spawnable is not None
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (t,),
+            ).fetchall()
+        ]
+        assert "claim_released_lane_exit" in kinds
 
 
 def test_stale_claim_released_when_worker_not_host_local(
