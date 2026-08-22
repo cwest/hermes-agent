@@ -96,7 +96,7 @@ def _drop_notify_pk(conn):
 
 def test_archive_prunes_notify_subs(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="archive me", assignee="w1")
+        tid = kb.create_task(conn, title="archive me", assignee="w1", detached=True)
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="c1")
         assert len(kb.list_notify_subs(conn, tid)) == 1
 
@@ -108,8 +108,8 @@ def test_archive_prunes_notify_subs(kanban_home):
 
 def test_archive_prune_leaves_other_tasks_subs(kanban_home):
     with kb.connect() as conn:
-        keep = kb.create_task(conn, title="live", assignee="w1")
-        drop = kb.create_task(conn, title="archive me", assignee="w1")
+        keep = kb.create_task(conn, title="live", assignee="w1", detached=True)
+        drop = kb.create_task(conn, title="archive me", assignee="w1", detached=True)
         kb.add_notify_sub(conn, task_id=keep, platform="telegram", chat_id="c1")
         kb.add_notify_sub(conn, task_id=drop, platform="telegram", chat_id="c1")
 
@@ -125,9 +125,9 @@ def test_archive_prune_leaves_other_tasks_subs(kanban_home):
 
 def test_gc_dry_run_reports_without_mutating(kanban_home):
     with kb.connect() as conn:
-        done = kb.create_task(conn, title="done card", assignee="w1")
-        arch = kb.create_task(conn, title="arch card", assignee="w1")
-        live = kb.create_task(conn, title="live card", assignee="w1")
+        done = kb.create_task(conn, title="done card", assignee="w1", detached=True)
+        arch = kb.create_task(conn, title="arch card", assignee="w1", detached=True)
+        live = kb.create_task(conn, title="live card", assignee="w1", detached=True)
         for t in (done, arch, live):
             kb.add_notify_sub(conn, task_id=t, platform="telegram", chat_id="c1")
 
@@ -160,8 +160,8 @@ def test_gc_dry_run_reports_without_mutating(kanban_home):
 
 def test_gc_real_sweep_then_idempotent(kanban_home):
     with kb.connect() as conn:
-        done = kb.create_task(conn, title="done card", assignee="w1")
-        live = kb.create_task(conn, title="live card", assignee="w1")
+        done = kb.create_task(conn, title="done card", assignee="w1", detached=True)
+        live = kb.create_task(conn, title="live card", assignee="w1", detached=True)
         kb.add_notify_sub(conn, task_id=done, platform="telegram", chat_id="c1")
         kb.add_notify_sub(conn, task_id=live, platform="telegram", chat_id="c1")
         kb.complete_task(conn, done, result="ok")
@@ -185,7 +185,7 @@ def test_gc_preserves_live_card_subs(kanban_home):
     with kb.connect() as conn:
         statuses_live = []
         for st in ("ready", "running", "blocked", "todo"):
-            t = kb.create_task(conn, title=f"{st} card", assignee="w1")
+            t = kb.create_task(conn, title=f"{st} card", assignee="w1", detached=True)
             kb.add_notify_sub(conn, task_id=t, platform="telegram", chat_id="c1")
             conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (st, t))
             statuses_live.append(t)
@@ -201,7 +201,7 @@ def test_gc_preserves_live_card_subs(kanban_home):
 
 def test_gc_deduplicates_legacy_duplicate_rows(kanban_home):
     with kb.connect() as conn:
-        live = kb.create_task(conn, title="live card", assignee="w1")
+        live = kb.create_task(conn, title="live card", assignee="w1", detached=True)
         conn.commit()
         _drop_notify_pk(conn)
         # Three identical rows for the SAME live target (legacy dupes).
@@ -221,7 +221,7 @@ def test_gc_deduplicates_legacy_duplicate_rows(kanban_home):
 
 def test_gc_dry_run_counts_duplicates_without_mutating(kanban_home):
     with kb.connect() as conn:
-        live = kb.create_task(conn, title="live card", assignee="w1")
+        live = kb.create_task(conn, title="live card", assignee="w1", detached=True)
         conn.commit()
         _drop_notify_pk(conn)
         _insert_raw_sub(conn, live, thread_id="t9")
@@ -240,7 +240,7 @@ def test_gc_dry_run_counts_duplicates_without_mutating(kanban_home):
 
 def test_reopened_card_can_resubscribe_and_be_woken(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="cycle", assignee="w1")
+        tid = kb.create_task(conn, title="cycle", assignee="w1", detached=True)
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="c1")
         kb.complete_task(conn, tid, result="done")
 
@@ -285,8 +285,8 @@ def _run_kanban_cli(argv):
 
 def test_cli_gc_dry_run_reports_and_does_not_mutate(kanban_home, capsys):
     with kb.connect() as conn:
-        done = kb.create_task(conn, title="done card", assignee="w1")
-        live = kb.create_task(conn, title="live card", assignee="w1")
+        done = kb.create_task(conn, title="done card", assignee="w1", detached=True)
+        live = kb.create_task(conn, title="live card", assignee="w1", detached=True)
         kb.add_notify_sub(conn, task_id=done, platform="telegram", chat_id="c1")
         kb.add_notify_sub(conn, task_id=live, platform="telegram", chat_id="c1")
         kb.complete_task(conn, done, result="ok")
@@ -305,8 +305,8 @@ def test_cli_gc_dry_run_reports_and_does_not_mutate(kanban_home, capsys):
 
 def test_cli_gc_sweeps_then_dry_run_reports_zero(kanban_home, capsys):
     with kb.connect() as conn:
-        done = kb.create_task(conn, title="done card", assignee="w1")
-        live = kb.create_task(conn, title="live card", assignee="w1")
+        done = kb.create_task(conn, title="done card", assignee="w1", detached=True)
+        live = kb.create_task(conn, title="live card", assignee="w1", detached=True)
         kb.add_notify_sub(conn, task_id=done, platform="telegram", chat_id="c1")
         kb.add_notify_sub(conn, task_id=live, platform="telegram", chat_id="c1")
         kb.complete_task(conn, done, result="ok")
