@@ -10475,21 +10475,38 @@ def _git_deploy_branch_with_upstream(path: Path) -> Optional[tuple[str, str]]:
     (``main`` → ``origin/main``, or a fork's ``cwest/integration`` →
     ``origin/cwest/integration``). When the clone is detached we cannot read
     that from HEAD, so we recover it from the local branches that track an
-    upstream:
+    upstream, or — when NO local branch exists at all — from the remote's
+    recorded default branch:
 
     * Prefer the remote's default branch when ``refs/remotes/origin/HEAD`` is
       set (``origin/main`` → local ``main``) and that local branch tracks an
       upstream — this is the exact branch the human recovery
       (``git checkout main``) targets.
+    * If there are ZERO local branches but ``refs/remotes/origin/HEAD``
+      resolves to ``<remote>/<branch>``, treat ``(<branch>, "<remote>/<branch>")``
+      as the deploy target. The remote tracking ref is the authority, and a
+      local branch DWIM-created from it (``git checkout <branch>``) is exactly
+      what the human recovery produces. A prior worker that checked the clone
+      out to a PR head and left it detached with the deploy branch pruned lands
+      here.
     * Otherwise fall back to the sole local branch that tracks an upstream. A
       genuine deploy clone has exactly one (it lives on its deploy branch); if
-      zero or more than one track an upstream the target is ambiguous, so we
-      return ``None`` and the caller refuses.
+      more than one tracks an upstream (and there is no ``origin/HEAD`` hint)
+      the target is ambiguous, so we return ``None`` and the caller refuses.
 
     Returns ``(local_branch, upstream_ref)`` or ``None``.
     """
     tracking = _git_local_branches_with_upstream(path)
+
+    # No local branch at all: the deploy branch was pruned (a checkout-to-PR-head
+    # leftover). The remote's recorded default branch IS the deploy target — a
+    # DWIM ``git checkout <branch>`` recreates it tracking ``<remote>/<branch>``.
     if not tracking:
+        remote_default = _git_remote_default_ref(path)
+        if remote_default is not None:
+            _remote, _, local_branch = remote_default.partition("/")
+            if local_branch:
+                return local_branch, remote_default
         return None
 
     # Prefer the remote default branch (origin/HEAD → local branch), when it
@@ -10504,6 +10521,35 @@ def _git_deploy_branch_with_upstream(path: Path) -> Optional[tuple[str, str]]:
         (only_branch, only_upstream), = tracking.items()
         return only_branch, only_upstream
     return None
+
+
+def _git_remote_default_ref(path: Path) -> Optional[str]:
+    """Full ``<remote>/<branch>`` short ref of ``refs/remotes/origin/HEAD``, or None.
+
+    Unlike :func:`_git_remote_default_local_branch` (which returns only the
+    ``<branch>`` half for matching against local branch names), this returns the
+    whole remote tracking ref (e.g. ``origin/main``) so it can serve as the
+    upstream target when no local branch exists to read one from. Returns
+    ``None`` when origin/HEAD is unset (a clone made from an empty remote never
+    establishes it) or unparseable.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "symbolic-ref", "--short",
+             "refs/remotes/origin/HEAD"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    ref = (result.stdout or "").strip()
+    if not ref or "/" not in ref:
+        return None
+    return ref
 
 
 def _git_remote_default_local_branch(path: Path) -> Optional[str]:
@@ -10586,20 +10632,57 @@ def _git_head_is_ancestor_of(path: Path, ref: str) -> bool:
     return result.returncode == 0
 
 
+def _git_local_branch_exists(path: Path, branch: str) -> bool:
+    """True when a local branch named ``branch`` exists.
+
+    ``git show-ref --verify --quiet refs/heads/<branch>`` exits 0 iff the local
+    branch ref exists. Used to decide whether a reattach must first CREATE the
+    branch from its remote tracking ref (the no-local-branch self-heal) or can
+    simply check out an existing one.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "show-ref", "--verify", "--quiet",
+             f"refs/heads/{branch}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, check=False,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
 def _git_reattach_ff_only(path: Path, branch: str, upstream: str) -> None:
     """Reattach a clean, contained detached HEAD to ``branch`` and fast-forward.
 
-    Conservative by construction: ``checkout`` moves onto the existing local
-    deploy branch, then ``merge --ff-only`` advances it to the upstream tip.
-    Never ``reset --hard``, never ``--force``, never discards. Callers MUST
-    have already proven the tree is clean and HEAD is an ancestor of
-    ``upstream`` so both steps are lossless.
+    Conservative by construction: ``checkout`` moves onto the deploy branch,
+    then ``merge --ff-only`` advances it to the upstream tip. Never
+    ``reset --hard``, never ``--force``, never discards. Callers MUST have
+    already proven the tree is clean and HEAD is an ancestor of ``upstream`` so
+    both steps are lossless.
+
+    Two shapes of the checkout, matching the two human recoveries:
+
+    * The local branch already exists → ``git checkout <branch>`` moves onto it.
+    * The local branch does NOT exist (a checkout-to-PR-head leftover pruned it)
+      → ``git checkout -b <branch> --track <upstream>`` recreates it from the
+      remote tracking ref with tracking set, exactly what a plain
+      ``git checkout <branch>`` DWIM produces — done explicitly so it does not
+      depend on the repo's ``checkout.guess`` config being on.
     """
-    subprocess.run(
-        ["git", "-C", str(path), "checkout", branch],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=60, check=True,
-    )
+    if _git_local_branch_exists(path, branch):
+        subprocess.run(
+            ["git", "-C", str(path), "checkout", branch],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, check=True,
+        )
+    else:
+        subprocess.run(
+            ["git", "-C", str(path), "checkout", "-b", branch,
+             "--track", upstream],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, check=True,
+        )
     subprocess.run(
         ["git", "-C", str(path), "merge", "--ff-only", upstream],
         capture_output=True, text=True, encoding="utf-8", errors="replace",

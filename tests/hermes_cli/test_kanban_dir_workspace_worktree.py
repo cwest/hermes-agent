@@ -99,6 +99,20 @@ def _current_branch(path: Path) -> str:
     return _git(path, "rev-parse", "--abbrev-ref", "HEAD").strip()
 
 
+def _git_origin_head_unset(path: Path) -> bool:
+    """True when ``refs/remotes/origin/HEAD`` is not a resolvable symbolic ref.
+
+    ``git clone`` from a remote that was empty at clone time never records
+    origin/HEAD, so ``symbolic-ref`` exits non-zero. This models the
+    no-default-branch-hint state the ambiguity refusal must survive.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(path), "symbolic-ref", "refs/remotes/origin/HEAD"],
+        capture_output=True, text=True,
+    )
+    return result.returncode != 0
+
+
 def test_dir_repo_root_resolves_to_worktree_not_in_place(kanban_home, tmp_path):
     """A dir workspace on a repo root returns a per-task worktree, not the clone."""
     repo = _make_repo(tmp_path)
@@ -442,6 +456,147 @@ def test_dir_clone_named_local_only_branch_still_fails(kanban_home, tmp_path):
         kb.resolve_workspace(task)
     # The named branch is untouched — never auto-reattached.
     assert _current_branch(repo) == "topic/leftover"
+
+
+def test_dir_clone_detached_no_local_branch_self_heals_from_origin_head(
+    kanban_home, tmp_path
+):
+    """Clean tree + detached HEAD + NO local branches + origin/HEAD set → self-heal.
+
+    The tightest form of the review-leg polluter: the prior worker not only
+    detached the shared clone but left ZERO local branches (a checkout to a PR
+    head with the deploy branch since pruned). ``origin/HEAD`` still resolves to
+    ``origin/main`` and the detached HEAD is contained in it, so a human's
+    ``git checkout main`` would DWIM-create the local branch from the remote
+    tracking ref and fast-forward, stranding nothing. The resolver must reach
+    that same state instead of hard-failing because no local branch pre-exists.
+    """
+    repo = _make_repo(tmp_path)
+    head_sha = _git(repo, "rev-parse", "HEAD").strip()
+    # ``git clone`` from a remote that was empty at clone time does not record
+    # origin/HEAD; a real deploy clone has it set. Establish it, as a genuine
+    # clone-from-populated-remote would.
+    _git(repo, "remote", "set-head", "origin", "-a")
+    # Detach, then delete the local deploy branch so ZERO local branches remain —
+    # exactly the broken state the fix targets.
+    _git(repo, "checkout", "--detach", head_sha)
+    _git(repo, "branch", "-D", "main")
+
+    # Precondition: really detached, clean, no local branches, origin/HEAD set.
+    assert _current_branch(repo) == "HEAD"
+    assert _git(repo, "status", "--porcelain").strip() == ""
+    assert _git(repo, "for-each-ref", "refs/heads/").strip() == ""
+    assert (
+        _git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").strip()
+        == "origin/main"
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="office feature",
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
+        )
+        task = kb.get_task(conn, tid)
+
+    # Must NOT raise — the no-local-branch detach self-heals via origin/HEAD.
+    workspace = kb.resolve_workspace(task)
+    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    # The shared clone is now on a local ``main`` tracking ``origin/main`` at the
+    # upstream SHA — the exact state ``git checkout main`` would produce.
+    assert _current_branch(repo) == "main"
+    assert (
+        _git(repo, "rev-parse", "--abbrev-ref", "main@{upstream}").strip()
+        == "origin/main"
+    )
+    assert (
+        _git(repo, "rev-parse", "HEAD").strip()
+        == _git(repo, "rev-parse", "origin/main").strip()
+    )
+    assert _git(repo, "status", "--porcelain").strip() == ""
+
+
+def test_dir_clone_detached_no_local_branch_ff_advances_to_upstream(
+    kanban_home, tmp_path
+):
+    """No local branches + detached BEHIND upstream → create-from-remote + FF.
+
+    Combines the no-local-branch case with a strict-ancestor detach: the local
+    deploy branch is gone AND the detached commit is behind the upstream tip.
+    The self-heal must both create ``main`` from ``origin/main`` and fast-forward
+    it to the upstream tip, stranding nothing.
+    """
+    repo = _make_repo(tmp_path)
+    old_sha = _git(repo, "rev-parse", "HEAD").strip()
+    # Advance the upstream past the detach point.
+    (repo / "README.md").write_text("advanced\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "advance")
+    _git(repo, "push", "origin", "main")
+    upstream_sha = _git(repo, "rev-parse", "origin/main").strip()
+    assert upstream_sha != old_sha
+    # Establish origin/HEAD as a real clone-from-populated-remote would have it.
+    _git(repo, "remote", "set-head", "origin", "-a")
+    # Detach at the older commit, then delete the local branch entirely.
+    _git(repo, "checkout", "--detach", old_sha)
+    _git(repo, "branch", "-D", "main")
+    assert _git(repo, "for-each-ref", "refs/heads/").strip() == ""
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="office feature",
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace = kb.resolve_workspace(task)
+    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    # Created ``main`` from ``origin/main`` AND fast-forwarded to the tip.
+    assert _current_branch(repo) == "main"
+    assert (
+        _git(repo, "rev-parse", "--abbrev-ref", "main@{upstream}").strip()
+        == "origin/main"
+    )
+    assert _git(repo, "rev-parse", "HEAD").strip() == upstream_sha
+
+
+def test_dir_clone_no_origin_head_ambiguous_tracking_still_fails(
+    kanban_home, tmp_path
+):
+    """No usable origin/HEAD + 2+ tracking branches → still RAISE (ambiguous).
+
+    The ambiguity refusal must survive the origin/HEAD fallback: when there is
+    no ``refs/remotes/origin/HEAD`` to name the deploy target AND more than one
+    local branch tracks an upstream, the resolver cannot guess which branch is
+    the deploy target and must refuse rather than pick one.
+    """
+    repo = _make_repo(tmp_path)
+    # Give the clone a SECOND branch that also tracks an upstream, so two local
+    # branches track — ambiguous without an origin/HEAD hint.
+    (repo / "README.md").write_text("second\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "second")
+    _git(repo, "checkout", "-b", "release")
+    _git(repo, "push", "-u", "origin", "release")
+    _git(repo, "checkout", "main")
+    # origin/HEAD is naturally unset on this clone (the bare remote was empty at
+    # clone time and set-head was never run), so there is no default-branch hint.
+    # Detach so the self-heal path runs with no way to disambiguate.
+    assert _git_origin_head_unset(repo)
+    _git(repo, "checkout", "--detach", "HEAD")
+    assert _current_branch(repo) == "HEAD"
+    assert _git(repo, "status", "--porcelain").strip() == ""
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="office feature",
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
+        )
+        task = kb.get_task(conn, tid)
+
+    with pytest.raises(RuntimeError, match="could not be resolved|ambiguous|cannot .*fast-forward"):
+        kb.resolve_workspace(task)
+    # Still detached — nothing was guessed at or reattached.
+    assert _current_branch(repo) == "HEAD"
 
 
 def test_dir_linked_worktree_on_topic_branch_dispatches(kanban_home, tmp_path):
