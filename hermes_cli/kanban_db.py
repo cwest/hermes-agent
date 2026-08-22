@@ -6725,11 +6725,59 @@ def release_stale_claims(
     # invariant "claim state belongs only to running cards" that the
     # dashboard status-set path already enforces.
     leaked = conn.execute(
-        "SELECT id, claim_lock, worker_pid, status "
+        "SELECT id, claim_lock, worker_pid, status, claim_expires "
         "FROM tasks "
         "WHERE status != 'running' AND claim_lock IS NOT NULL",
     ).fetchall()
     for row in leaked:
+        # D1 liveness gate (duplicate-spawn fix): releasing a leaked claim
+        # is the correct self-heal ONLY when the claiming worker is actually
+        # dead. A host-local worker whose PID is still ALIVE legitimately
+        # holds this claim — e.g. a reviewer spawned onto a ``review`` card,
+        # or an author process still winding down after opening its PR. A
+        # repeated lifecycle event (a duplicate ``status_changed
+        # running->review`` webhook delivery) re-leaks that SAME live claim
+        # onto the non-running lane; releasing it here frees the claim while
+        # the worker is still running, and the review-spawn path (gated on
+        # ``claim_lock IS NULL``) then spawns a SECOND worker beside the
+        # first — two live processes on the same PR/branch. Unlike the
+        # TTL-stale and wedged-worker paths below, we must NOT terminate this
+        # worker: it is doing legitimate work in its current lane. Just hold
+        # the claim (extend the TTL, record a ``reclaim_deferred`` event) and
+        # retry next tick; the claim is released the moment the worker exits
+        # and its PID goes dead. Dead-PID and non-host-local leaks fall
+        # through to the release below, preserving the lane-exit self-heal.
+        host_local = str(row["claim_lock"] or "").startswith(host_prefix)
+        if (
+            host_local
+            and row["worker_pid"]
+            and _pid_alive(row["worker_pid"])
+        ):
+            grace = now + RECLAIM_DEFER_GRACE_SECONDS
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET claim_expires = ? "
+                    "WHERE id = ? AND status != 'running' AND claim_lock IS ?",
+                    (grace, row["id"], row["claim_lock"]),
+                )
+                if cur.rowcount != 1:
+                    # Raced with a legitimate re-claim (card moved back to
+                    # running) between the read and the write — leave it alone.
+                    continue
+                _append_event(
+                    conn, row["id"], "reclaim_deferred",
+                    {
+                        "reason": "lane_exit_worker_alive",
+                        "status": row["status"],
+                        "claim_lock": row["claim_lock"],
+                        "worker_pid": int(row["worker_pid"]),
+                        "claim_expires_now": grace,
+                        "now": now,
+                    },
+                )
+            # Not reclaimed: the live worker keeps its claim.
+            continue
+
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
@@ -6751,6 +6799,7 @@ def release_stale_claims(
                         int(row["worker_pid"])
                         if row["worker_pid"] is not None else None
                     ),
+                    "host_local": host_local,
                     "now": now,
                 },
             )
