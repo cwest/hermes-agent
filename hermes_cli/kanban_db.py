@@ -10739,6 +10739,135 @@ def _git_reattach_ff_only(path: Path, branch: str, upstream: str) -> None:
     )
 
 
+def _git_rev_parse(path: Path, rev: str) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", rev],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    out = (result.stdout or "").strip()
+    return out or None
+
+
+def _git_has_commits_between(path: Path, base: str, tip: str) -> Optional[bool]:
+    """True iff ``tip`` carries commits not reachable from ``base``.
+
+    Returns ``None`` when the query cannot be answered (e.g. git error), so
+    callers can distinguish "no unique commits" from "could not determine".
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-list", "--count", f"{base}..{tip}"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    out = (result.stdout or "").strip()
+    try:
+        return int(out) > 0
+    except ValueError:
+        return None
+
+
+def _git_worktree_is_clean(path: Path) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        # If we cannot prove it clean, treat it as dirty (conservative).
+        return False
+    if result.returncode != 0:
+        return False
+    return not (result.stdout or "").strip()
+
+
+def _ensure_worktree_fresh(
+    worktree: Path, repo_root: Path, *, task_id: str
+) -> None:
+    """Guarantee a reused worktree is not behind the shared checkout's HEAD.
+
+    A per-task worktree is cut off ``repo_root``'s HEAD (the shared checkout,
+    which sits on the integration branch). When that branch advances but the
+    worktree stays at the old tip with ZERO unique commits, a returning
+    dispatch used to reuse the worktree as-is — from inside the stale tree the
+    shared branch looks AHEAD, so a worker concludes the work is already staged
+    and reports complete with no commits (the PR head never moves).
+
+    This gate makes that impossible: before a worker is handed a reused
+    worktree, we compare its HEAD to the shared checkout's HEAD and:
+
+    - do nothing when the worktree is already at (or ahead of / carrying real
+      work relative to) the base tip — fast-forwarding a branch with unique
+      commits would destroy work, so we never touch it;
+    - fast-forward a CLEAN, zero-unique-commit worktree up to the base tip
+      (safe by construction — a pure ref move that touches no live state);
+    - refuse (raise) when the worktree is behind but cannot be safely
+      fast-forwarded (uncommitted changes would be clobbered), so the
+      dispatcher records a spawn failure and falls back rather than silently
+      spawning into a stale tree.
+    """
+    base_tip = _git_rev_parse(repo_root, "HEAD")
+    wt_head = _git_rev_parse(worktree, "HEAD")
+    if base_tip is None or wt_head is None:
+        # Cannot determine freshness (bare repo mid-op, git error). Leave the
+        # worktree untouched rather than guess — the pre-gate behavior.
+        return
+    if wt_head == base_tip:
+        return  # already fresh
+
+    # Does the worktree carry commits the base tip does not? If so it holds
+    # real (possibly in-progress) work — never rewind or rebase it here.
+    has_unique = _git_has_commits_between(worktree, base_tip, wt_head)
+    if has_unique is None or has_unique:
+        return
+
+    # Zero unique commits: is the base actually ahead of us (i.e. behind)?
+    is_behind = _git_has_commits_between(worktree, wt_head, base_tip)
+    if not is_behind:
+        return  # not behind (nor ahead) — nothing to do
+
+    if not _git_worktree_is_clean(worktree):
+        raise RuntimeError(
+            f"task {task_id} per-task worktree {worktree} is behind the shared "
+            f"checkout HEAD ({wt_head[:9]} vs {base_tip[:9]}) and has "
+            "uncommitted changes, so it cannot be safely fast-forwarded; "
+            "refusing to dispatch into a stale workspace"
+        )
+
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "merge", "--ff-only", base_tip],
+        capture_output=True,
+        text=True, encoding='utf-8', errors='replace',
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"task {task_id} per-task worktree {worktree} is behind the shared "
+            f"checkout HEAD ({wt_head[:9]} vs {base_tip[:9]}) and could not be "
+            f"fast-forwarded: {stderr}; refusing to dispatch into a stale "
+            "workspace"
+        )
+
+
 def _nearest_existing_path(path: Path) -> Path:
     current = path
     while not current.exists() and current != current.parent:
@@ -10809,8 +10938,19 @@ def _ensure_worktree_dir_excluded(repo_root: Path, target: Path) -> None:
         return
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    task_id: Optional[str] = None,
+) -> None:
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    When ``target`` already exists as a linked worktree of this repo, a
+    freshness gate ensures it is not left behind the shared checkout's HEAD
+    before it is reused (see ``_ensure_worktree_fresh``).
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
@@ -10820,6 +10960,9 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
             # worktree created before this fix landed doesn't leave the anchor
             # dirty on newer git.
             _ensure_worktree_dir_excluded(repo_root, target)
+            _ensure_worktree_fresh(
+                target, repo_root, task_id=task_id or target.name
+            )
             return
     # Exclude .worktrees/ from the anchor's working tree BEFORE creating the
     # worktree, so the anchor clone never registers a dirty untracked entry.
@@ -10888,7 +11031,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, task_id=task.id)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -10923,6 +11066,14 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            # Reusing this task's own worktree. Guarantee it is not behind the
+            # shared checkout's HEAD before handing it to the worker — a stale
+            # reuse is exactly the false-completion trap this gate closes.
+            shared_root = _repo_root_for_worktree_target(requested.parent)
+            if shared_root is not None:
+                _ensure_worktree_fresh(
+                    requested_resolved, shared_root, task_id=task.id
+                )
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -10935,7 +11086,9 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(
+                    fallback_root, fallback, branch_name, task_id=task.id
+                )
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
@@ -10945,7 +11098,7 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, task_id=task.id)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -10954,7 +11107,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(repo_root, requested, branch_name, task_id=task.id)
     return requested, branch_name
 
 
