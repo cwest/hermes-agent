@@ -196,3 +196,166 @@ def test_resolve_worktree_own_path_on_foreign_branch_keeps_legacy_reuse(
     workspace, branch = kb._resolve_worktree_workspace(task)
     assert workspace == own.resolve()
     assert branch == "wt/foreign"
+
+
+# ---------------------------------------------------------------------------
+# Freshness gate: never dispatch a worker into a behind-HEAD per-task worktree.
+#
+# A per-task worktree is cut off the shared checkout's HEAD. When the shared
+# branch then advances but the worktree branch carries zero unique commits, a
+# returning dispatch used to reuse the worktree as-is — leaving the worker N
+# commits behind, where the shared branch looks AHEAD and a worker concludes
+# the work is already staged (false completion, PR head never moves).
+# ---------------------------------------------------------------------------
+
+
+def _head(path: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _advance_base(repo: Path, filename: str = "advance.txt") -> str:
+    """Add a commit to the repo's primary (base-branch) working tree."""
+    (repo / filename).write_text("more\n", encoding="utf-8")
+    _git(repo, "add", filename)
+    _git(repo, "commit", "-m", f"advance {filename}")
+    return _head(repo)
+
+
+def test_resolve_worktree_behind_head_clean_is_fast_forwarded(
+    kanban_home, tmp_path
+):
+    """A clean, zero-unique-commit worktree behind base is FF'd to the tip."""
+    repo = _make_repo(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="stale but clean",
+            workspace_kind="worktree",
+            detached=True,
+        )
+        # Create the worktree on the branch the resolver derives, so the
+        # existing-checkout shortcut (and its freshness gate) is what runs.
+        branch_name = kb._derive_worktree_branch_name(tid, "stale but clean")
+        own = _add_worktree(repo, repo / ".worktrees" / tid, branch_name)
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(own), tid),
+        )
+        conn.commit()
+        task = kb.get_task(conn, tid)
+
+    # Shared branch advances; the worktree stays behind with no unique commits.
+    base_tip = _advance_base(repo)
+    assert _head(own) != base_tip  # precondition: behind
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+
+    assert workspace == own.resolve()
+    assert branch == branch_name
+    # The worker's starting HEAD now equals the branch tip.
+    assert _head(own) == base_tip
+
+
+def test_resolve_worktree_behind_head_with_unique_commits_is_untouched(
+    kanban_home, tmp_path
+):
+    """A worktree carrying real work is never rewound/rebased by the gate."""
+    repo = _make_repo(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="stale but has work",
+            workspace_kind="worktree",
+            detached=True,
+        )
+        branch_name = kb._derive_worktree_branch_name(tid, "stale but has work")
+        own = _add_worktree(repo, repo / ".worktrees" / tid, branch_name)
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(own), tid),
+        )
+        conn.commit()
+        task = kb.get_task(conn, tid)
+
+    # The worktree has a real, unpushed commit of its own.
+    (own / "work.txt").write_text("real work\n", encoding="utf-8")
+    _git(own, "add", "work.txt")
+    _git(own, "commit", "-m", "agent work")
+    work_head = _head(own)
+
+    # Base advances after the work commit was made.
+    _advance_base(repo)
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+
+    assert workspace == own.resolve()
+    assert branch == branch_name
+    # The work commit is preserved verbatim — the gate must not touch it.
+    assert _head(own) == work_head
+
+
+def test_resolve_worktree_behind_head_dirty_is_refused(kanban_home, tmp_path):
+    """A dirty, behind-HEAD worktree cannot be FF'd, so dispatch refuses it."""
+    repo = _make_repo(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="stale and dirty",
+            workspace_kind="worktree",
+            detached=True,
+        )
+        branch_name = kb._derive_worktree_branch_name(tid, "stale and dirty")
+        own = _add_worktree(repo, repo / ".worktrees" / tid, branch_name)
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(own), tid),
+        )
+        conn.commit()
+        task = kb.get_task(conn, tid)
+
+    # Base advances; the worktree is behind AND has uncommitted changes,
+    # so a fast-forward would clobber local edits — refuse instead.
+    base_tip = _advance_base(repo)
+    (own / "README.md").write_text("dirty edit\n", encoding="utf-8")
+    assert _head(own) != base_tip  # precondition: behind
+
+    with pytest.raises(Exception) as excinfo:
+        kb._resolve_worktree_workspace(task)
+    # The refusal must name staleness so the spawn-failure record is legible.
+    assert "behind" in str(excinfo.value).lower()
+
+
+def test_resolve_worktree_fresh_worktree_needs_no_fast_forward(
+    kanban_home, tmp_path
+):
+    """A worktree already at the base tip is reused untouched (no-op gate)."""
+    repo = _make_repo(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="already fresh",
+            workspace_kind="worktree",
+            detached=True,
+        )
+        branch_name = kb._derive_worktree_branch_name(tid, "already fresh")
+        own = _add_worktree(repo, repo / ".worktrees" / tid, branch_name)
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(own), tid),
+        )
+        conn.commit()
+        task = kb.get_task(conn, tid)
+
+    fresh_head = _head(own)
+    workspace, branch = kb._resolve_worktree_workspace(task)
+
+    assert workspace == own.resolve()
+    assert branch == branch_name
+    assert _head(own) == fresh_head
