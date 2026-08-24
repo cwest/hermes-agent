@@ -8255,6 +8255,19 @@ def explain_completion_refusal(
 # dispatcher claim is what makes a card ``running``).
 _REOPEN_TARGET_STATUSES = {"triage", "todo", "ready", "blocked", "review"}
 
+# The subset of reopen targets that put the card back into the dispatchable work
+# pool. A card reopened into one of these is meant to be picked up by the
+# dispatcher immediately (``ready`` spawns directly; a parent-free ``todo`` is
+# promoted to ``ready`` by ``recompute_ready`` on the next tick). When the card
+# carries an open PR, landing it in one of these lanes WITHOUT an ``unblocked``
+# cutoff event leaves ``check_respawn_guard`` returning ``active_pr`` forever (the
+# guard's PR cutoff is only advanced past a prior PR-handoff comment by an
+# ``unblocked`` event) — the same wedge ``route_feedback_to_author`` closes. So a
+# reopen into one of these targets must ALSO emit ``unblocked`` + reset the loop
+# counter. The non-dispatchable targets (``blocked`` / ``review`` / ``triage``)
+# route the card to a human/reviewer, not the work pool, so they are left as-is.
+_REOPEN_DISPATCHABLE_STATUSES = {"todo", "ready"}
+
 
 def reopen_task(
     conn: sqlite3.Connection,
@@ -8291,6 +8304,18 @@ def reopen_task(
         longer looks completed. The consecutive-failure counter is NOT touched.
       * dependents are recomputed (a reopened parent must un-promote children that
         had auto-advanced onto its ``done``).
+      * when ``to_status`` is a DISPATCHABLE lane (``ready`` / ``todo``), the
+        reopen additionally emits the ``unblocked`` cutoff event and resets
+        ``block_recurrences`` — the same guard-clearing bounce
+        :func:`route_feedback_to_author` performs (via the shared
+        :func:`reset_block_recurrences` primitive). Without it, a false-``done``
+        card carrying an OPEN PR, reopened into ``ready``, would sit
+        ``respawn_guarded: active_pr`` on every dispatcher tick and never spawn
+        its assignee (the ``t_16a493a3`` symptom): :func:`check_respawn_guard`
+        only advances its PR cutoff past a prior PR-handoff comment when an
+        ``unblocked`` event was recorded after that comment. Non-dispatchable
+        targets (``blocked`` / ``review`` / ``triage``) route the card to a
+        human/reviewer rather than the work pool, so no such bounce is emitted.
 
     Returns ``True`` when the card was reopened, ``False`` when it was not
     ``done``.
@@ -8351,6 +8376,34 @@ def reopen_task(
                 "assignee": new_assignee,
                 "by": f"{actor}:reopen",
             },
+        )
+        # When the reopen targets a dispatchable lane, emit the ``unblocked``
+        # cutoff event NOW (causally after any prior PR-handoff comment). This is
+        # what ``check_respawn_guard`` honors to advance its ``active_pr`` /
+        # ``recent_success`` cutoffs past the stale PR comment — without it a
+        # false-``done`` card carrying an open PR, reopened to ``ready``, would
+        # sit ``respawn_guarded: active_pr`` on every tick and never dispatch
+        # (the ``t_16a493a3`` symptom). This mirrors ``unblock_task``'s event
+        # (that primitive can't be reused directly here because it fences on a
+        # ``blocked``/``scheduled``/``triage`` source, and the card is now in the
+        # dispatchable lane). ``recompute_ready`` below may re-land a parent-free
+        # ``todo`` into ``ready``; either way an ``unblocked`` cutoff exists.
+        dispatchable = to_status in _REOPEN_DISPATCHABLE_STATUSES
+        if dispatchable:
+            _append_event(
+                conn, task_id, "unblocked",
+                {"status": to_status} if to_status != "ready" else None,
+            )
+    # A dispatchable reopen also resets any inflated ``block_recurrences`` via the
+    # sanctioned counter-reset primitive (it opens its own txn + emits its own
+    # audit event) — the same reset ``route_feedback_to_author`` performs — so the
+    # loop breaker in ``block_task`` does not later escalate the reopened card to
+    # ``triage`` on the next same-cause block. Non-dispatchable targets keep the
+    # counter intact.
+    if dispatchable:
+        reset_block_recurrences(
+            conn, task_id, actor=f"{actor}:reopen",
+            reason="reopen into a dispatchable lane — fresh work cycle",
         )
     # Recompute dependents outside the reopen txn: a child that auto-promoted
     # onto this parent's ``done`` must demote now that the parent is live again.
