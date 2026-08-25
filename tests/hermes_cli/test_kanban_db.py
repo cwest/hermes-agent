@@ -4254,6 +4254,161 @@ def test_resolve_review_owner_falls_back_when_unstamped(kanban_home):
         assert kb.resolve_review_owner(conn, t, default="custom") == "custom"
 
 
+# ---------------------------------------------------------------------------
+# resolve_ready_owner — read the ready-lane (author) owner from state_owners
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_ready_owner_reads_stamped_map(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="c", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        assert kb.resolve_ready_owner(conn, t) == "easley"
+
+
+def test_resolve_ready_owner_honors_non_default_author(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="w", assignee="baldwin")
+        _stamp_owner_map(conn, t, "ready: baldwin, review: perkins, blocked-acceptance: casey")
+        assert kb.resolve_ready_owner(conn, t) == "baldwin"
+
+
+def test_resolve_ready_owner_falls_back_when_unstamped(kanban_home):
+    """A legacy / CLI-created card with no owner map falls back to the current
+    assignee (the card's own owner is the best available author), then to the
+    explicit default when even that is absent."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="c", assignee="easley")
+        # No owner map stamped: fall back to the card's current assignee.
+        assert kb.resolve_ready_owner(conn, t) == "easley"
+        # An explicit default overrides the assignee fallback.
+        assert kb.resolve_ready_owner(conn, t, default="custom") == "custom"
+
+
+# ---------------------------------------------------------------------------
+# bounce_task — the orchestrator's sanctioned review->ready author bounce
+# ---------------------------------------------------------------------------
+
+
+def _put_review(conn, task_id, assignee="lamport"):
+    """Test helper: seed a settled review-lane card (as a bounced-back-to
+    author motion would encounter it), no claim held."""
+    _set_task_status(conn, task_id, "review")
+    conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, task_id))
+
+
+def test_bounce_moves_review_to_ready_and_reassigns(kanban_home):
+    """A review card MOVES to ready + the ready-lane (author) owner, so status
+    and assignee agree and the dispatcher re-spawns the author."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        _put_review(conn, t, assignee="lamport")
+
+        ok = kb.bounce_task(conn, t, author="easley", reason="found a defect")
+        assert ok is True
+
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.assignee == "easley"
+        # Claim must be clear so the dispatcher can pick it up.
+        assert task.claim_lock is None
+
+
+def test_bounce_emits_status_and_assigned_events(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        _put_review(conn, t, assignee="lamport")
+        kb.bounce_task(conn, t, author="easley", reason="found a defect")
+        events = [e.kind for e in kb.list_events(conn, t)]
+    assert "status_changed" in events
+    assert "assigned" in events
+
+
+def test_bounce_records_audit_comment_with_reason(kanban_home):
+    """The §9.1 audit comment carries the bounce reason (Done-when criterion)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        _put_review(conn, t, assignee="lamport")
+        kb.bounce_task(
+            conn, t, author="easley", reason="null deref at foo.py:42", actor="hollis"
+        )
+        bodies = [c.body for c in kb.list_comments(conn, t)]
+    assert any("null deref at foo.py:42" in b for b in bodies)
+
+
+def test_bounce_uses_owner_map_ready_owner_when_author_omitted(kanban_home):
+    """With no explicit author, bounce resolves the ready-lane owner from the
+    card's state_owners map."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="draft", assignee="baldwin")
+        _stamp_owner_map(conn, t, "ready: baldwin, review: perkins, blocked-acceptance: casey")
+        _put_review(conn, t, assignee="perkins")
+        assert kb.bounce_task(conn, t, reason="rework") is True
+        assert kb.get_task(conn, t).assignee == "baldwin"
+
+
+def test_bounce_reassigns_to_explicit_author_override(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        _put_review(conn, t, assignee="lamport")
+        assert kb.bounce_task(conn, t, author="reddy", reason="rework") is True
+        assert kb.get_task(conn, t).assignee == "reddy"
+
+
+def test_bounce_ends_any_open_run(kanban_home):
+    """A bounce closes any dangling run so current_run_id is clear afterward."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        _put_review(conn, t, assignee="lamport")
+        kb.bounce_task(conn, t, author="easley", reason="rework")
+        assert kb.get_task(conn, t).current_run_id is None
+
+
+@pytest.mark.parametrize(
+    "status", ["done", "running", "ready", "blocked", "triage", "todo", "scheduled", "archived"]
+)
+def test_bounce_refuses_every_non_review_status(kanban_home, status):
+    """NEGATIVE CONTROL: bounce can ONLY act on a 'review' card. Every other
+    status returns False and leaves status AND assignee untouched. This proves
+    the guard behaviorally at the sole enforcement point: the SQL
+    ``WHERE status = 'review'``. A settled row (no claim held) is seeded so the
+    status clause is the only guard standing between the call and a write —
+    widening it to admit another status MUST turn that parametrization RED."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="settled card", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        _set_task_status(conn, t, status)
+        before = kb.get_task(conn, t)
+        assert before.claim_lock is None
+        assert before.current_run_id is None
+        # author != current assignee so the guard's rowcount=0 path is exercised.
+        assert kb.bounce_task(conn, t, author="reddy", reason="x") is False
+        after = kb.get_task(conn, t)
+        assert after.status == status
+        assert after.assignee == before.assignee
+
+
+def test_bounce_refuses_unknown_task(kanban_home):
+    with kb.connect() as conn:
+        assert kb.bounce_task(conn, "t_doesnotexist", author="easley", reason="x") is False
+
+
+def test_bounce_only_target_is_ready(kanban_home):
+    """NEGATIVE CONTROL (positive half): the only status bounce can produce is
+    'ready' — never 'done', never back to 'review'."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        _put_review(conn, t, assignee="lamport")
+        assert kb.bounce_task(conn, t, author="easley", reason="x") is True
+        assert kb.get_task(conn, t).status == "ready"
+
+
 def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
     """dispatch_once dry-run sees review tasks and reports them as spawned."""
     with kb.connect() as conn:

@@ -191,6 +191,64 @@ def test_run_slash_review_explicit_reviewer(kanban_home):
         assert kb.get_task(conn, tid).assignee == "perkins"
 
 
+def _make_review_card(assignee_map="ready: easley, review: lamport, blocked-acceptance: casey"):
+    """Create a card, stamp an owner map, and move it into the review lane —
+    the state a review->author bounce encounters."""
+    import re
+    out = kc.run_slash("create 'impl' --assignee easley")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    kc.run_slash(f"claim {tid}")
+    with kb.connect() as conn:
+        kb.add_comment(
+            conn, tid, "kanban",
+            f"[audit] stage=submit\nnotes: state_owners={{{assignee_map}}}",
+        )
+        kb.submit_for_review(conn, tid, reviewer="lamport")
+    return tid
+
+
+def test_run_slash_bounce_returns_review_card_to_author(kanban_home):
+    """`kanban bounce <id>` MOVEs a review card back to ready + the owner-map
+    author, so status and assignee agree (never left review+author)."""
+    tid = _make_review_card()
+    msg = kc.run_slash(f"bounce {tid} --reason 'found a defect'")
+    assert "easley" in msg
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "ready"
+    assert task.assignee == "easley"
+    assert task.claim_lock is None
+
+
+def test_run_slash_bounce_records_reason_comment(kanban_home):
+    tid = _make_review_card()
+    kc.run_slash(f"bounce {tid} --reason 'null deref at foo.py:42'")
+    show = kc.run_slash(f"show {tid}")
+    assert "null deref at foo.py:42" in show
+
+
+def test_run_slash_bounce_explicit_author_override(kanban_home):
+    tid = _make_review_card()
+    kc.run_slash(f"bounce {tid} --to reddy --reason 'rework'")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).assignee == "reddy"
+
+
+def test_run_slash_unblock_on_review_names_bounce(kanban_home):
+    """The refusal message for `unblock` on a review card names the verb to use
+    instead — the current message offers no next step."""
+    tid = _make_review_card()
+    out = kc.run_slash(f"unblock {tid}")
+    assert "bounce" in out.lower()
+
+
+def test_run_slash_block_on_review_names_bounce(kanban_home):
+    """`block` on a review card is likewise refused with a hint to use bounce."""
+    tid = _make_review_card()
+    out = kc.run_slash(f"block {tid} 'x'")
+    assert "bounce" in out.lower()
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)

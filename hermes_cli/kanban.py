@@ -649,6 +649,33 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_bounce = sub.add_parser(
+        "bounce",
+        help="Return a review-status card to its author (review -> ready)",
+    )
+    p_bounce.add_argument("task_id")
+    p_bounce.add_argument(
+        "reason",
+        nargs="*",
+        help="Why the card is bounced (recorded as a §9.1 audit comment). "
+             "Quote multi-word reasons, or use --reason.",
+    )
+    p_bounce.add_argument(
+        "--reason",
+        dest="reason_opt",
+        default=None,
+        help="Alternative to the positional reason.",
+    )
+    p_bounce.add_argument(
+        "--to",
+        default=None,
+        help=(
+            "Author to reassign to. Omit to use the card's own state_owners "
+            "ready-lane owner (code -> easley, writing -> baldwin); a card with "
+            "no owner map falls back to its current assignee."
+        ),
+    )
+
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -1060,6 +1087,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "review":   _cmd_review,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "bounce":   _cmd_bounce,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1123,6 +1151,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "complete",
     "edit",
     "block",
+    "bounce",
     "schedule",
     "unblock",
     "promote",
@@ -2249,6 +2278,26 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _review_bounce_hint(conn, task_id: str) -> str:
+    """Return ' — use `bounce` ...' when a block/unblock was refused because the
+    card is in the review lane, else ''.
+
+    ``block``/``unblock`` deliberately do not accept a ``review`` card; the
+    review exit is ``bounce``. This turns the bare refusal into an actionable
+    next step instead of a dead end.
+    """
+    try:
+        task = kb.get_task(conn, task_id)
+    except Exception:
+        return ""
+    if task is not None and task.status == "review":
+        return (
+            " — card is in review; use `kanban bounce "
+            f"{task_id} --reason ...` to return it to its author"
+        )
+    return ""
+
+
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
@@ -2267,7 +2316,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
+                print(f"cannot block {tid}{_review_bounce_hint(conn, tid)}", file=sys.stderr)
             else:
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
@@ -2359,10 +2408,58 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                print(
+                    f"cannot unblock {tid} (not blocked/scheduled?)"
+                    f"{_review_bounce_hint(conn, tid)}",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_bounce(args: argparse.Namespace) -> int:
+    """Return a review-status card to its author (review -> ready).
+
+    The sanctioned inverse of ``review``: MOVEs the card review -> ready,
+    reassigns it to the ready-lane owner (from the card's ``state_owners`` map,
+    or ``--to`` when given), and records the reason as a §9.1 audit comment —
+    atomically, so status and assignee never disagree. This is the one command
+    that performs the whole bounce; ``block``/``unblock`` deliberately do not
+    accept a review card.
+    """
+    reason = " ".join(args.reason).strip() if args.reason else None
+    if not reason:
+        reason = (getattr(args, "reason_opt", None) or "").strip() or None
+    if not reason:
+        print("a --reason (or positional reason) is required to bounce", file=sys.stderr)
+        return 1
+    author = getattr(args, "to", None)
+    if author and author.lower() in {"none", "-", "null"}:
+        author = None
+    actor = _profile_author()
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            print(f"cannot bounce {args.task_id}: unknown task", file=sys.stderr)
+            return 1
+        target = author or kb.resolve_ready_owner(conn, args.task_id)
+        if not kb.bounce_task(
+            conn,
+            args.task_id,
+            author=target,
+            reason=reason,
+            actor=actor,
+            expected_run_id=_worker_run_id_for(args.task_id),
+        ):
+            print(
+                f"cannot bounce {args.task_id} "
+                f"(not in review? status={task.status})",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{args.task_id} → ready (bounced to: {target}): {reason}")
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
@@ -3175,6 +3272,7 @@ Common subcommands:
   `complete <id>…`      Mark task(s) done
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `review <id>`         Hand a running task off to the review lane (running → review)
+  `bounce <id> --reason`  Return a review card to its author (review → ready)
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

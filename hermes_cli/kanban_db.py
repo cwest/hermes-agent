@@ -2789,6 +2789,13 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
 #: with a different default (e.g. a writing card -> ``perkins``) pass ``default``.
 DEFAULT_REVIEW_OWNER = "lamport"
 
+#: The ready-lane (author) owner for a card that carries no ``state_owners``
+#: map and no current assignee to fall back to. Unlike the review lane there is
+#: no single canonical author across kinds (code -> easley, writing -> baldwin,
+#: …), so :func:`resolve_ready_owner` prefers the card's own owner map, then its
+#: current assignee, and only lands on this literal for a truly ownerless card.
+DEFAULT_READY_OWNER = "easley"
+
 #: The owner-map fragment recorded in a card's ``submit``-stage audit comment,
 #: e.g. ``state_owners={ready: easley, review: lamport, blocked-acceptance: casey}``.
 #: The owner map is NOT a column — it lives in the audit trail — so lane-owner
@@ -2847,6 +2854,47 @@ def resolve_review_owner(
         if owner:
             return owner
     return default
+
+
+def resolve_ready_owner(
+    conn: sqlite3.Connection, task_id: str, default: Optional[str] = None
+) -> str:
+    """Return the ready-lane (author) owner for a card from its ``state_owners`` map.
+
+    The mirror of :func:`resolve_review_owner` for the ``ready`` lane — used by
+    :func:`bounce_task` to reassign a review-status card back to the author who
+    owns its implementation lane (code -> ``easley``, writing -> ``baldwin``).
+    Reads ``state_owners["ready"]`` from the earliest parseable owner-map audit
+    comment (first-match, matching ``resolve_review_owner`` — the map is stamped
+    once at submit and not re-negotiated per lane).
+
+    Fallback order for a card with no parseable ``ready`` owner:
+
+    1. the explicit ``default`` argument, when the caller supplied one;
+    2. otherwise the card's CURRENT assignee — for a legacy / CLI-created card
+       with no owner map, the card's own owner is the best available author;
+    3. otherwise :data:`DEFAULT_READY_OWNER`.
+
+    Unlike the review lane there is no single canonical author across card kinds,
+    so the assignee fallback (2) is what makes this correct for un-stamped cards
+    rather than a hardcoded literal.
+    """
+    try:
+        comments = list_comments(conn, task_id)
+    except Exception:
+        comments = []
+    for c in comments:
+        owner = _parse_owner_map(getattr(c, "body", "")).get("ready")
+        if owner:
+            return owner
+    if default:
+        return default
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is not None and row["assignee"]:
+        return row["assignee"]
+    return DEFAULT_READY_OWNER
 
 
 def create_task(
@@ -5829,6 +5877,142 @@ def submit_for_review(
             _append_event(
                 conn, task_id, "assigned",
                 {"from": prev_assignee, "to": reviewer, "by": "submit_for_review"},
+                run_id=run_id,
+            )
+    return True
+
+
+def bounce_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    author: Optional[str] = None,
+    reason: str,
+    actor: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """MOVE a card ``review`` -> ``ready`` + the author, returning it for rework.
+
+    The sanctioned inverse of :func:`submit_for_review`. It expresses the one
+    motion neither ``block`` nor ``unblock`` covered: take a card OUT of the
+    review lane and return it to its author with a recorded reason, atomically,
+    so status and assignee never disagree (the ``review``+author state the old
+    ``assign``+``comment`` workaround left behind).
+
+    ``block_task`` guards ``running``/``ready`` and ``unblock_task`` guards
+    ``blocked``/``scheduled`` — a ``review`` card matches neither, by design
+    (their contracts carry the unblock-loop recurrence counter and parent
+    re-gating, which the review lane does not want). This verb owns the review
+    exit so those verbs stay narrow.
+
+    What it does, atomically, inside one ``write_txn``:
+
+    * Records a §9.1 audit comment (``actor`` -> author, carrying ``reason``)
+      BEFORE the transition, so the reason is on the card even if a later step
+      is a no-op.
+    * Guarded ``UPDATE ... WHERE id=? AND status='review'`` — an atomic
+      check-and-set. Only a review-lane card matches; every other status
+      (including terminal ``done``) matches zero rows and is NOT moved
+      (returns ``False``), so a race can never drag a card out of a lane it no
+      longer occupies.
+    * Clears ``claim_lock`` / ``claim_expires`` / ``worker_pid`` so the
+      dispatcher can re-claim and re-spawn the author.
+    * Sets ``assignee`` to ``author`` (the ready-lane owner; resolve it from the
+      card's ``state_owners`` map with :func:`resolve_ready_owner` when not
+      given explicitly).
+    * Closes any open run with a non-terminal ``bounced`` outcome and emits
+      ``status_changed`` + ``assigned`` events so the audit trail is complete.
+
+    Like ``submit_for_review`` it touches only the board row — it does NOT touch
+    the PR (no undraft, no merge, no close); the fix-forward happens on the same
+    branch/PR when the author is re-spawned.
+
+    ``author`` defaults to the card's ready-lane owner via
+    :func:`resolve_ready_owner`. ``reason`` is required — a bounce with no
+    recorded reason is exactly the ambiguous state this verb exists to prevent.
+    ``actor`` is the comment author (the orchestrator/human driving the bounce);
+    it defaults to ``"kanban"``.
+
+    Returns ``True`` on a successful move, ``False`` for an unknown id or a card
+    not in ``review``.
+    """
+    if not reason or not reason.strip():
+        raise ValueError("bounce reason is required")
+    reason = reason.strip()
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        prev_status = row["status"]
+        prev_assignee = row["assignee"]
+        if prev_status != "review":
+            # Not in the review lane — nothing to bounce. No comment, no change.
+            return False
+
+        target_author = _canonical_assignee(author) or resolve_ready_owner(
+            conn, task_id
+        )
+        if not target_author:
+            raise ValueError("could not resolve a bounce author")
+
+        # §9.1 audit comment recorded before the transition (mirrors the CLI's
+        # comment-before-mutate order for block/unblock). Written inside this
+        # txn directly rather than via add_comment (which opens its own txn).
+        comment_author = (actor or "kanban").strip() or "kanban"
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, comment_author, f"BOUNCE: {reason}", now),
+        )
+        _append_event(
+            conn, task_id, "commented",
+            {"author": comment_author, "len": len(f"BOUNCE: {reason}")},
+        )
+
+        # Atomic guard: only a review-lane card may be bounced. The SET target
+        # is a literal 'ready' and the WHERE forbids any non-review card.
+        params: tuple = (target_author, task_id)
+        run_guard = ""
+        if expected_run_id is not None:
+            run_guard = " AND current_run_id = ?"
+            params = (target_author, task_id, int(expected_run_id))
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'ready',
+                   assignee      = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND status = 'review'
+            """ + run_guard,
+            params,
+        )
+        if cur.rowcount != 1:
+            # Lost the review lane between read and write (or stale run id).
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="bounced", status="bounced",
+            summary=reason,
+        )
+        if run_id is None:
+            run_id = _synthesize_ended_run(
+                conn, task_id, outcome="bounced", summary=reason,
+            )
+        _append_event(
+            conn, task_id, "status_changed",
+            {"from": prev_status, "to": "ready", "by": "bounce_task"},
+            run_id=run_id,
+        )
+        if prev_assignee != target_author:
+            _append_event(
+                conn, task_id, "assigned",
+                {"from": prev_assignee, "to": target_author, "by": "bounce_task"},
                 run_id=run_id,
             )
     return True
