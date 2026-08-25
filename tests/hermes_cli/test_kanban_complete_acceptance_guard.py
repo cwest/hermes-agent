@@ -166,3 +166,48 @@ def test_review_bounce_blocked_card_still_completable(kanban_home: Path) -> None
 
         assert kb.complete_task(conn, tid, summary="author completed") is True
         assert kb.get_task(conn, tid).status == "done"
+
+
+# ---------------------------------------------------------------------------
+# RED 4 — the acceptance refusal message names the reconcile verb WHEN a merged
+# PR may be linked (so the operator has a sanctioned recovery, not raw-module
+# access), and does NOT name it when no PR is linked
+# ---------------------------------------------------------------------------
+
+_PR_URL = "https://github.com/cwest/hermes-agent/pull/71"
+
+
+def test_acceptance_refusal_names_reconcile_verb_when_pr_linked(
+    kanban_home: Path,
+) -> None:
+    """When a PASS'd acceptance card carries a linked PR (Casey may have already
+    merged it, webhook missed), the refusal explanation points at
+    ``reconcile-acceptance`` — the sanctioned recovery this verb exists to be."""
+    with kb.connect() as conn:
+        tid = _stage_acceptance_card(conn)
+        kb.add_comment(
+            conn, tid, author="easley",
+            body=f"Draft PR opened: {_PR_URL} @ head abc1234.",
+        )
+        # Trigger the acceptance refusal so the audit event is recorded.
+        assert kb.complete_task(conn, tid, summary="worker tried") is False
+
+        msg = kb.explain_completion_refusal(conn, tid)
+        assert "reconcile-acceptance" in msg, \
+            "the refusal must name the sanctioned reconcile recovery verb"
+        assert tid in msg, "the hint must be runnable (carry the task id)"
+
+
+def test_acceptance_refusal_omits_reconcile_verb_without_pr(
+    kanban_home: Path,
+) -> None:
+    """With no PR linked there is nothing to reconcile against, so the message
+    stays the plain acceptance refusal — no misleading reconcile hint."""
+    with kb.connect() as conn:
+        tid = _stage_acceptance_card(conn)
+        assert kb.complete_task(conn, tid, summary="worker tried") is False
+
+        msg = kb.explain_completion_refusal(conn, tid)
+        assert "reconcile-acceptance" not in msg
+        assert "acceptance lane" in msg, "still the acceptance refusal message"
+

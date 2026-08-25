@@ -8178,12 +8178,26 @@ def explain_completion_refusal(
     ).fetchone()
     latest_kind = row["kind"] if row else None
     if latest_kind == "completion_refused_acceptance":
-        return (
+        msg = (
             "refused: this card is parked in the acceptance lane awaiting "
             "Casey's sign-off (a reviewed PASS). done means Casey merged/"
             "accepted — a worker cannot complete it. Do NOT retry; leave it for "
             "the merge path."
         )
+        # If the card already carries a linked PR, Casey may have ALREADY merged
+        # it and only the github-pr-closed webhook was missed — the exact case
+        # `hermes kanban reconcile-acceptance <id>` recovers (it PROVES the merge
+        # against GitHub before moving the card). Name it so the operator has a
+        # sanctioned path instead of reaching for raw-module access. Cheap
+        # DB-only check — never consults gh on this common refusal path.
+        if _card_newest_pr_url(conn, task_id):
+            msg += (
+                " If Casey ALREADY merged the PR and the github-pr-closed "
+                "webhook was simply missed, recover it with "
+                "`hermes kanban reconcile-acceptance " + task_id + "` (it "
+                "verifies the merge against GitHub before moving the card)."
+            )
+        return msg
     if latest_kind == "completion_refused_missing_pr":
         return (
             "refused: this card builds in a git worktree and owes a reviewable "
