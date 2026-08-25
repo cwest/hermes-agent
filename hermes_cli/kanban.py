@@ -653,6 +653,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
+    p_reconcile = sub.add_parser(
+        "reconcile-acceptance",
+        help="Walk a merged-PR acceptance card to done (missed github-pr-closed webhook recovery)",
+        description=(
+            "Recover a card stranded in the acceptance lane (blocked + "
+            "awaiting-casey-signoff) after Casey ALREADY merged its PR but the "
+            "github-pr-closed webhook was lost, so the card has no working path "
+            "to done. This is a reconciliation of a MISSED event, NOT a bypass "
+            "of sign-off: done still means 'Casey merged', and the merge is "
+            "PROVEN against GitHub ground truth (the linked PR must be MERGED "
+            "with a resolvable merge commit) before the card moves. On refusal "
+            "it prints WHICH precondition failed (not in the acceptance lane / "
+            "no PR URL linked / PR not merged); on success it prints the proven "
+            "merge commit and PR URL."
+        ),
+    )
+    p_reconcile.add_argument(
+        "task_id",
+        help="Task id of the stranded acceptance card to reconcile",
+    )
+
     p_unblock = sub.add_parser(
         "unblock",
         help="Return blocked/scheduled tasks to ready, or todo while parents remain open",
@@ -1062,52 +1083,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
             return 1
 
-        handlers = {
-            "init":     _cmd_init,
-            "create":   _cmd_create,
-            "swarm":    _cmd_swarm,
-            "list":     _cmd_list,
-            "ls":       _cmd_list,
-            "show":     _cmd_show,
-            "assign":   _cmd_assign,
-            "set-model": _cmd_set_model,
-            "reclaim":  _cmd_reclaim,
-            "reassign": _cmd_reassign,
-            "diagnostics": _cmd_diagnostics,
-            "diag":     _cmd_diagnostics,
-            "link":     _cmd_link,
-            "unlink":   _cmd_unlink,
-            "claim":    _cmd_claim,
-            "comment":  _cmd_comment,
-            "attach":   _cmd_attach,
-            "attachments": _cmd_attachments,
-            "attach-rm": _cmd_attach_rm,
-            "complete": _cmd_complete,
-            "edit":     _cmd_edit,
-            "block":    _cmd_block,
-            "review":   _cmd_review,
-            "schedule": _cmd_schedule,
-            "unblock":  _cmd_unblock,
-            "promote":  _cmd_promote,
-            "archive":  _cmd_archive,
-            "tail":     _cmd_tail,
-            "dispatch": _cmd_dispatch,
-            "daemon":   _cmd_daemon,
-            "watch":    _cmd_watch,
-            "stats":    _cmd_stats,
-            "log":      _cmd_log,
-            "runs":     _cmd_runs,
-            "heartbeat": _cmd_heartbeat,
-            "assignees": _cmd_assignees,
-            "notify-subscribe":   _cmd_notify_subscribe,
-            "notify-list":        _cmd_notify_list,
-            "notify-unsubscribe": _cmd_notify_unsubscribe,
-            "context":  _cmd_context,
-            "specify":  _cmd_specify,
-            "decompose":  _cmd_decompose,
-            "gc":       _cmd_gc,
-        }
-        handler = handlers.get(action)
+        handler = _HANDLERS.get(action)
         if not handler:
             print(f"kanban: unknown action {action!r}", file=sys.stderr)
             return 2
@@ -1154,6 +1130,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule",
     "unblock",
     "promote",
+    "reconcile-acceptance",
     "archive",
     "dispatch",
     "daemon",
@@ -2406,6 +2383,112 @@ def _cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reconcile_acceptance(args: argparse.Namespace) -> int:
+    """Walk a merged-PR acceptance card to ``done`` — missed-webhook recovery.
+
+    A thin CLI shim over :func:`kanban_db.reconcile_merged_acceptance`. It does
+    NOT reimplement or relax the reconcile: the merge is still PROVEN against
+    GitHub ground truth by that function before the card moves, and ``done``
+    still means "Casey merged". The shim adds only what the function is silent
+    about — it names WHICH precondition failed on refusal (the bare ``False`` /
+    silent no-op is what drove the raw-module debugging this verb replaces), and
+    prints the proven merge commit + PR URL on success.
+
+    Refusal reasons are derived from the SAME reads the function gates on. The
+    cheap DB-only preconditions (acceptance lane, sticky signoff reason, a linked
+    PR URL) are checked first so a refusal on any of them is named WITHOUT ever
+    consulting ``gh``. Only when those pass is the function called (its one
+    ``gh`` ground-truth check); a ``False`` from there means the merge gate
+    failed, and the PR state is re-resolved once to say whether the PR is
+    unmerged, merged-without-a-resolvable-commit, or transiently unresolvable.
+    """
+    task_id = args.task_id
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            print(f"cannot reconcile {task_id}: unknown task", file=sys.stderr)
+            return 1
+
+        # --- Cheap DB-only precondition checks (no gh). These mirror the gates
+        #     in reconcile_merged_acceptance so a refusal names the cause; the
+        #     function remains the authority that actually moves the card. ---
+        if task.status != "blocked":
+            print(
+                f"cannot reconcile {task_id}: not in the acceptance lane "
+                f"(status is {task.status!r}, not 'blocked'). Only a card "
+                f"parked blocked + awaiting-casey-signoff is reconcilable.",
+                file=sys.stderr,
+            )
+            return 1
+
+        reason = kb._latest_sticky_block_reason(conn, task_id)
+        if not reason or not reason.lstrip().startswith(
+            kb._ACCEPTANCE_SIGNOFF_REASON_PREFIX
+        ):
+            print(
+                f"cannot reconcile {task_id}: not in the acceptance lane "
+                f"(latest block reason is not '{kb._ACCEPTANCE_SIGNOFF_REASON_PREFIX}'). "
+                "This is not a generic complete-any-blocked-card path — only a "
+                "reviewer-PASS acceptance park is reconcilable.",
+                file=sys.stderr,
+            )
+            return 1
+
+        pr_url = kb._card_newest_pr_url(conn, task_id)
+        if not pr_url:
+            print(
+                f"cannot reconcile {task_id}: no PR URL is linked on the card, "
+                "so there is nothing to prove a merge against. Link the merged "
+                "PR (post its URL in a comment) first.",
+                file=sys.stderr,
+            )
+            return 1
+
+        # --- Preconditions pass: hand off to the authority. This is the ONLY
+        #     path that consults gh (once) and moves the card. ---
+        ok = kb.reconcile_merged_acceptance(
+            conn, task_id, actor=_profile_author()
+        )
+        if ok:
+            merge_commit = None
+            for ev in reversed(kb.list_events(conn, task_id)):
+                if ev.kind == "completion_reconciled_merge":
+                    merge_commit = (ev.payload or {}).get("merge_commit")
+                    break
+            print(f"{task_id} → done (reconciled: missed github-pr-closed webhook)")
+            print(f"  PR:           {pr_url}")
+            if merge_commit:
+                print(f"  merge commit: {merge_commit}")
+            return 0
+
+        # --- The merge gate refused. Re-resolve the PR state ONCE to say why.
+        #     This is diagnostic only; the card was already left untouched. ---
+        state, merge_oid = kb._resolve_pr_merge_commit(pr_url)
+        if state != "merged":
+            detail = (
+                f"the PR is not merged (state {state!r}). done means Casey "
+                "merged — reconcile only recovers a card whose PR he ALREADY "
+                "merged when the webhook was missed."
+            )
+            if state in {"unknown", "not_found"}:
+                detail = (
+                    f"the PR state could not be resolved (gh returned {state!r}); "
+                    "failing closed. Retry once gh can reach the PR."
+                )
+        elif not merge_oid:
+            detail = (
+                "the PR reports merged but no merge commit oid could be "
+                "resolved (unverifiable); failing closed."
+            )
+        else:  # pragma: no cover - would have succeeded above
+            detail = "the reconcile was refused for an unexpected reason."
+        print(
+            f"cannot reconcile {task_id}: {detail}\n  PR: {pr_url}",
+            file=sys.stderr,
+        )
+        return 1
+
+
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
@@ -3331,6 +3414,54 @@ def _cmd_repair(args: argparse.Namespace) -> int:
 # Slash-command entry point (used by /kanban from CLI and gateway)
 # ---------------------------------------------------------------------------
 
+_HANDLERS = {
+    "init":     _cmd_init,
+    "create":   _cmd_create,
+    "swarm":    _cmd_swarm,
+    "list":     _cmd_list,
+    "ls":       _cmd_list,
+    "show":     _cmd_show,
+    "assign":   _cmd_assign,
+    "set-model": _cmd_set_model,
+    "reclaim":  _cmd_reclaim,
+    "reassign": _cmd_reassign,
+    "diagnostics": _cmd_diagnostics,
+    "diag":     _cmd_diagnostics,
+    "link":     _cmd_link,
+    "unlink":   _cmd_unlink,
+    "claim":    _cmd_claim,
+    "comment":  _cmd_comment,
+    "attach":   _cmd_attach,
+    "attachments": _cmd_attachments,
+    "attach-rm": _cmd_attach_rm,
+    "complete": _cmd_complete,
+    "edit":     _cmd_edit,
+    "block":    _cmd_block,
+    "review":   _cmd_review,
+    "reconcile-acceptance": _cmd_reconcile_acceptance,
+    "schedule": _cmd_schedule,
+    "unblock":  _cmd_unblock,
+    "promote":  _cmd_promote,
+    "archive":  _cmd_archive,
+    "tail":     _cmd_tail,
+    "dispatch": _cmd_dispatch,
+    "daemon":   _cmd_daemon,
+    "watch":    _cmd_watch,
+    "stats":    _cmd_stats,
+    "log":      _cmd_log,
+    "runs":     _cmd_runs,
+    "heartbeat": _cmd_heartbeat,
+    "assignees": _cmd_assignees,
+    "notify-subscribe":   _cmd_notify_subscribe,
+    "notify-list":        _cmd_notify_list,
+    "notify-unsubscribe": _cmd_notify_unsubscribe,
+    "context":  _cmd_context,
+    "specify":  _cmd_specify,
+    "decompose":  _cmd_decompose,
+    "gc":       _cmd_gc,
+}
+
+
 _SLASH_KANBAN_HELP = """\
 **/kanban** — manage the shared task board.
 
@@ -3344,6 +3475,7 @@ Common subcommands:
   `complete <id>…`      Mark task(s) done
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `review <id>`         Hand a running task off to the review lane (running → review)
+  `reconcile-acceptance <id>`  Walk a merged-PR acceptance card to done (missed webhook recovery)
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts
