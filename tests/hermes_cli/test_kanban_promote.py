@@ -143,6 +143,60 @@ def test_promote_rejects_non_todo_status(conn):
     assert "'ready'" in err and "promote only applies" in err
 
 
+def test_promote_triage_task_works(conn):
+    """A card stuck in ``triage`` (an intake lane meaning "not yet started,
+    needs an owner and a lane" — exactly like ``todo``) must be promotable to
+    ``ready`` through the sanctioned verb. This is the guaranteed exit for a
+    card the block-loop breaker escalated to ``triage``: before this fix
+    ``promote`` refused every ``triage`` card, leaving a direct DB write as the
+    only escape (the workaround the one-card design forbids).
+    """
+    tid = kb.create_task(conn, title="stuck in triage", assignee="setup", triage=True, detached=True)
+    assert kb.get_task(conn, tid).status == "triage"
+    ok, err = kb.promote_task(conn, tid, actor="tester", reason="recover from triage")
+    assert ok and err is None
+    assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_promote_triage_emits_audit_event(conn):
+    tid = kb.create_task(conn, title="stuck in triage", assignee="setup", triage=True, detached=True)
+    kb.promote_task(conn, tid, actor="tester", reason="recover from triage")
+    ev = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'promoted_manual'",
+        (tid,),
+    ).fetchone()
+    assert ev is not None
+    payload = json.loads(ev["payload"])
+    assert payload["actor"] == "tester"
+    assert payload["reason"] == "recover from triage"
+
+
+def test_promote_triage_refuses_when_parent_not_done(conn):
+    """The parent-dependency gate still applies to a triage promotion: a triage
+    card with an unfinished parent is refused unless forced (same invariant the
+    dispatcher trusts for todo/blocked promotions)."""
+    parent = kb.create_task(conn, title="parent", assignee="setup", detached=True)
+    child = kb.create_task(
+        conn, title="child", parents=[parent], assignee="setup", triage=True, detached=True
+    )
+    assert kb.get_task(conn, child).status == "triage"
+    ok, err = kb.promote_task(conn, child, actor="tester")
+    assert ok is False
+    assert err is not None and "unsatisfied parent dependencies" in err
+    assert kb.get_task(conn, child).status == "triage"
+
+
+def test_promote_error_message_names_triage(conn):
+    """The refusal message for a non-promotable status advertises ``triage`` as
+    an accepted source alongside todo/blocked, so an operator reading the error
+    learns the full accepted set."""
+    tid = kb.create_task(conn, title="standalone", detached=True)
+    ok, err = kb.promote_task(conn, tid, actor="tester")
+    assert ok is False
+    assert "triage" in err
+
+
 def test_promote_rejects_unknown_task(conn):
     ok, err = kb.promote_task(conn, "t_doesnotexist", actor="tester")
     assert ok is False

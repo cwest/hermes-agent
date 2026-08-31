@@ -9712,7 +9712,7 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a `todo`, `blocked`, or `triage` task to `ready`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
@@ -9721,7 +9721,15 @@ def promote_task(
     assignee or claim state. Returns ``(True, None)`` on success and
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
+
+    ``triage`` is accepted alongside ``todo`` and ``blocked`` because all
+    three mean "not yet started, needs an owner and a lane" — and it is the
+    sanctioned EXIT for a card the block-loop breaker escalated to ``triage``.
+    Without this, ``triage`` had no transition verb at all (``review`` /
+    ``block`` / ``reclaim`` all refuse it), so the only escape was a direct
+    DB write — exactly the workaround the one-card design forbids.
     """
+    _PROMOTABLE_FROM = ("todo", "blocked", "triage")
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -9729,10 +9737,10 @@ def promote_task(
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in _PROMOTABLE_FROM:
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'blocked', or 'triage'"
         )
 
     if not force:
@@ -9758,7 +9766,7 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
+            "WHERE id = ? AND status IN ('todo', 'blocked', 'triage')",
             (task_id,),
         )
         if upd.rowcount != 1:
