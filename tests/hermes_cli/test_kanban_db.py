@@ -2383,6 +2383,12 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
     _init_git_repo(repo)
     target = repo / ".worktrees" / "custom-task"
     branch = "wt/custom-task"
+    # A card-declared branch must already exist — the dispatcher checks it out,
+    # it does not cut it fresh (that silent fallback is the defect being fixed).
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", branch],
+        check=True, capture_output=True, text=True,
+    )
     with kb.connect() as conn:
         t = kb.create_task(
             conn,

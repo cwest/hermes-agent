@@ -6410,6 +6410,33 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     return result.returncode == 0
 
 
+def _git_remote_branch_exists(
+    repo_root: Path, branch_name: str, remote: str = "origin"
+) -> bool:
+    """True if ``branch_name`` exists on ``remote``.
+
+    Uses ``git ls-remote`` so it reflects the remote's CURRENT state without
+    needing a prior fetch — a card-declared PR branch lives on the remote
+    (GitHub), and the dispatcher's local clone may never have seen it.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "ls-remote", "--heads",
+                remote, branch_name,
+            ],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=60,
+            check=False,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    return bool((result.stdout or "").strip())
+
+
 def _git_common_dir(path: Path) -> Optional[Path]:
     try:
         result = subprocess.run(
@@ -6491,8 +6518,24 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+def _ensure_git_worktree(
+    repo_root: Path, target: Path, branch_name: str, *, declared: bool = False
+) -> None:
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    ``declared`` distinguishes a *card-declared* target branch from an
+    *auto-derived* ``wt/<task-id>`` branch:
+
+    - ``declared=False`` (default, auto-derived): if the branch exists locally
+      it is checked out; otherwise a fresh branch is cut from ``HEAD``. This is
+      the standalone-task path — every task gets its own isolated branch.
+    - ``declared=True``: the card said "check out THIS existing branch". The
+      branch MUST already exist. It is resolved from a local ref, or fetched
+      from ``origin`` when it only exists on the remote, and then fast-forward
+      pulled. If it exists NOWHERE it is a loud failure — never a silent fresh
+      branch off ``main``, which is the defect that silently splits a
+      one-piece deliverable across an orphan branch and a new PR.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
@@ -6500,6 +6543,11 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         if target_common == repo_common:
             return
     target.parent.mkdir(parents=True, exist_ok=True)
+
+    if declared:
+        _ensure_declared_branch_worktree(repo_root, target, branch_name)
+        return
+
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
@@ -6521,6 +6569,73 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
+def _ensure_declared_branch_worktree(
+    repo_root: Path, target: Path, branch_name: str
+) -> None:
+    """Check out an EXISTING declared branch into ``target``; fail if absent.
+
+    Resolution order: local ref → remote ``origin`` (fetch first). A branch
+    that exists in neither place raises, so a card declaring a target branch
+    can never silently fall back to a fresh cut from ``main``.
+    """
+    if not _git_branch_exists(repo_root, branch_name):
+        if not _git_remote_branch_exists(repo_root, branch_name):
+            raise RuntimeError(
+                f"declared target branch {branch_name!r} does not exist locally "
+                f"or on origin for repo {repo_root}. A card that declares a target "
+                "branch must point at an existing branch; refusing to silently cut "
+                "a fresh branch from main (that splits a deliverable onto an orphan "
+                "branch). Push the branch first, or clear the card's branch_name to "
+                "get a fresh wt/<task-id> worktree."
+            )
+        # Fetch the remote branch into a local tracking ref so `worktree add`
+        # can check it out. `git fetch origin <b>:<b>` creates refs/heads/<b>
+        # pointing at origin's tip.
+        fetch = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "fetch", "origin",
+                f"{branch_name}:{branch_name}",
+            ],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=120,
+            check=False,
+        )
+        if fetch.returncode != 0:
+            stderr = (fetch.stderr or fetch.stdout or "").strip()
+            raise RuntimeError(
+                f"failed to fetch declared branch {branch_name!r} from origin "
+                f"for repo {repo_root}: {stderr}"
+            )
+
+    add = subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name],
+        capture_output=True,
+        text=True, encoding='utf-8', errors='replace',
+        timeout=60,
+        check=False,
+    )
+    if add.returncode != 0:
+        stderr = (add.stderr or add.stdout or "").strip()
+        raise RuntimeError(
+            f"git worktree add failed for {target} on declared branch "
+            f"{branch_name}: {stderr}"
+        )
+
+    # Bring the checkout up to date with the remote tip, but only via a
+    # fast-forward — never a merge/rebase that could silently rewrite the
+    # shared PR branch. A non-ff divergence is a real conflict the humans
+    # must resolve, so let it surface rather than papering over it.
+    if _git_remote_branch_exists(repo_root, branch_name):
+        subprocess.run(
+            ["git", "-C", str(target), "pull", "--ff-only", "origin", branch_name],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=120,
+            check=False,
+        )
+
+
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
@@ -6534,6 +6649,16 @@ def _resolve_worktree_workspace(
     launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
     """
+    # A card that carries an explicit ``branch_name`` and is NOT project-linked
+    # is *declaring* an existing target branch: "check this branch out" (e.g.
+    # sibling cards contributing to one in-flight PR). Such a branch must
+    # already exist — we refuse to silently cut a fresh one from main.
+    #
+    # A project-linked task ALSO carries a ``branch_name``, but it is
+    # DETERMINISTICALLY DERIVED (``<slug>/<task-id>-<title>``) and is meant to
+    # be cut fresh per task — so it is NOT a declaration and keeps the
+    # create-if-missing path.
+    declared = bool((task.branch_name or "").strip()) and not task.project_id
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
@@ -6561,7 +6686,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, declared=declared)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -6587,7 +6712,7 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(fallback_root, fallback, branch_name, declared=declared)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
@@ -6597,7 +6722,7 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, declared=declared)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -6606,7 +6731,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(repo_root, requested, branch_name, declared=declared)
     return requested, branch_name
 
 

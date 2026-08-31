@@ -66,6 +66,176 @@ def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
     return target
 
 
+def _make_repo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
+    """A working clone whose ``origin`` is a bare repo, so remote-branch
+    resolution can be exercised end-to-end with real git."""
+    bare = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(bare)],
+        check=True, capture_output=True, text=True,
+    )
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", str(bare), str(clone)],
+        check=True, capture_output=True, text=True,
+    )
+    (clone / "README.md").write_text("base\n", encoding="utf-8")
+    _git(clone, "add", "README.md")
+    _git(clone, "commit", "-m", "init")
+    _git(clone, "push", "origin", "main")
+    return clone, bare
+
+
+def _push_remote_branch(clone: Path, branch: str) -> None:
+    """Create ``branch`` on the remote, then remove the local copy so the
+    dispatcher must resolve it from ``origin`` (the real cross-worker case:
+    the PR branch lives on GitHub, not in the dispatcher's local repo)."""
+    _git(clone, "checkout", "-b", branch)
+    (clone / f"{branch.replace('/', '_')}.txt").write_text("x\n", encoding="utf-8")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", f"work on {branch}")
+    _git(clone, "push", "origin", branch)
+    _git(clone, "checkout", "main")
+    _git(clone, "branch", "-D", branch)
+
+
+def test_declared_branch_existing_locally_is_checked_out(kanban_home, tmp_path):
+    """A card that declares an existing local branch is dispatched INTO it."""
+    repo = _make_repo(tmp_path)
+    _git(repo, "branch", "feature/shared-pr")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="contribute to shared PR",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="feature/shared-pr",
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+    assert branch == "feature/shared-pr"
+    head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == "feature/shared-pr"
+
+
+def test_declared_branch_on_remote_only_is_fetched_and_checked_out(
+    kanban_home, tmp_path
+):
+    """A declared branch that exists only on origin is fetched and checked
+    out — not shadowed by a fresh branch cut from main."""
+    clone, _bare = _make_repo_with_remote(tmp_path)
+    _push_remote_branch(clone, "wt/t_84a614c5-obtainability-part")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="hero for the obtainability post",
+            workspace_kind="worktree",
+            workspace_path=str(clone),
+            branch_name="wt/t_84a614c5-obtainability-part",
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+    assert branch == "wt/t_84a614c5-obtainability-part"
+    head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == "wt/t_84a614c5-obtainability-part"
+    # It is the REMOTE branch's content, not a fresh cut from main.
+    assert (workspace / "wt_t_84a614c5-obtainability-part.txt").exists()
+
+
+def test_declared_branch_that_does_not_exist_fails_loudly(kanban_home, tmp_path):
+    """A declared branch missing locally AND on the remote must fail — never
+    silently fall back to a fresh branch off main."""
+    clone, _bare = _make_repo_with_remote(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="targets a branch that was never pushed",
+            workspace_kind="worktree",
+            workspace_path=str(clone),
+            branch_name="wt/nonexistent-branch",
+        )
+        task = kb.get_task(conn, tid)
+
+    with pytest.raises((RuntimeError, ValueError)) as exc:
+        kb._resolve_worktree_workspace(task)
+    msg = str(exc.value)
+    assert "wt/nonexistent-branch" in msg
+    # No stray worktree was left cut from main.
+    for wt in (clone / ".worktrees").glob("*") if (clone / ".worktrees").exists() else []:
+        head = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        assert head != "wt/nonexistent-branch"
+
+
+def test_no_declared_branch_still_cuts_fresh_worktree(kanban_home, tmp_path):
+    """Default (no branch_name) behavior is unchanged: fresh wt/<task-id>."""
+    repo = _make_repo(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ordinary standalone task",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+    assert branch == f"wt/{tid}"
+    assert workspace == (repo / ".worktrees" / tid).resolve()
+    head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == f"wt/{tid}"
+
+
+def test_project_linked_branch_is_cut_fresh_not_treated_as_declared(
+    kanban_home, tmp_path
+):
+    """A project-linked task carries a deterministic branch_name, but it is
+    auto-derived and must be CUT FRESH — not treated as a declared existing
+    branch (which would fail loudly on a brand-new project branch)."""
+    repo = _make_repo(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="project task",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        # Simulate a project-linked task: deterministic branch that does NOT
+        # exist yet, with project_id set. The discriminator is project_id.
+        conn.execute(
+            "UPDATE tasks SET branch_name = ?, project_id = ? WHERE id = ?",
+            ("webapp/" + tid + "-project-task", "webapp", tid),
+        )
+        conn.commit()
+        task = kb.get_task(conn, tid)
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+    assert branch == f"webapp/{tid}-project-task"
+    head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == f"webapp/{tid}-project-task"
+
+
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
