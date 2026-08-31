@@ -697,7 +697,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_promote = sub.add_parser(
         "promote",
-        help="Manually move one or more todo/blocked tasks to ready (recovery path)",
+        help="Manually move one or more todo/blocked/triage tasks to ready (recovery path)",
     )
     p_promote.add_argument("task_id")
     p_promote.add_argument(
