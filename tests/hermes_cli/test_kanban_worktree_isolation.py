@@ -242,6 +242,95 @@ def test_project_linked_branch_is_cut_fresh_not_treated_as_declared(
     assert head == f"webapp/{tid}-project-task"
 
 
+def test_dir_pinned_at_linked_worktree_stays_on_its_branch_no_wt_branch(
+    kanban_home, tmp_path
+):
+    """A ``dir``-workspace card pinned at a LINKED-WORKTREE checkout already on a
+    topic branch is worked IN PLACE on that branch — not redirected to a fresh
+    ``wt/<task-id>`` cut from the checkout's HEAD.
+
+    This is the exact production incident: a card with a ``dir`` workspace pinned
+    at ``<site>/.worktrees/obtainability-series`` (branch
+    ``topic/obtainability-series``) was dispatched into a NEW worktree on a NEW
+    ``wt/<id>`` branch off the checkout's HEAD, orphaning the declared
+    deliverable branch. A ``dir`` card structurally cannot carry a
+    ``branch_name`` (``create_task`` forbids it), so the branch to honor is the
+    one the pinned checkout is already sitting on.
+    """
+    clone, _bare = _make_repo_with_remote(tmp_path)
+    _git(clone, "branch", "topic/obtainability-series")
+    wt = clone / ".worktrees" / "obtainability-series"
+    _git(clone, "worktree", "add", str(wt), "topic/obtainability-series")
+    (wt / "hero.md").write_text("obtainability draft\n", encoding="utf-8")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-m", "draft the series")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="hero for the obtainability post",
+            workspace_kind="dir",
+            workspace_path=str(wt),
+            detached=True,
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace = kb._resolve_dir_workspace(task)
+
+    # Worked in place on the pinned checkout, still on its declared branch.
+    assert workspace.resolve() == wt.resolve()
+    head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == "topic/obtainability-series"
+    # The declared branch's content is present (not a fresh cut from main).
+    assert (workspace / "hero.md").exists()
+    # No auto-derived wt/<task-id> branch was ever created anywhere in the repo.
+    branches = subprocess.run(
+        ["git", "-C", str(wt), "branch", "--list", f"wt/{tid}*"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert branches == ""
+
+
+def test_dir_repo_root_shared_clone_still_redirects_to_fresh_worktree(
+    kanban_home, tmp_path
+):
+    """A ``dir``-root card pinned at a true SHARED CLONE (repo root, not a linked
+    worktree) keeps the redirect-and-cut behavior: a fresh ``wt/<task-id>``
+    worktree off the clone's HEAD, so the shared clone's branch is never touched.
+    """
+    clone, _bare = _make_repo_with_remote(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ops sweep on the deploy clone",
+            workspace_kind="dir",
+            workspace_path=str(clone),
+            detached=True,
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace = kb._resolve_dir_workspace(task)
+    expected_branch = kb._derive_worktree_branch_name(
+        tid, "ops sweep on the deploy clone"
+    )
+    assert workspace == (clone / ".worktrees" / tid).resolve()
+    head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == expected_branch
+    # The shared clone itself is untouched, still on main.
+    clone_head = subprocess.run(
+        ["git", "-C", str(clone), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert clone_head == "main"
+
+
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True, detached=True)

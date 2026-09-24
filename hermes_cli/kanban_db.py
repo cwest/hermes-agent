@@ -11388,93 +11388,102 @@ def _resolve_dir_workspace(task: Task) -> Path:
 
     # A linked worktree's own root IS its git toplevel, so it reaches here too —
     # but a worktree correctly sitting on its own topic branch is the whole point
-    # of a worktree, not a deploy clone left off main. Skip the fast-forward
-    # guard for it; the guard exists only for a true shared clone.
-    if not _is_linked_worktree_checkout(repo_root):
-        # Guard: a shared deploy clone must be able to fast-forward — that is the
-        # post-merge ``git pull --ff-only`` this redirect exists to protect. The
-        # real invariant is "HEAD tracks an upstream", NOT "the branch is named
-        # main": a fork legitimately deploys from its own integration branch
-        # (e.g. ``cwest/integration`` tracking ``origin/cwest/integration``). We
-        # refuse only the states where ``--ff-only`` genuinely cannot run — a
-        # detached HEAD, or a local-only branch with no upstream.
-        #
-        # The common polluter here is a PREVIOUS lane worker (most often a
-        # REVIEW leg) that checked this shared clone out to a PR head SHA to read
-        # a diff, blocked, and exited WITHOUT restoring the deploy branch. The
-        # dispatcher then auto-routes the next card here and its spawn dies on
-        # this guard. See
-        # ``diagnosing-process-liveness-before-intervening/references/
-        # deploy-clone-detached-by-a-review-leg.md``. That leftover detach is
-        # provably recoverable: when the tree is CLEAN and the detached HEAD is
-        # already an ancestor of the deploy branch's upstream, reattaching and
-        # fast-forwarding strands nothing. Do exactly the human's two-command
-        # recovery (``git checkout <deploy-branch> && git pull --ff-only``) in
-        # place, then continue — rather than converting a mechanical fixup into a
-        # dead card only a human can clear. Anything short of that clean,
-        # contained, detached state still refuses (below).
-        if not _git_has_upstream(repo_root):
-            current_branch = _git_current_branch(repo_root)
-            dirty = _git_is_dirty(repo_root)
-            deploy = None if dirty else _git_deploy_branch_with_upstream(repo_root)
+    # of a worktree, not a deploy clone left off main. It is ALREADY an isolated
+    # per-branch checkout, so return it in place: redirecting it to a fresh
+    # ``wt/<task-id>`` cut from its HEAD is exactly the incident this fix closes —
+    # a ``dir`` card pinned at ``<site>/.worktrees/obtainability-series`` (branch
+    # ``topic/obtainability-series``) was dispatched onto a NEW ``wt/<id>`` branch
+    # off that checkout's HEAD, orphaning the declared deliverable branch. Working
+    # in place lands the worker on the checkout's own branch with its content, and
+    # cuts no ``wt/`` branch. The fast-forward guard below is meaningless for a
+    # worktree (it is not a shared deploy clone) and is skipped with it.
+    if _is_linked_worktree_checkout(repo_root):
+        return repo_root
 
-            # Conservative self-heal: ONLY a clean tree, an actual detached HEAD
-            # (a named local-only branch is a DELIBERATE state — never
-            # auto-reattached), a resolvable deploy branch that tracks an
-            # upstream, and a HEAD already contained in that upstream. All four
-            # must hold; otherwise fall through and refuse.
-            if (
-                not dirty
-                and current_branch is None
-                and deploy is not None
-                and _git_head_is_ancestor_of(repo_root, deploy[1])
-            ):
-                deploy_branch, deploy_upstream = deploy
-                _git_reattach_ff_only(repo_root, deploy_branch, deploy_upstream)
-            else:
-                # Name the precondition that failed and the likely cause so the
-                # next reader can act without reverse-engineering it from the
-                # reflog.
-                if dirty:
-                    why = (
-                        "its working tree is DIRTY (uncommitted or untracked "
-                        "changes), which must never be auto-recovered — recover "
-                        "the tree by hand first"
-                    )
-                elif current_branch is not None:
-                    why = (
-                        f"it is on the named local-only branch "
-                        f"{current_branch!r} with no upstream — a deliberate "
-                        f"state that is never auto-reattached; put it back on a "
-                        f"branch that tracks its upstream before dispatching"
-                    )
-                elif deploy is None:
-                    why = (
-                        "its deploy branch / upstream could not be resolved from "
-                        "`refs/remotes/origin/HEAD` (no tracked default branch), "
-                        "so a safe reattach target is unknown"
-                    )
-                else:
-                    why = (
-                        f"the detached HEAD is NOT contained in the deploy "
-                        f"branch upstream {deploy[1]!r}, so reattaching would "
-                        f"strand that commit — refusing rather than discard it"
-                    )
-                raise RuntimeError(
-                    f"deploy clone {repo_root} cannot be safely fast-forwarded: "
-                    f"{why}. A card worker must never build on a shared clone "
-                    f"whose deploy branch cannot `git pull --ff-only`. The usual "
-                    f"source is a PREVIOUS lane worker (often a review leg) that "
-                    f"checked this shared clone out to a PR head and exited "
-                    f"without restoring the branch; run `git reflog` in the clone "
-                    f"to confirm, then reattach it to its deploy branch."
+    # Guard: a shared deploy clone must be able to fast-forward — that is the
+    # post-merge ``git pull --ff-only`` this redirect exists to protect. The
+    # real invariant is "HEAD tracks an upstream", NOT "the branch is named
+    # main": a fork legitimately deploys from its own integration branch
+    # (e.g. ``cwest/integration`` tracking ``origin/cwest/integration``). We
+    # refuse only the states where ``--ff-only`` genuinely cannot run — a
+    # detached HEAD, or a local-only branch with no upstream.
+    #
+    # The common polluter here is a PREVIOUS lane worker (most often a
+    # REVIEW leg) that checked this shared clone out to a PR head SHA to read
+    # a diff, blocked, and exited WITHOUT restoring the deploy branch. The
+    # dispatcher then auto-routes the next card here and its spawn dies on
+    # this guard. See
+    # ``diagnosing-process-liveness-before-intervening/references/
+    # deploy-clone-detached-by-a-review-leg.md``. That leftover detach is
+    # provably recoverable: when the tree is CLEAN and the detached HEAD is
+    # already an ancestor of the deploy branch's upstream, reattaching and
+    # fast-forwarding strands nothing. Do exactly the human's two-command
+    # recovery (``git checkout <deploy-branch> && git pull --ff-only``) in
+    # place, then continue — rather than converting a mechanical fixup into a
+    # dead card only a human can clear. Anything short of that clean,
+    # contained, detached state still refuses (below).
+    if not _git_has_upstream(repo_root):
+        current_branch = _git_current_branch(repo_root)
+        dirty = _git_is_dirty(repo_root)
+        deploy = None if dirty else _git_deploy_branch_with_upstream(repo_root)
+
+        # Conservative self-heal: ONLY a clean tree, an actual detached HEAD
+        # (a named local-only branch is a DELIBERATE state — never
+        # auto-reattached), a resolvable deploy branch that tracks an
+        # upstream, and a HEAD already contained in that upstream. All four
+        # must hold; otherwise fall through and refuse.
+        if (
+            not dirty
+            and current_branch is None
+            and deploy is not None
+            and _git_head_is_ancestor_of(repo_root, deploy[1])
+        ):
+            deploy_branch, deploy_upstream = deploy
+            _git_reattach_ff_only(repo_root, deploy_branch, deploy_upstream)
+        else:
+            # Name the precondition that failed and the likely cause so the
+            # next reader can act without reverse-engineering it from the
+            # reflog.
+            if dirty:
+                why = (
+                    "its working tree is DIRTY (uncommitted or untracked "
+                    "changes), which must never be auto-recovered — recover "
+                    "the tree by hand first"
                 )
+            elif current_branch is not None:
+                why = (
+                    f"it is on the named local-only branch "
+                    f"{current_branch!r} with no upstream — a deliberate "
+                    f"state that is never auto-reattached; put it back on a "
+                    f"branch that tracks its upstream before dispatching"
+                )
+            elif deploy is None:
+                why = (
+                    "its deploy branch / upstream could not be resolved from "
+                    "`refs/remotes/origin/HEAD` (no tracked default branch), "
+                    "so a safe reattach target is unknown"
+                )
+            else:
+                why = (
+                    f"the detached HEAD is NOT contained in the deploy "
+                    f"branch upstream {deploy[1]!r}, so reattaching would "
+                    f"strand that commit — refusing rather than discard it"
+                )
+            raise RuntimeError(
+                f"deploy clone {repo_root} cannot be safely fast-forwarded: "
+                f"{why}. A card worker must never build on a shared clone "
+                f"whose deploy branch cannot `git pull --ff-only`. The usual "
+                f"source is a PREVIOUS lane worker (often a review leg) that "
+                f"checked this shared clone out to a PR head and exited "
+                f"without restoring the branch; run `git reflog` in the clone "
+                f"to confirm, then reattach it to its deploy branch."
+            )
 
     branch_name = (task.branch_name or "").strip() or _derive_worktree_branch_name(
         task.id, getattr(task, "title", None)
     )
     target = repo_root / ".worktrees" / task.id
-    _ensure_git_worktree(repo_root, target, branch_name)
+    _ensure_git_worktree(repo_root, target, branch_name, task_id=task.id)
     return target.resolve(strict=False)
 
 
