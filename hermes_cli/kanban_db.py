@@ -10932,6 +10932,50 @@ def _git_rev_parse(path: Path, rev: str) -> Optional[str]:
     return out or None
 
 
+def _git_integration_base(repo_root: Path) -> Optional[str]:
+    """Resolve the repo's integration base commit, or ``None``.
+
+    A fork-core deploy clone (e.g. ``cwest/hermes-agent``) keeps its ROOT
+    pinned to ``main`` — the deploy-clone guard enforces that so the post-merge
+    ``git pull --ff-only`` can fast-forward — but the fork's work targets its
+    own integration branch (``cwest/integration``), which diverges from
+    ``main``. Cutting a fresh per-task worktree off the root's HEAD therefore
+    lands the worker on ``main``: code that lacks the fork patch stack and is
+    missing what only exists on integration.
+
+    The integration base is declared as **repo metadata**, not a hardcoded
+    branch name: a ``kanban.integrationBase`` git config value naming the ref to
+    cut from (e.g. ``origin/cwest/integration``). This keeps the mechanism
+    per-repo and derivable — a repo with no integration base (e.g.
+    ``cwest/okfctl``) simply has no such config and cuts from its default
+    branch, unchanged.
+
+    Returns the resolved commit SHA of the configured ref when both (a) the
+    config value is set and non-empty and (b) the ref resolves in this repo;
+    otherwise ``None`` so callers fall back to the root's HEAD.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "config", "--get",
+             "kanban.integrationBase"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    ref = (result.stdout or "").strip()
+    if not ref:
+        return None
+    # The configured ref must resolve to a real commit in this repo. A stale or
+    # not-yet-fetched ref returns None → the caller falls back to HEAD rather
+    # than fail dispatch on a misconfiguration.
+    return _git_rev_parse(repo_root, ref)
+
+
 def _git_has_commits_between(path: Path, base: str, tip: str) -> Optional[bool]:
     """True iff ``tip`` carries commits not reachable from ``base``.
 
@@ -10977,17 +11021,19 @@ def _git_worktree_is_clean(path: Path) -> bool:
 def _ensure_worktree_fresh(
     worktree: Path, repo_root: Path, *, task_id: str
 ) -> None:
-    """Guarantee a reused worktree is not behind the shared checkout's HEAD.
+    """Guarantee a reused worktree is not behind the repo's integration base.
 
-    A per-task worktree is cut off ``repo_root``'s HEAD (the shared checkout,
-    which sits on the integration branch). When that branch advances but the
-    worktree stays at the old tip with ZERO unique commits, a returning
-    dispatch used to reuse the worktree as-is — from inside the stale tree the
-    shared branch looks AHEAD, so a worker concludes the work is already staged
+    A per-task worktree is cut off the repo's integration base — the fork's
+    integration branch when ``kanban.integrationBase`` is configured (fork-core:
+    the deploy ROOT is pinned to ``main`` but work targets ``cwest/integration``,
+    which diverges), otherwise the shared checkout's HEAD. When that base
+    advances but the worktree stays at the old tip with ZERO unique commits, a
+    returning dispatch used to reuse the worktree as-is — from inside the stale
+    tree the base looks AHEAD, so a worker concludes the work is already staged
     and reports complete with no commits (the PR head never moves).
 
     This gate makes that impossible: before a worker is handed a reused
-    worktree, we compare its HEAD to the shared checkout's HEAD and:
+    worktree, we compare its HEAD to the integration base and:
 
     - do nothing when the worktree is already at (or ahead of / carrying real
       work relative to) the base tip — fast-forwarding a branch with unique
@@ -10998,8 +11044,17 @@ def _ensure_worktree_fresh(
       fast-forwarded (uncommitted changes would be clobbered), so the
       dispatcher records a spawn failure and falls back rather than silently
       spawning into a stale tree.
+
+    The base is the SAME one the fresh-cut path uses (see
+    ``_git_integration_base``), so a worktree is freshened to exactly the tip it
+    would have been cut from — never to the root's ``main`` when the fork's base
+    is the integration branch.
     """
-    base_tip = _git_rev_parse(repo_root, "HEAD")
+    # Freshen against the integration base (the same ref the fresh-cut path
+    # uses), falling back to the root's HEAD when no integration base is
+    # declared — never to root HEAD when the fork's base is the integration
+    # branch, which would strand the worktree on main.
+    base_tip = _git_integration_base(repo_root) or _git_rev_parse(repo_root, "HEAD")
     wt_head = _git_rev_parse(worktree, "HEAD")
     if base_tip is None or wt_head is None:
         # Cannot determine freshness (bare repo mid-op, git error). Leave the
@@ -11166,9 +11221,17 @@ def _ensure_git_worktree(
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
+        # Cut the fresh branch from the repo's integration base when one is
+        # declared (fork-core: ``kanban.integrationBase`` → the fork's
+        # integration branch), NOT the root's HEAD. The root is pinned to its
+        # default branch (``main`` on the deploy clone), which diverges from the
+        # integration branch the fork's work targets — cutting off HEAD lands the
+        # worker on code lacking the fork patch stack. A repo with no integration
+        # base falls back to HEAD (unchanged default-branch behavior).
+        start_point = _git_integration_base(repo_root) or "HEAD"
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), start_point,
         ]
     result = subprocess.run(
         cmd,

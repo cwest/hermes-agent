@@ -624,3 +624,150 @@ def test_resolve_worktree_fresh_worktree_needs_no_fast_forward(
     assert workspace == own.resolve()
     assert branch == branch_name
     assert _head(own) == fresh_head
+
+
+# ---------------------------------------------------------------------------
+# Integration-base cut/freshen: a fork-core worktree must be cut from the
+# repo's integration base, not the shared checkout's HEAD.
+#
+# On ~/src/hermes-agent the deploy root is pinned to ``main`` (the deploy-clone
+# guard enforces that), but fork-core work targets ``cwest/integration``, which
+# diverges from ``main``. A fresh ``wt/<id>`` worktree cut off root HEAD lands
+# the worker on ``main`` — code that lacks the fork patch stack and is missing
+# what only exists on integration. The base is derived from repo metadata (a
+# ``kanban.integrationBase`` git config value), never a hardcoded branch name,
+# so a repo with no integration base (e.g. cwest/okfctl) still cuts from its
+# default branch. The freshness gate must compare against the SAME base.
+# ---------------------------------------------------------------------------
+
+
+def _make_fork_repo(tmp_path: Path) -> tuple[Path, str, str]:
+    """A repo mirroring the fork topology: root on ``main``, a diverged
+    ``integration`` branch, and ``kanban.integrationBase`` pointing at it.
+
+    Returns ``(repo, main_head, integration_head)``.
+    """
+    repo = _make_repo(tmp_path)  # root on ``main`` with one commit
+    main_head = _head(repo)
+
+    # Cut an ``integration`` branch and advance it past ``main`` (the fork
+    # patch stack lives here). Then return the root to ``main`` so the deploy
+    # clone stays pinned to its default branch, exactly like the live root.
+    _git(repo, "checkout", "-b", "integration")
+    (repo / "fork_patch.txt").write_text("only on integration\n", encoding="utf-8")
+    _git(repo, "add", "fork_patch.txt")
+    _git(repo, "commit", "-m", "fork patch stack")
+    integration_head = _head(repo)
+    _git(repo, "checkout", "main")
+
+    # Repo metadata declares the integration base — derived, not hardcoded.
+    _git(repo, "config", "kanban.integrationBase", "integration")
+    return repo, main_head, integration_head
+
+
+def test_fresh_worktree_cut_from_integration_base_not_root_main(
+    kanban_home, tmp_path
+):
+    """A fresh worktree card on a fork repo starts at the integration base
+    while the root stays on ``main`` (the deploy-clone invariant)."""
+    repo, main_head, integration_head = _make_fork_repo(tmp_path)
+    assert main_head != integration_head  # precondition: the branches diverge
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="fork-core fix",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            detached=True,
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+    expected_branch = kb._derive_worktree_branch_name(tid, "fork-core fix")
+    assert branch == expected_branch
+
+    # The worker starts at the integration tip, not root HEAD (main).
+    assert _head(workspace) == integration_head
+    # Code that only exists on integration is present.
+    assert (workspace / "fork_patch.txt").exists()
+    # The root is untouched — still pinned to main.
+    assert _head(repo) == main_head
+    root_branch = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert root_branch == "main"
+
+
+def test_freshness_gate_fast_forwards_to_integration_tip_not_main(
+    kanban_home, tmp_path
+):
+    """A clean, zero-commit reused worktree is fast-forwarded to the
+    integration tip, not to the root's main HEAD."""
+    repo, main_head, _integration_head = _make_fork_repo(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="stale fork worktree",
+            workspace_kind="worktree",
+            detached=True,
+        )
+        branch_name = kb._derive_worktree_branch_name(tid, "stale fork worktree")
+        # Cut the worktree off ``main`` (the pre-fix behavior / a stale cut),
+        # so the freshness gate has something to fast-forward.
+        own = repo / ".worktrees" / tid
+        _git(repo, "worktree", "add", str(own), "-b", branch_name, main_head)
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(own), tid),
+        )
+        conn.commit()
+        task = kb.get_task(conn, tid)
+
+    # Advance the integration branch further after the worktree was cut, so the
+    # integration tip is distinct from both the worktree HEAD and main.
+    _git(repo, "checkout", "integration")
+    (repo / "later.txt").write_text("later fork work\n", encoding="utf-8")
+    _git(repo, "add", "later.txt")
+    _git(repo, "commit", "-m", "more fork work")
+    integration_tip = _head(repo)
+    _git(repo, "checkout", "main")
+
+    assert _head(own) == main_head  # precondition: worktree sits on the main cut
+    assert integration_tip != main_head
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+
+    assert workspace == own.resolve()
+    assert branch == branch_name
+    # Fast-forwarded to the integration tip, NOT the root's main HEAD.
+    assert _head(own) == integration_tip
+    assert (workspace / "fork_patch.txt").exists()
+    assert (workspace / "later.txt").exists()
+
+
+def test_repo_without_integration_base_cuts_from_default_branch(
+    kanban_home, tmp_path
+):
+    """Control: a repo with no integration base still cuts a fresh worktree
+    from its default branch (root HEAD) — behavior unchanged."""
+    repo = _make_repo(tmp_path)  # no kanban.integrationBase configured
+    root_head = _head(repo)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="plain repo task",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            detached=True,
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+    expected_branch = kb._derive_worktree_branch_name(tid, "plain repo task")
+    assert branch == expected_branch
+    # Cut from the default branch (root HEAD), exactly as before.
+    assert _head(workspace) == root_head
