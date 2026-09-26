@@ -274,3 +274,159 @@ def test_reconcile_refuses_running_card(
 
         assert ok is False, "a running card is not an acceptance park"
         assert kb.get_task(conn, tid).status == "running"
+
+
+# ---------------------------------------------------------------------------
+# RED 5 — a card that tracks a SET of PRs reconciles on the whole set
+# ---------------------------------------------------------------------------
+#
+# The single-PR reconcile above resolved only the card's NEWEST linked PR. A card
+# that lands a BATCH of PRs (e.g. "land the nine Dependabot PRs": five merged, one
+# closed-as-duplicate, three absorbed) has no path to done, because its newest
+# linked PR may be the closed-not-merged one — the reconcile refuses even though
+# every PR is terminal and several merged. The reconcile must evaluate the card's
+# FULL PR set: done iff EVERY PR is terminal, at least one merged (with a
+# resolvable merge oid), and NONE open. Any open PR, or any transient/unknown
+# answer, fails CLOSED. The single-PR cases above remain a strict subset (control).
+
+_PR_MERGED_A = "https://github.com/cwest/okfctl/pull/158"
+_PR_MERGED_B = "https://github.com/cwest/okfctl/pull/156"
+_PR_CLOSED = "https://github.com/cwest/okfctl/pull/162"
+_PR_OPEN = "https://github.com/cwest/okfctl/pull/170"
+_OID_A = "aaaa1111bbbb2222cccc3333dddd4444eeee5555"
+_OID_B = "bbbb2222cccc3333dddd4444eeee5555ffff6666"
+
+
+def _stage_multi_pr_acceptance_card(conn, pr_urls: list[str]) -> str:
+    """Leave a card in the acceptance lane linking a SET of PR URLs — the batch
+    shape (one card tracking many PRs). Each URL is linked in its own comment,
+    exactly as a batch card accretes PR references over its life."""
+    tid = kb.create_task(conn, title="land the batch", assignee="casey", detached=True)
+    kb.claim_task(conn, tid)
+    for url in pr_urls:
+        kb.add_comment(conn, tid, author="easley", body=f"PR: {url} handled.")
+    reason = (
+        f"awaiting-casey-signoff: reviewed PASS — batch {', '.join(pr_urls)}; "
+        "threads resolved. Ready to merge."
+    )
+    assert kb.block_task(
+        conn, tid, reason=reason,
+        expected_run_id=kb.get_task(conn, tid).current_run_id,
+    )
+    assert kb.get_task(conn, tid).status == "blocked"
+    return tid
+
+
+def _per_url_resolver(states: dict[str, tuple[str, str | None]]):
+    """Build a ``_resolve_pr_merge_commit`` stub that answers PER-URL from a map,
+    so a card's mixed PR set resolves each PR to its own ground-truth state."""
+    def _resolve(url):
+        assert url in states, f"unexpected PR URL resolved: {url}"
+        return states[url]
+    return _resolve
+
+
+def test_reconcile_mixed_merged_and_closed_set_completes_to_done(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch card whose PR set is a mix of MERGED and CLOSED-not-merged (all
+    terminal, at least one merged, none open) reconciles to ``done`` — the
+    t_83079590 shape. The newest linked PR is the CLOSED one, which the old
+    single-PR reconcile would have refused on."""
+    monkeypatch.setattr(
+        kb, "_resolve_pr_merge_commit",
+        _per_url_resolver({
+            _PR_MERGED_A: ("merged", _OID_A),
+            _PR_MERGED_B: ("merged", _OID_B),
+            _PR_CLOSED: ("closed", None),
+        }),
+    )
+    with kb.connect() as conn:
+        # Link order: merged, merged, then the closed one LAST so it is newest.
+        tid = _stage_multi_pr_acceptance_card(
+            conn, [_PR_MERGED_A, _PR_MERGED_B, _PR_CLOSED]
+        )
+
+        ok = kb.reconcile_merged_acceptance(conn, tid)
+
+        assert ok is True, "a mixed merged+closed terminal set must reconcile"
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        assert task.completed_at is not None
+
+        events = kb.list_events(conn, tid)
+        recon = [e for e in events if e.kind == "completion_reconciled_merge"]
+        assert recon, "a completion_reconciled_merge event must be recorded"
+        payload = recon[-1].payload or {}
+        # The audit trail records the FULL evaluated PR set + the proven merges.
+        pr_urls = payload.get("pr_urls") or []
+        assert set(pr_urls) == {_PR_MERGED_A, _PR_MERGED_B, _PR_CLOSED}, \
+            "the reconcile must record the full evaluated PR set"
+        merge_commits = payload.get("merge_commits") or []
+        assert set(merge_commits) == {_OID_A, _OID_B}, \
+            "the reconcile must record every proven merge commit"
+
+
+def test_reconcile_refuses_set_with_any_open_pr(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch card with ANY still-OPEN PR is REFUSED even if others merged —
+    the card is not fully terminal, so it is not done."""
+    monkeypatch.setattr(
+        kb, "_resolve_pr_merge_commit",
+        _per_url_resolver({
+            _PR_MERGED_A: ("merged", _OID_A),
+            _PR_OPEN: ("open", None),
+        }),
+    )
+    with kb.connect() as conn:
+        tid = _stage_multi_pr_acceptance_card(conn, [_PR_MERGED_A, _PR_OPEN])
+
+        ok = kb.reconcile_merged_acceptance(conn, tid)
+
+        assert ok is False, "an open PR in the set must block reconcile"
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", "card stays in the acceptance lane"
+        assert task.completed_at is None
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
+
+
+def test_reconcile_refuses_all_closed_none_merged_set(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch card whose PRs are ALL terminal but NONE merged (all
+    closed-not-merged) is REFUSED — done requires at least one proven merge."""
+    monkeypatch.setattr(
+        kb, "_resolve_pr_merge_commit",
+        _per_url_resolver({
+            _PR_CLOSED: ("closed", None),
+            _PR_OPEN: ("closed", None),
+        }),
+    )
+    with kb.connect() as conn:
+        tid = _stage_multi_pr_acceptance_card(conn, [_PR_CLOSED, _PR_OPEN])
+
+        ok = kb.reconcile_merged_acceptance(conn, tid)
+
+        assert ok is False, "all-closed-none-merged must not reconcile to done"
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
+
+
+def test_reconcile_refuses_set_with_any_unknown_pr(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient/unresolvable answer on ANY PR in the set fails CLOSED — the
+    reconcile refuses rather than complete on an unverifiable batch."""
+    monkeypatch.setattr(
+        kb, "_resolve_pr_merge_commit",
+        _per_url_resolver({
+            _PR_MERGED_A: ("merged", _OID_A),
+            _PR_CLOSED: ("unknown", None),
+        }),
+    )
+    with kb.connect() as conn:
+        tid = _stage_multi_pr_acceptance_card(conn, [_PR_MERGED_A, _PR_CLOSED])
+
+        assert kb.reconcile_merged_acceptance(conn, tid) is False
+        assert kb.get_task(conn, tid).status == "blocked"
