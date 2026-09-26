@@ -280,3 +280,217 @@ def test_research_self_owned_review_completion_still_done(kanban_home: Path) -> 
         assert task.status == "done", (
             "a research self-owned review completion still terminates at done"
         )
+
+
+# ---------------------------------------------------------------------------
+# RED 4 — defect (b): a self-owned review completion on a card whose linked PR
+# is ALREADY MERGED must land ``done``, not re-park for acceptance.
+#
+# The live shape (t_d23132c7 / cwest/okfctl#174, 2026-09-26): a PR was PASS'd
+# and parked for acceptance, then a merge-only branch catch-up fired a
+# ``synchronize`` that pulled the card back into review and re-spawned the
+# reviewer. By the time that reviewer's run finished, Casey had ALREADY merged
+# the PR — yet the self-review completion path re-parked the card
+# ``blocked`` + casey ("PR #174 was MERGED" per its own verdict), stranding a
+# merged card in the acceptance lane until ``reconcile-acceptance`` recovered
+# it. ``done`` means "Casey merged"; a proven merge at completion time IS that,
+# so the completion must terminate at ``done`` with no reconcile round-trip.
+#
+# The merge is proven from GitHub GROUND TRUTH (the same
+# ``_resolve_pr_merge_commit`` gate ``reconcile_merged_acceptance`` trusts),
+# never caller assertion — so the fix cannot re-open the acceptance guard's
+# hole. Only ``state == merged`` with a non-null oid routes to ``done``;
+# everything else parks exactly as before (the controls below).
+# ---------------------------------------------------------------------------
+
+
+_MERGED_PR_URL = "https://github.com/cwest/okfctl/pull/174"
+_MERGED_OID = "895f0ec1234567890abcdef1234567890abcdef0"
+
+
+def _link_pr(conn, tid: str, pr_url: str) -> None:
+    """Link a PR URL on the card the way the implementer's ready-for-review
+    handoff comment does (``_card_newest_pr_url`` reads it from comments)."""
+    kb.add_comment(
+        conn, tid, author="easley",
+        body=f"Draft PR opened: {pr_url} @ head 895f0ec. 240 tests green.",
+    )
+
+
+def test_self_owned_review_completion_on_merged_pr_lands_done(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The t_d23132c7 shape: a card claimed FROM review whose linked PR is
+    verifiably MERGED at completion time terminates at ``done`` — NOT the
+    acceptance park. Proven merge == acceptance; there is nothing left to sign
+    off, and re-parking only strands a merged card (the observed regression)."""
+    monkeypatch.setattr(
+        kb, "_resolve_pr_merge_commit", lambda url: ("merged", _MERGED_OID)
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="fix the kanban redirect", assignee="easley", detached=True
+        )
+        _stamp_owner_map(
+            conn, tid,
+            "ready: easley, review: lamport, blocked-acceptance: casey",
+            team="engineering",
+        )
+        _link_pr(conn, tid, _MERGED_PR_URL)
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="implemented + tests")  # -> review
+        _move_to_review_and_claim(conn, tid, "lamport")
+
+        ok = kb.complete_task(conn, tid, summary="PASS; PR was MERGED")
+
+        assert ok is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "done", (
+            "a self-owned review completion on an ALREADY-MERGED PR must land "
+            "done, not re-park for acceptance"
+        )
+        assert task.completed_at is not None, "a merged completion is terminal"
+        assert task.status != "blocked", "a merged card must not re-park"
+
+
+def test_self_owned_review_completion_on_merged_pr_records_merge_audit(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The merge-at-completion path records a distinguishable audit event
+    carrying the proven merge commit + PR url, so a done-by-merge-at-completion
+    is as traceable as a done-by-webhook or a done-by-reconcile."""
+    monkeypatch.setattr(
+        kb, "_resolve_pr_merge_commit", lambda url: ("merged", _MERGED_OID)
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="fix the kanban redirect", assignee="easley", detached=True
+        )
+        _stamp_owner_map(
+            conn, tid,
+            "ready: easley, review: lamport, blocked-acceptance: casey",
+            team="engineering",
+        )
+        _link_pr(conn, tid, _MERGED_PR_URL)
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="implemented + tests")
+        _move_to_review_and_claim(conn, tid, "lamport")
+
+        kb.complete_task(conn, tid, summary="PASS; PR was MERGED")
+
+        events = kb.list_events(conn, tid)
+        merge_events = [
+            e for e in events if e.kind == "completion_merged_at_review"
+        ]
+        assert merge_events, (
+            "a merge-proven review completion must emit a distinguishable "
+            "completion_merged_at_review audit event"
+        )
+        payload = merge_events[-1].payload or {}
+        assert payload.get("merge_commit") == _MERGED_OID
+        assert payload.get("pr_url") == _MERGED_PR_URL
+
+
+# ---------------------------------------------------------------------------
+# CONTROL — the acceptance guard is NOT weakened: a self-owned review completion
+# whose PR is NOT proven merged still parks ``blocked`` + casey. Only a proven
+# merge routes to done; open / unresolvable / no-PR all fail closed to the park.
+# ---------------------------------------------------------------------------
+
+
+def test_self_owned_review_completion_open_pr_still_parks(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OPEN linked PR is not a merge — the completion still parks for Casey's
+    acceptance exactly as before. The merge check must fail CLOSED."""
+    monkeypatch.setattr(
+        kb, "_resolve_pr_merge_commit", lambda url: ("open", None)
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="fix the kanban redirect", assignee="easley", detached=True
+        )
+        _stamp_owner_map(
+            conn, tid,
+            "ready: easley, review: lamport, blocked-acceptance: casey",
+            team="engineering",
+        )
+        _link_pr(conn, tid, _MERGED_PR_URL)
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="implemented + tests")
+        _move_to_review_and_claim(conn, tid, "lamport")
+
+        ok = kb.complete_task(conn, tid, summary="PASS; awaiting sign-off")
+
+        assert ok is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            "an OPEN PR must still park for acceptance — the merge check fails "
+            "closed"
+        )
+        assert task.assignee == "casey"
+        assert task.completed_at is None
+
+
+def test_self_owned_review_completion_unresolvable_pr_still_parks(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient/unresolvable ``gh`` answer (``unknown``) is not a proven
+    merge — the completion parks for acceptance (fail closed)."""
+    monkeypatch.setattr(
+        kb, "_resolve_pr_merge_commit", lambda url: ("unknown", None)
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="fix the kanban redirect", assignee="easley", detached=True
+        )
+        _stamp_owner_map(
+            conn, tid,
+            "ready: easley, review: lamport, blocked-acceptance: casey",
+            team="engineering",
+        )
+        _link_pr(conn, tid, _MERGED_PR_URL)
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="implemented + tests")
+        _move_to_review_and_claim(conn, tid, "lamport")
+
+        ok = kb.complete_task(conn, tid, summary="PASS; awaiting sign-off")
+
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_self_owned_review_completion_no_pr_still_parks(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card with NO linked PR has nothing to prove a merge against — the merge
+    check must not even consult ``gh`` and the completion parks for acceptance
+    (the ordinary edit-in-place self-owned review wedge is untouched)."""
+    calls: list[str] = []
+
+    def _spy(url: str):
+        calls.append(url)
+        return ("unknown", None)
+
+    monkeypatch.setattr(kb, "_resolve_pr_merge_commit", _spy)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="edit-in-place fix", assignee="easley", detached=True
+        )
+        _stamp_owner_map(
+            conn, tid,
+            "ready: easley, review: lamport, blocked-acceptance: casey",
+            team="engineering",
+        )
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="implemented")
+        _move_to_review_and_claim(conn, tid, "lamport")
+
+        ok = kb.complete_task(conn, tid, summary="PASS; awaiting sign-off")
+
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert calls == [], (
+            "no linked PR -> the merge check must not consult gh (nothing to "
+            "prove a merge against)"
+        )
