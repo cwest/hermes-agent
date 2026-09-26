@@ -11524,6 +11524,74 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+def _in_place_workspace_key(task: Task) -> Optional[str]:
+    """Return the SHARED directory a ``dir`` card would run in unisolated, or None.
+
+    This is the serialization key the dispatcher uses to guarantee that two
+    edit-in-place cards never run on the same workspace root at once (the
+    2026-09-26 incident: two ``dir`` cards on ``~/.hermes`` clobbered each
+    other's edits to the same file). It mirrors :func:`_resolve_dir_workspace`'s
+    routing decision WITHOUT any side effects — it never mkdirs, never
+    materializes a worktree, never mutates the row — so it is safe to call for
+    every ready card on every tick, before the card is claimed.
+
+    Returns the resolved absolute path string when the card would run IN PLACE
+    in a shared directory (so two such cards on the same path collide):
+      * a plain ``dir`` path that is not a git repo root (a shared ops dir, or a
+        deliberately-scoped subdirectory of a repo),
+      * a repo root that is a DECLARED edit-in-place root (``~/.hermes`` — the
+        live deploy tree, returned unchanged, never redirected),
+      * an existing linked-worktree checkout (returned in place).
+
+    Returns ``None`` when the card is ISOLATED per-task and therefore can never
+    collide with a sibling:
+      * ``scratch`` (a fresh ``workspaces/<id>`` dir),
+      * ``worktree`` (a per-task ``<repo>/.worktrees/<id>`` checkout),
+      * a ``dir`` card whose path is a plain repo root that gets redirected to a
+        per-task ``<repo>/.worktrees/<id>`` worktree,
+      * a ``dir`` card with a missing / non-absolute path (an error the resolver
+        will raise on later — not this guard's concern).
+
+    The predicate must never raise: any unexpected condition falls through to
+    ``None`` (do not serialize) rather than wedge the dispatcher. Serialization
+    is a safety net; failing open here at worst allows the pre-existing behavior.
+    """
+    try:
+        kind = task.workspace_kind or "scratch"
+        # Only ``dir`` cards run unisolated in place. scratch/worktree are
+        # per-task by construction.
+        if kind != "dir":
+            return None
+        if not task.workspace_path:
+            return None
+        p = Path(task.workspace_path).expanduser()
+        if not p.is_absolute():
+            return None
+        resolved = p.resolve(strict=False)
+
+        repo_root = _git_toplevel(p) if p.exists() else None
+        # Not a repo, or a path INSIDE a repo (scoped subdir) — runs in place at
+        # the resolved path. Two cards on the same such path collide.
+        if repo_root is None or resolved != repo_root:
+            return str(resolved)
+
+        # The path IS a repo root. It runs in place (no redirect) only when it is
+        # a declared edit-in-place root or an existing linked-worktree checkout;
+        # every other repo root is redirected to a per-task worktree and is thus
+        # isolated. Mirror _resolve_dir_workspace's two carve-outs exactly.
+        from hermes_cli.edit_in_place_repos import is_edit_in_place_root
+
+        if is_edit_in_place_root(repo_root):
+            return str(repo_root)
+        if _is_linked_worktree_checkout(repo_root):
+            return str(repo_root)
+        # A plain shared deploy clone at its root → redirected to
+        # <repo>/.worktrees/<id> → isolated per task → no collision.
+        return None
+    except Exception:
+        return None
+
+
 def _resolve_dir_workspace(task: Task) -> Path:
     """Resolve a ``dir`` workspace, redirecting repo roots to a linked worktree.
 
@@ -12191,6 +12259,18 @@ class DispatchResult:
     emits ``gave_up``. The card is blocked once with a ``filing-error`` reason
     naming the correct filing. Bucketed separately so dashboards/telemetry can
     tell a mis-filed card apart from one that exhausted real retries."""
+    skipped_workspace_busy: list[tuple[str, str]] = field(default_factory=list)
+    """Ready ``dir`` cards deferred this tick because another card is already
+    running IN PLACE on the SAME workspace root. Each entry is
+    ``(task_id, workspace_root)``. Edit-in-place cards (the ``~/.hermes`` deploy
+    tree, a plain shared ops directory, an existing worktree checkout) all run
+    unisolated in that one directory, so two of them at once race on the same
+    files — one worker's full-file write silently erases the other's edits
+    (incident 2026-09-26). The dispatcher serializes them: at most one running
+    per in-place root, the rest deferred to a later tick. NOT an
+    operator-actionable failure — the deferred card is claimed on the next tick
+    after the occupant leaves ``running``. Scratch (per-task dir) and worktree
+    (per-task ``.worktrees/<id>``) cards are isolated and never bucketed here."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -14443,6 +14523,26 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    # Edit-in-place serialization (incident 2026-09-26): a ``dir`` card that
+    # runs UNISOLATED in a shared directory (the ``~/.hermes`` deploy tree, a
+    # plain shared ops dir, an existing worktree checkout) races on the same
+    # files against any sibling running in that same directory — one worker's
+    # full-file write silently erases the other's edits. Build the set of
+    # in-place roots already occupied by a RUNNING card so the ready loop can
+    # refuse to claim a second card onto an occupied root. Populated up front
+    # from the DB and extended as this tick spawns, so two same-root cards in one
+    # ready queue also serialize. Scratch / worktree / redirected-repo-root cards
+    # are per-task isolated and return ``None`` from _in_place_workspace_key, so
+    # they are never keyed here. This is a correctness invariant, not a tunable —
+    # it is always on.
+    _occupied_inplace_roots: set[str] = set()
+    for rrow in conn.execute(
+        "SELECT * FROM tasks WHERE status = 'running' "
+        "AND workspace_kind = 'dir'"
+    ):
+        key = _in_place_workspace_key(Task.from_row(rrow))
+        if key is not None:
+            _occupied_inplace_roots.add(key)
     for row in ready_rows:
         if _per_tick_cap is not None and spawned >= _per_tick_cap:
             break
@@ -14549,6 +14649,19 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        # Edit-in-place serialization guard: never run two ``dir`` cards
+        # unisolated on the SAME workspace root at once. Compute this candidate's
+        # in-place key (None for isolated scratch/worktree/redirected-repo-root
+        # cards — they never collide) and defer if that root is already occupied
+        # by a running card or by a card this tick already spawned. The deferred
+        # card stays in ``ready`` (we skip BEFORE claim_task) and is picked up on
+        # a later tick once the occupant leaves ``running``. Runs in dry_run too
+        # so the reported spawn set reflects the real serialization decision.
+        _candidate = get_task(conn, row["id"])
+        _inplace_key = _in_place_workspace_key(_candidate) if _candidate else None
+        if _inplace_key is not None and _inplace_key in _occupied_inplace_roots:
+            result.skipped_workspace_busy.append((row["id"], _inplace_key))
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -14559,10 +14672,21 @@ def _dispatch_once_locked(
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
+            # Reserve the in-place root for the rest of this dry_run tick so a
+            # sibling same-root card is reported deferred, not spawnable.
+            if _inplace_key is not None:
+                _occupied_inplace_roots.add(_inplace_key)
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # The card is now ``running`` — reserve its in-place root so a same-root
+        # sibling later in this same tick defers (the row query for occupied
+        # roots ran before this claim). Done right after the claim, before
+        # spawn/resolve, so the reservation holds even if the spawn call below
+        # raises: the card is already running and owns the root.
+        if _inplace_key is not None:
+            _occupied_inplace_roots.add(_inplace_key)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
