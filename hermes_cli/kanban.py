@@ -2434,8 +2434,8 @@ def _cmd_reconcile_acceptance(args: argparse.Namespace) -> int:
             )
             return 1
 
-        pr_url = kb._card_newest_pr_url(conn, task_id)
-        if not pr_url:
+        pr_urls = kb._card_all_pr_urls(conn, task_id)
+        if not pr_urls:
             print(
                 f"cannot reconcile {task_id}: no PR URL is linked on the card, "
                 "so there is nothing to prove a merge against. Link the merged "
@@ -2445,45 +2445,73 @@ def _cmd_reconcile_acceptance(args: argparse.Namespace) -> int:
             return 1
 
         # --- Preconditions pass: hand off to the authority. This is the ONLY
-        #     path that consults gh (once) and moves the card. ---
+        #     path that consults gh (once per linked PR) and moves the card. ---
         ok = kb.reconcile_merged_acceptance(
             conn, task_id, actor=_profile_author()
         )
         if ok:
-            merge_commit = None
+            merge_commits: list[str] = []
             for ev in reversed(kb.list_events(conn, task_id)):
                 if ev.kind == "completion_reconciled_merge":
-                    merge_commit = (ev.payload or {}).get("merge_commit")
+                    payload = ev.payload or {}
+                    merge_commits = list(payload.get("merge_commits") or [])
+                    if not merge_commits and payload.get("merge_commit"):
+                        merge_commits = [payload["merge_commit"]]
                     break
-            print(f"{task_id} → done (reconciled: missed github-pr-closed webhook)")
-            print(f"  PR:           {pr_url}")
-            if merge_commit:
-                print(f"  merge commit: {merge_commit}")
+            if len(pr_urls) == 1:
+                print(f"{task_id} → done (reconciled: missed github-pr-closed webhook)")
+                print(f"  PR:           {pr_urls[0]}")
+            else:
+                print(
+                    f"{task_id} → done (reconciled {len(pr_urls)} PRs: "
+                    "missed github-pr-closed webhook)"
+                )
+                for url in pr_urls:
+                    print(f"  PR:           {url}")
+            for oid in merge_commits:
+                print(f"  merge commit: {oid}")
             return 0
 
-        # --- The merge gate refused. Re-resolve the PR state ONCE to say why.
-        #     This is diagnostic only; the card was already left untouched. ---
-        state, merge_oid = kb._resolve_pr_merge_commit(pr_url)
-        if state != "merged":
+        # --- The merge gate refused. Re-resolve the FULL PR set ONCE to say why.
+        #     This is diagnostic only; the card was already left untouched. The
+        #     reconcile refuses on: any OPEN PR (batch not finished), any
+        #     transient/unknown answer (fail closed), a merged-without-a-resolvable
+        #     -oid PR, or an all-terminal set with NO proven merge. Name the FIRST
+        #     blocking cause across the set so a multi-PR refusal is legible. ---
+        resolved = [(url, *kb._resolve_pr_merge_commit(url)) for url in pr_urls]
+        open_prs = [u for (u, s, _o) in resolved if s == "open"]
+        unresolved = [u for (u, s, _o) in resolved if s in {"unknown", "not_found"}]
+        merged_no_oid = [u for (u, s, o) in resolved if s == "merged" and not o]
+        any_merged = any(s == "merged" and o for (_u, s, o) in resolved)
+        if open_prs:
             detail = (
-                f"the PR is not merged (state {state!r}). done means Casey "
-                "merged — reconcile only recovers a card whose PR he ALREADY "
-                "merged when the webhook was missed."
+                f"{len(open_prs)} linked PR(s) are still OPEN "
+                f"({', '.join(open_prs)}); the batch is not finished. done means "
+                "every PR is terminal (merged/closed) and at least one merged."
             )
-            if state in {"unknown", "not_found"}:
-                detail = (
-                    f"the PR state could not be resolved (gh returned {state!r}); "
-                    "failing closed. Retry once gh can reach the PR."
-                )
-        elif not merge_oid:
+        elif unresolved:
             detail = (
-                "the PR reports merged but no merge commit oid could be "
-                "resolved (unverifiable); failing closed."
+                f"{len(unresolved)} linked PR state(s) could not be resolved "
+                f"(gh returned unknown/not_found for {', '.join(unresolved)}); "
+                "failing closed. Retry once gh can reach the PR(s)."
+            )
+        elif merged_no_oid:
+            detail = (
+                f"{len(merged_no_oid)} PR(s) report merged but no merge commit "
+                f"oid could be resolved ({', '.join(merged_no_oid)}, "
+                "unverifiable); failing closed."
+            )
+        elif not any_merged:
+            detail = (
+                "every linked PR is terminal but NONE merged (all "
+                "closed-not-merged). done requires at least one proven merge — "
+                "reconcile only recovers a card whose PR(s) Casey ALREADY merged."
             )
         else:  # pragma: no cover - would have succeeded above
             detail = "the reconcile was refused for an unexpected reason."
+        pr_list = "\n".join(f"  PR: {u}" for u in pr_urls)
         print(
-            f"cannot reconcile {task_id}: {detail}\n  PR: {pr_url}",
+            f"cannot reconcile {task_id}: {detail}\n{pr_list}",
             file=sys.stderr,
         )
         return 1
