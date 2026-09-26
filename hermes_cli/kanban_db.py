@@ -6225,6 +6225,38 @@ def _card_newest_pr_url(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     return None
 
 
+def _card_all_pr_urls(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Return the de-duplicated set of GitHub PR URLs linked on the card.
+
+    The multi-PR analog of :func:`_card_newest_pr_url`: a card that tracks a SET
+    of PRs (e.g. "land the nine Dependabot PRs") accretes several PR references
+    across its comment thread. :func:`reconcile_merged_acceptance` must evaluate
+    the WHOLE set — a card is done only when EVERY linked PR is terminal — so it
+    needs the full set, not just the newest reference.
+
+    Scans every comment (newest-first) with the same PR-URL pattern the rest of
+    the PR->card linkage trusts (:data:`_RESPAWN_GUARD_PR_URL_RE`), collecting
+    each distinct URL. Order is newest-first with first-seen wins, so the newest
+    linked PR leads the list (a stable, human-legible order for the audit trail).
+    A URL that appears in several comments is counted once. Returns ``[]`` when
+    no PR is linked.
+    """
+    seen: set[str] = set()
+    urls: list[str] = []
+    for row in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ).fetchall():
+        if not row["body"]:
+            continue
+        for m in _RESPAWN_GUARD_PR_URL_RE.finditer(row["body"]):
+            url = m.group(0)
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
+
+
 def reconcile_merged_acceptance(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6234,12 +6266,12 @@ def reconcile_merged_acceptance(
     """Walk a MERGED-PR acceptance card to ``done`` — the missed-webhook recovery.
 
     A card parked in the acceptance lane (``status='blocked'`` with a sticky
-    ``awaiting-casey-signoff`` reason) whose linked PR was ALREADY merged by Casey
-    has no working path to ``done`` when the ``github-pr-closed`` webhook is lost:
-    ``complete_task`` correctly REFUSES it (the acceptance guard cannot tell "not
-    merged yet" from "merged, webhook dropped"), and ``unblock`` + ``complete``
-    shunts it to ``review`` against a merged PR — strictly worse. This is the
-    missing reconcile (live ``t_fecc790d``).
+    ``awaiting-casey-signoff`` reason) whose linked PR(s) were ALREADY merged by
+    Casey has no working path to ``done`` when the ``github-pr-closed`` webhook is
+    lost: ``complete_task`` correctly REFUSES it (the acceptance guard cannot tell
+    "not merged yet" from "merged, webhook dropped"), and ``unblock`` +
+    ``complete`` shunts it to ``review`` against a merged PR — strictly worse. This
+    is the missing reconcile (live ``t_fecc790d``).
 
     It is a reconciliation of a MISSED event, NOT a new way to bypass sign-off:
     ``done`` still means "Casey merged." The proof is GitHub GROUND TRUTH, never
@@ -6251,21 +6283,31 @@ def reconcile_merged_acceptance(
         sticky block reason starts with ``awaiting-casey-signoff`` (so this is
         NOT a generic self-complete of any blocked card; a generic
         ``needs_input`` / ``review-changes-requested`` block is refused);
-      * a resolvable GitHub PR URL is linked on the card
-        (:func:`_card_newest_pr_url`); no PR -> refuse (nothing to prove a merge
+      * at least one resolvable GitHub PR URL is linked on the card
+        (:func:`_card_all_pr_urls`); no PR -> refuse (nothing to prove a merge
         against);
-      * the live PR is ``state == "merged"`` with a NON-NULL ``mergeCommit.oid``
-        (:func:`_resolve_pr_merge_commit`). An OPEN PR, a merged state with no
-        resolvable merge oid, or any unresolvable/transient ``gh`` answer
-        (``"unknown"`` / ``"not_found"`` / ``"closed"``) fails CLOSED -> refuse.
+      * the card's FULL PR set is terminal-and-merged. A card can track a SET of
+        PRs (e.g. "land the nine Dependabot PRs": several merged, one closed as a
+        duplicate, others absorbed) — evaluating only the newest linked PR
+        stranded exactly that card (live ``t_83079590``: its newest PR was the
+        closed-not-merged one). Each PR is resolved through the per-URL
+        ground-truth reader (:func:`_resolve_pr_merge_commit`), and the card is
+        done-eligible IFF **every** PR is terminal, **at least one** is ``merged``
+        with a resolvable ``mergeCommit.oid``, and **none** is ``open``. Any
+        ``open`` PR -> refuse (the batch is not finished); any ``unknown``
+        (transient/unresolvable ``gh`` answer) -> refuse (fail CLOSED); an
+        all-terminal set with no proven merge -> refuse. A single-PR card is a
+        strict subset of this rule: 1 merged -> done, 1 open -> refuse, 1
+        closed-not-merged -> refuse (control preserved exactly).
 
     On proof it completes the card through the ONE sanctioned merge completer —
     :func:`complete_task` with ``allow_acceptance_complete=True`` (the exact path
     Casey's live webhook merge takes) — so the single terminal contract holds:
     ``done`` is reached only by a proven merge. It additionally records a
-    distinguishable ``completion_reconciled_merge`` audit event carrying the
-    proven ``merge_commit`` + ``pr_url`` and a ``missed_webhook`` marker, so a
-    done-by-reconcile is as traceable as a done-by-webhook.
+    distinguishable ``completion_reconciled_merge`` audit event carrying the FULL
+    evaluated ``pr_urls`` set + every proven ``merge_commits`` and a
+    ``missed_webhook`` marker, so a done-by-reconcile is as traceable as a
+    done-by-webhook.
 
     Returns True on a successful reconcile, False on any refusal (a clean no-op —
     the card is left untouched in the acceptance lane). Refusals are silent by
@@ -6286,19 +6328,44 @@ def reconcile_merged_acceptance(
     ):
         return False
 
-    # 2) A resolvable linked PR is mandatory — there is nothing to prove a merge
-    #    against otherwise. No PR -> refuse without consulting gh.
-    pr_url = _card_newest_pr_url(conn, task_id)
-    if not pr_url:
+    # 2) At least one resolvable linked PR is mandatory — there is nothing to
+    #    prove a merge against otherwise. No PR -> refuse without consulting gh.
+    pr_urls = _card_all_pr_urls(conn, task_id)
+    if not pr_urls:
         return False
 
-    # 3) GitHub ground truth. Require ``merged`` AND a non-null mergeCommit.oid.
-    #    Everything else — OPEN, closed-not-merged, not_found, unknown/transient,
-    #    or merged-without-a-resolvable-oid — fails CLOSED (refuse). This is the
-    #    load-bearing gate: the merge must be PROVEN, not asserted.
-    state, merge_oid = _resolve_pr_merge_commit(pr_url)
-    if state != "merged" or not merge_oid:
+    # 3) GitHub ground truth over the FULL PR set. Resolve every linked PR and
+    #    require: every PR terminal, >=1 merged with a resolvable mergeCommit.oid,
+    #    none open, none transient/unknown. Everything that is not a clean,
+    #    fully-terminal, at-least-one-proven-merge set fails CLOSED (refuse).
+    #    This is the load-bearing gate: the batch's completion must be PROVEN,
+    #    not asserted, across ALL its PRs.
+    merge_commits: list[str] = []
+    for url in pr_urls:
+        state, merge_oid = _resolve_pr_merge_commit(url)
+        if state == "merged":
+            if not merge_oid:
+                # Merged-without-a-resolvable-oid is unverifiable -> fail closed.
+                return False
+            merge_commits.append(merge_oid)
+        elif state in ("closed", "not_found"):
+            # Terminal, not a merge — allowed in the set as long as SOME PR
+            # merged (checked below). A closed-as-duplicate / absorbed PR.
+            continue
+        else:
+            # "open" (batch not finished) or "unknown" (transient/unresolvable):
+            # both refuse. An open PR means the work is not done; an unknown
+            # answer must never force-accept on an unverifiable state.
+            return False
+    if not merge_commits:
+        # Every PR terminal but NONE merged -> there is no proven merge to make
+        # this card ``done``. Refuse.
         return False
+
+    # A canonical single merge commit for the completer / summary: the newest
+    # proven merge (pr_urls is newest-first, so merge_commits is too).
+    primary_merge_oid = merge_commits[0]
+    pr_display = pr_urls[0] if len(pr_urls) == 1 else f"{len(pr_urls)} PRs"
 
     # 4) Proven merge. Complete through the ONE sanctioned merge completer so the
     #    single terminal contract holds (``done`` == a proven merge). Record the
@@ -6308,8 +6375,12 @@ def reconcile_merged_acceptance(
         _append_event(
             conn, task_id, "completion_reconciled_merge",
             {
-                "pr_url": pr_url,
-                "merge_commit": merge_oid,
+                "pr_urls": pr_urls,
+                "merge_commits": merge_commits,
+                # Back-compat single-value fields (the pre-multi-PR audit shape):
+                # the newest linked PR + its proven merge commit.
+                "pr_url": pr_urls[0],
+                "merge_commit": primary_merge_oid,
                 "reason": reason,
                 "missed_webhook": True,
                 "by": f"{actor}:reconcile-merged-acceptance",
@@ -6318,13 +6389,16 @@ def reconcile_merged_acceptance(
     completed = complete_task(
         conn, task_id,
         summary=(
-            f"reconciled to done: PR {pr_url} verifiably merged "
-            f"(merge commit {merge_oid}); github-pr-closed webhook was missed."
+            f"reconciled to done: {pr_display} verifiably merged "
+            f"(merge commit{'s' if len(merge_commits) > 1 else ''} "
+            f"{', '.join(merge_commits)}); github-pr-closed webhook was missed."
         ),
         metadata={
             "reconcile": "merged_acceptance",
-            "pr_url": pr_url,
-            "merge_commit": merge_oid,
+            "pr_urls": pr_urls,
+            "merge_commits": merge_commits,
+            "pr_url": pr_urls[0],
+            "merge_commit": primary_merge_oid,
             "missed_webhook": True,
         },
         allow_acceptance_complete=True,

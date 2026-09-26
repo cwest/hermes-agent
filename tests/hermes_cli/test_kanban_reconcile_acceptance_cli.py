@@ -264,3 +264,81 @@ def test_reconcile_acceptance_verb_is_wired_and_documented(kanban_home: Path) ->
     # It appears in the kanban --help text.
     help_text = kanban_parser.format_help()
     assert "reconcile-acceptance" in help_text
+
+
+# ---------------------------------------------------------------------------
+# Multi-PR set — the shim reconciles a batch card and diagnoses set refusals
+# ---------------------------------------------------------------------------
+
+_PR_MERGED_A = "https://github.com/cwest/okfctl/pull/158"
+_PR_CLOSED = "https://github.com/cwest/okfctl/pull/162"
+_PR_OPEN = "https://github.com/cwest/okfctl/pull/170"
+_OID_A = "aaaa1111bbbb2222cccc3333dddd4444eeee5555"
+
+
+def _stage_multi_pr_acceptance_card(conn, pr_urls: list[str]) -> str:
+    tid = kb.create_task(conn, title="land the batch", assignee="casey", detached=True)
+    kb.claim_task(conn, tid)
+    for url in pr_urls:
+        kb.add_comment(conn, tid, author="easley", body=f"PR: {url} handled.")
+    reason = (
+        f"awaiting-casey-signoff: reviewed PASS — batch {', '.join(pr_urls)}; "
+        "threads resolved. Ready to merge."
+    )
+    assert kb.block_task(
+        conn, tid, reason=reason,
+        expected_run_id=kb.get_task(conn, tid).current_run_id,
+    )
+    assert kb.get_task(conn, tid).status == "blocked"
+    return tid
+
+
+def _per_url(states: dict[str, tuple[str, str | None]]):
+    def _resolve(url):
+        assert url in states, f"unexpected PR URL resolved: {url}"
+        return states[url]
+    return _resolve
+
+
+def test_cli_reconcile_mixed_set_moves_to_done(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A batch card (merged + closed-not-merged, none open) reconciles to done
+    through the CLI shim — the t_83079590 shape, where the NEWEST linked PR is
+    the closed one the old single-PR shim would have refused on."""
+    monkeypatch.setattr(
+        kb, "_resolve_pr_merge_commit",
+        _per_url({_PR_MERGED_A: ("merged", _OID_A), _PR_CLOSED: ("closed", None)}),
+    )
+    with kb.connect() as conn:
+        # closed PR linked LAST so it is the newest reference.
+        tid = _stage_multi_pr_acceptance_card(conn, [_PR_MERGED_A, _PR_CLOSED])
+
+    rc, out, err = _run(tid, capsys)
+
+    assert rc == 0, f"a mixed merged+closed batch must reconcile; stderr={err!r}"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+    assert _OID_A in out, "success must print the proven merge commit"
+
+
+def test_cli_reconcile_open_in_set_names_the_reason(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A batch card with ANY open PR is refused, and the shim names the open PR
+    as the blocking cause (not a bare False)."""
+    monkeypatch.setattr(
+        kb, "_resolve_pr_merge_commit",
+        _per_url({_PR_MERGED_A: ("merged", _OID_A), _PR_OPEN: ("open", None)}),
+    )
+    with kb.connect() as conn:
+        tid = _stage_multi_pr_acceptance_card(conn, [_PR_MERGED_A, _PR_OPEN])
+
+    rc, out, err = _run(tid, capsys)
+
+    assert rc == 1
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+    msg = (out + err).lower()
+    assert "open" in msg or "not" in msg, \
+        f"an open-in-set refusal must name the blocking PR; got {out + err!r}"
