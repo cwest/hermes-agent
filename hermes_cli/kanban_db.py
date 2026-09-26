@@ -7809,6 +7809,61 @@ def complete_task(
                     # (no acceptance park) — fall through to the ``-> done`` UPDATE.
                     pass
                 else:
+                    # Merge-at-completion short circuit (defect (b), live
+                    # ``t_d23132c7`` / cwest/okfctl#174): the acceptance park below
+                    # is Casey's human sign-off gate and is CORRECT while the PR is
+                    # unmerged. But a merge-only branch catch-up can pull an
+                    # already-PASS'd card back into ``review`` and re-spawn its
+                    # reviewer; by the time THAT run completes here, Casey may have
+                    # ALREADY merged the PR. Re-parking a merged card
+                    # ``blocked`` + casey strands it in the acceptance lane until
+                    # ``reconcile-acceptance`` recovers it (the observed
+                    # regression). ``done`` means "Casey merged" — a proven merge
+                    # at completion time IS that, so route to ``done`` here instead
+                    # of parking, saving the reconcile round-trip.
+                    #
+                    # The merge is PROVEN from GitHub ground truth via the exact
+                    # gate :func:`reconcile_merged_acceptance` trusts
+                    # (:func:`_resolve_pr_merge_commit`: ``state == "merged"`` AND a
+                    # non-null ``mergeCommit.oid``), never caller assertion — so
+                    # this cannot re-open the hole the acceptance guard closes. It
+                    # fails CLOSED in every other case: no linked PR (``gh`` is not
+                    # even consulted), an OPEN PR, a merged state with no resolvable
+                    # oid, or any transient/unknown answer all fall through to the
+                    # ordinary acceptance park unchanged. Completion routes through
+                    # the ONE sanctioned merge completer (``complete_task`` with
+                    # ``allow_acceptance_complete=True`` — the same path Casey's
+                    # merge webhook and the reconcile take), so the single terminal
+                    # contract holds: ``done`` is reached only by a proven merge. A
+                    # distinguishable ``completion_merged_at_review`` audit event
+                    # records the proof so a done-by-merge-at-completion is as
+                    # traceable as a done-by-webhook or a done-by-reconcile.
+                    _merge_pr_url = _card_newest_pr_url(conn, task_id)
+                    if _merge_pr_url:
+                        _merge_state, _merge_oid = _resolve_pr_merge_commit(
+                            _merge_pr_url
+                        )
+                        if _merge_state == "merged" and _merge_oid:
+                            with write_txn(conn):
+                                _append_event(
+                                    conn, task_id, "completion_merged_at_review",
+                                    {
+                                        "pr_url": _merge_pr_url,
+                                        "merge_commit": _merge_oid,
+                                        "review_owner": _review_owner,
+                                        "by": "onecard:complete-task-self-review",
+                                    },
+                                )
+                            _completed = complete_task(
+                                conn, task_id,
+                                summary=(
+                                    summary if summary is not None else result
+                                ),
+                                metadata=metadata,
+                                expected_run_id=expected_run_id,
+                                allow_acceptance_complete=True,
+                            )
+                            return bool(_completed)
                     _acceptance_owner = _acceptance_owner_from_owner_map(conn, task_id)
                     _park_reason = _normalize_signoff_reason(
                         (summary or result or "").strip() or None
