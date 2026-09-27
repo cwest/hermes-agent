@@ -930,6 +930,128 @@ def test_submit_for_review_cannot_set_done(worker_env):
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Edit-in-place (workspace_kind=dir, no-PR) cards: the sanctioned handoff must
+# reach `review` WITHOUT passing through `blocked`.
+#
+# A dir card has no PR, so no `github-prs` webhook ever moves it
+# running->review. The worker's review handoff for such a card is
+# `kanban_submit_for_review`, which MOVEs the card one lane regardless of
+# workspace kind. It must NOT be a `kanban_block` park (which dead-ends a no-PR
+# card in `blocked`).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def dir_worker_env(monkeypatch, tmp_path):
+    """A claimed, running edit-in-place card (workspace_kind='dir') carrying a
+    state_owners owner map — the shape a no-PR code card has when the worker
+    finishes and needs to hand off for review."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    proj = tmp_path / "edit-in-place"
+    proj.mkdir()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="fix: edit-in-place change", assignee="test-worker",
+            workspace_kind="dir", workspace_path=str(proj), detached=True,
+        )
+        kb.add_comment(
+            conn, tid, "kanban",
+            "[audit] stage=submit\nnotes: state_owners={ready: test-worker, "
+            "review: lamport, blocked-acceptance: casey}",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return tid
+
+
+def test_dir_card_block_review_required_leaves_it_blocked(dir_worker_env):
+    """NEGATIVE CONTROL: handing a no-PR dir card off via kanban_block leaves it
+    stuck in `blocked`, never `review`.
+
+    This documents exactly why the review handoff must NOT go through
+    kanban_block for a no-PR card: there is no webhook to move it onward, so it
+    dead-ends in `blocked` awaiting a hand-clear."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_block(
+        {"reason": "review-required: edit-in-place change ready", "kind": "needs_input"}
+    )
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, dir_worker_env)
+        assert task.status == "blocked"
+        assert task.status != "review"
+    finally:
+        conn.close()
+
+
+def test_dir_card_submit_for_review_reaches_review_without_blocking(dir_worker_env):
+    """POSITIVE: the sanctioned handoff MOVEs a no-PR dir card straight to
+    `review`, assigned to its state_owners.review owner, with NO `blocked`
+    event ever recorded in its history."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_submit_for_review({})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["status"] == "review"
+    assert d["assignee"] == "lamport"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, dir_worker_env)
+        assert task.status == "review"
+        assert task.assignee == "lamport"
+        # It reached review via a workspace-kind-agnostic MOVE.
+        assert task.workspace_kind == "dir"
+        # The card never passed through `blocked`.
+        events = kb.list_events(conn, dir_worker_env)
+        assert not any(e.kind == "blocked" for e in events), (
+            "a sanctioned dir-card handoff must not emit a blocked event"
+        )
+        # And the audit trail shows the running->review transition.
+        moved = [
+            e for e in events
+            if e.kind == "status_changed"
+            and (e.payload or {}).get("to") == "review"
+        ]
+        assert moved, "expected a status_changed event to 'review'"
+    finally:
+        conn.close()
+
+
+def test_guidance_routes_no_pr_dir_card_to_submit_for_review(monkeypatch, tmp_path):
+    """The auto-injected worker guidance must give a no-PR edit-in-place code
+    card a sanctioned review handoff (`kanban_submit_for_review`) — not leave it
+    with only complete (wrong: marks done) or block (wrong: dead-ends).
+
+    Fails against guidance that covers only the PR-open path."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "kanban_submit_for_review" in KANBAN_GUIDANCE
+    # The dir / edit-in-place no-PR shape is explicitly addressed.
+    assert "workspace_kind=dir" in KANBAN_GUIDANCE
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
@@ -2101,9 +2223,10 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     details (workspace kinds, deliverable artifacts, created-card claims,
     profile discovery) when the standalone kanban-worker / kanban-orchestrator
     skills were removed and folded into this always-injected guidance, and
-    the step-5 handoff was later split into three explicit exits
-    (complete-for-non-PR, end-the-run-after-PR, block-for-needs-input), so the
-    ceiling is sized to fit that content with a little headroom.
+    the step-5 handoff was later split into four explicit exits
+    (complete-for-non-PR, end-the-run-after-PR, submit-for-review on a no-PR
+    edit-in-place card, block-for-needs-input), so the ceiling is sized to fit
+    that content with a little headroom.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
@@ -2113,7 +2236,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 6_000, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 6_500, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 

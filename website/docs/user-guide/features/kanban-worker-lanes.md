@@ -50,21 +50,28 @@ For non-Hermes lanes (registered via a plugin), the plugin supplies its own `spa
 
 Every claim must end in exactly one of:
 
-- `kanban_complete(summary=..., metadata=...)` — task succeeds, status flips to `done`.
-- `kanban_block(reason=...)` — task waits for human input, status flips to `blocked`. The dispatcher respawns when `kanban_unblock` runs.
+- `kanban_complete(summary=..., metadata=...)` — task succeeds, status flips to `done`. Reserve this for genuinely terminal work (a typo fix, a docs change, a research writeup) — `done` means the work item is finished, not "handed off."
+- `kanban_submit_for_review(reviewer=...)` — a code change is written and needs review; the card MOVEs `running` → `review`, assigned to its `state_owners.review` owner. This is the sanctioned, non-terminal handoff for a no-PR edit-in-place card (see [the review handoff](#outputs-and-the-review-handoff) below). The dispatcher then spawns the review lane for it.
+- `kanban_block(reason=...)` — task waits for human input, status flips to `blocked`. The dispatcher respawns when `kanban_unblock` runs. This is a genuine STOP, not a review handoff.
 - The worker process exits without a tool call. The kernel reaps it and emits `crashed` (PID died) or `gave_up` (consecutive-failure breaker tripped) or `timed_out` (max_runtime exceeded). This is the failure path; healthy workers don't end here.
 
 The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.
 
-## Outputs and the review-required convention
+## Outputs and the review handoff
 
-For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel doesn't enforce this distinction (a "code-changing task" is fuzzy and forcing block-instead-of-complete on every code worker would break flows where no review is wanted). It's a convention layered on top:
+For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. How the card reaches `review` depends on whether it has a PR:
 
-- **Block instead of complete**, with `reason` prefixed `review-required: ` so the dashboard / `hermes kanban show` surfaces the row as awaiting review.
-- **Drop structured metadata into a `kanban_comment` first** since `kanban_block` only carries the human-readable `reason`. Comments are the durable annotation channel — every audit-relevant field (changed_files, tests_run, diff_path or PR url, decisions) belongs there.
-- **Reviewer either approves and unblocks**, which respawns the worker with the comment thread for follow-ups; or asks for changes via another comment, which the next worker run sees as part of `kanban_show`'s context.
+- **PR-backed card** — the worker opens a marker-stamped draft PR (`<!-- card:$HERMES_KANBAN_TASK -->` in the body), comments the PR URL + head SHA, and ends the run. The `github-prs` webhook + `stage-pr-review` MOVEs the card `running` → `review` and assigns the reviewer. The worker never moves the card and never calls `kanban_complete` (that would mark an unmerged draft `done`).
+- **No-PR edit-in-place card** (`workspace_kind=dir`, e.g. a change to `~/.hermes`) — there is no PR and therefore no webhook to move it. The worker calls **`kanban_submit_for_review()`** itself: it MOVEs the card `running` → `review`, clears the claim, and assigns the reviewer resolved from the card's `state_owners.review` owner map (code → the code reviewer, writing → the editor). This is the *only* thing that reaches `review` without a human hand-clear.
 
-The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks — typo fixes, docs changes, research writeups) and the `review-required` block pattern.
+For both shapes:
+
+- **Drop structured metadata into a `kanban_comment` first.** Every audit-relevant field (changed_files, tests_run, diff_path or PR url + head SHA, decisions) belongs there — the handoff carries only a short `summary`. Comments are the durable annotation channel.
+- **Do not `kanban_block` to hand off.** Blocking parks the card in `blocked`; a no-PR card then dead-ends there awaiting a manual `unblock` → `review` clear. Reserve `kanban_block` for a genuine STOP that needs a human decision.
+- **Do not `kanban_complete` unreviewed work.** `kanban_complete` flips the card to `done` (≡ merged/accepted), which skips review entirely.
+- **The reviewer either approves** (undrafts the PR / routes toward the merge lane) **or requests changes via a comment**, which the next worker run sees as part of `kanban_show`'s context.
+
+The injected `KANBAN_GUIDANCE` covers all the terminators: `kanban_complete` (truly terminal tasks), the PR-open path, `kanban_submit_for_review` (the no-PR code-review handoff), and `kanban_block` (a real STOP).
 
 ## Logs and audit trail
 
