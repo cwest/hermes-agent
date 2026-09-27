@@ -26,6 +26,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
+from agent.compression_markers import elided_arg_placeholder
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
@@ -857,6 +858,16 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     to begin with — some model backends use non-JSON tool arguments — the
     original string is returned unchanged rather than replaced with
     something neither we nor the backend can parse.
+
+    An over-long string value is replaced *entirely* with a structural
+    elision placeholder (:func:`agent.compression_markers.elided_arg_placeholder`),
+    NOT a head slice plus an inline ``...[truncated]`` marker. Keeping a real
+    head + marker meant the model saw its own prior ``write_file`` / ``patch``
+    payloads shaped like ``"# real head...[truncated]"`` and reproduced that
+    shape in NEW tool calls — silently writing files cut off at ~200 chars.
+    Discarding the whole value removes the copyable content prefix, and the
+    write_file / patch / kanban gates refuse any payload that still carries
+    the placeholder's sentinel. See the card for the observed evidence.
     """
     try:
         parsed = json.loads(args)
@@ -866,7 +877,7 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     def _shrink(obj: Any) -> Any:
         if isinstance(obj, str):
             if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
+                return elided_arg_placeholder(len(obj))
             return obj
         if isinstance(obj, dict):
             return {k: _shrink(v) for k, v in obj.items()}

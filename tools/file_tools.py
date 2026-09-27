@@ -11,6 +11,7 @@ import threading
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
+from agent.compression_markers import contains_compression_elision
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -2052,6 +2053,23 @@ def _handle_read_file(args, **kw):
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
+def _compression_elision_error(tool: str, field: str) -> str:
+    """Error returned when a payload still carries the compression sentinel.
+
+    Context compression elides over-long historical tool args to a structural
+    placeholder; a payload containing that sentinel means the model copied an
+    elided value out of its own history instead of re-emitting the real
+    content. Refuse it and tell the model to re-send in full.
+    """
+    return (
+        f"{tool}: '{field}' contains a context-compression elision marker, which "
+        f"means it was copied from a shrunken tool call in your history rather than "
+        f"authored fresh. Writing it would truncate the content. Re-emit this "
+        f"{tool} call with the FULL, complete {field} — do not copy the elided "
+        f"value."
+    )
+
+
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
     if not args.get("path") or not isinstance(args.get("path"), str):
@@ -2072,6 +2090,8 @@ def _handle_write_file(args, **kw):
             f"write_file: 'content' must be a string, got "
             f"{type(args['content']).__name__}."
         )
+    if contains_compression_elision(args["content"]):
+        return tool_error(_compression_elision_error("write_file", "content"))
     return write_file_tool(
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
@@ -2081,6 +2101,13 @@ def _handle_write_file(args, **kw):
 
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
+    # Refuse a payload copied out of an elided history in either patch mode:
+    # replace-mode carries the new text in 'new_string'; V4A mode carries it
+    # inside the 'patch' blob.
+    if contains_compression_elision(args.get("new_string")):
+        return tool_error(_compression_elision_error("patch", "new_string"))
+    if contains_compression_elision(args.get("patch")):
+        return tool_error(_compression_elision_error("patch", "patch"))
     return patch_tool(
         mode=args.get("mode", "replace"), path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),

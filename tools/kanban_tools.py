@@ -34,11 +34,28 @@ import os
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+from agent.compression_markers import contains_compression_elision
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
+
+
+def _compression_elision_error(tool: str, field: str) -> str:
+    """Error returned when a kanban payload still carries the compression sentinel.
+
+    Context compression elides over-long historical tool args to a structural
+    placeholder; a payload containing that sentinel means the model copied an
+    elided value out of its own history instead of re-emitting the real
+    content. Refuse it so a truncated comment/spec never lands.
+    """
+    return (
+        f"{tool}: '{field}' contains a context-compression elision marker, which "
+        f"means it was copied from a shrunken tool call in your history rather than "
+        f"authored fresh. Persisting it would truncate the content. Re-emit this "
+        f"{tool} call with the FULL, complete {field} — do not copy the elided value."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -972,6 +989,8 @@ def _handle_comment(args: dict, **kw) -> str:
     body = args.get("body")
     if not body or not str(body).strip():
         return tool_error("body is required")
+    if contains_compression_elision(body):
+        return tool_error(_compression_elision_error("kanban_comment", "body"))
     body = redact_sensitive_text(str(body), force=True)
     # Author is intentionally derived from the worker's own runtime
     # identity, NOT from caller-supplied args. Comments are injected
@@ -1242,6 +1261,8 @@ def _handle_create(args: dict, **kw) -> str:
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
     body = args.get("body")
+    if contains_compression_elision(body):
+        return tool_error(_compression_elision_error("kanban_create", "body"))
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
