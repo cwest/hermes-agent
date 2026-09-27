@@ -1266,6 +1266,45 @@ def test_comment_rejects_empty_body(worker_env):
     assert json.loads(out).get("error")
 
 
+def test_comment_refuses_body_with_compression_sentinel(worker_env):
+    """A comment body copied out of an elided history (carrying the
+    compression sentinel) must be refused, not persisted as a superseded
+    marker-bearing comment."""
+    from tools import kanban_tools as kt
+    from agent.compression_markers import elided_arg_placeholder
+
+    poisoned = "handoff notes\n" + elided_arg_placeholder(1500)
+    out = json.loads(kt._handle_comment({"task_id": worker_env, "body": poisoned}))
+    assert out.get("error")
+    assert "compression" in out["error"].lower() or "re-send" in out["error"].lower()
+
+    # And it must not have landed.
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        comments = kb.list_comments(conn, worker_env)
+        user_comments = [c for c in comments if c.author != "kanban"]
+        assert user_comments == []
+    finally:
+        conn.close()
+
+
+def test_create_refuses_body_with_compression_sentinel(worker_env):
+    """A kanban_create whose body carries the compression sentinel must be
+    refused so the spawned card's spec isn't a truncated copy."""
+    from tools import kanban_tools as kt
+    from agent.compression_markers import elided_arg_placeholder
+
+    poisoned = "# Follow-up spec\n" + elided_arg_placeholder(2200)
+    out = json.loads(kt._handle_create({
+        "title": "follow-up",
+        "assignee": "peer",
+        "body": poisoned,
+    }))
+    assert out.get("error")
+    assert "compression" in out["error"].lower() or "re-send" in out["error"].lower()
+
+
 def test_comment_ignores_caller_supplied_author(worker_env):
     """``args["author"]`` is no longer honored — the author is always
     derived from ``HERMES_PROFILE`` so a worker can't forge a comment

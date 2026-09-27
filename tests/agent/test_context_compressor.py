@@ -3384,6 +3384,7 @@ class TestTruncateToolCallArgsJson:
 
     def test_shrunken_args_remain_valid_json(self):
         import json as _json
+        from agent.compression_markers import contains_compression_elision
         shrink = self._helper()
         original = _json.dumps({
             "path": "~/.hermes/skills/shopping/browser-setup-notes.md",
@@ -3393,7 +3394,12 @@ class TestTruncateToolCallArgsJson:
         shrunk = shrink(original)
         parsed = _json.loads(shrunk)  # must not raise
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        # Root cause fix: the over-long value is replaced by a structural
+        # elision sentinel, NOT a copyable head + "...[truncated]" suffix.
+        assert contains_compression_elision(parsed["content"])
+        assert "...[truncated]" not in parsed["content"]
+        # No content prefix survives that the model could copy.
+        assert not parsed["content"].startswith("# Shopping")
         assert len(shrunk) < len(original)
 
     def test_non_json_arguments_pass_through(self):
@@ -3409,6 +3415,7 @@ class TestTruncateToolCallArgsJson:
 
     def test_nested_structures_are_walked(self):
         import json as _json
+        from agent.compression_markers import contains_compression_elision
         shrink = self._helper()
         payload = _json.dumps({
             "messages": [
@@ -3418,12 +3425,13 @@ class TestTruncateToolCallArgsJson:
             "meta": {"note": "y" * 500},
         })
         parsed = _json.loads(shrink(payload))
-        assert parsed["messages"][0]["content"].endswith("...[truncated]")
+        assert contains_compression_elision(parsed["messages"][0]["content"])
         assert parsed["messages"][1]["content"] == "ok"
-        assert parsed["meta"]["note"].endswith("...[truncated]")
+        assert contains_compression_elision(parsed["meta"]["note"])
 
     def test_non_string_leaves_preserved(self):
         import json as _json
+        from agent.compression_markers import contains_compression_elision
         shrink = self._helper()
         payload = _json.dumps({
             "retries": 3,
@@ -3437,23 +3445,27 @@ class TestTruncateToolCallArgsJson:
         assert parsed["enabled"] is True
         assert parsed["timeout"] is None
         assert parsed["items"] == [1, 2, 3]
-        assert parsed["note"].endswith("...[truncated]")
+        assert contains_compression_elision(parsed["note"])
 
     def test_scalar_json_string_gets_shrunk(self):
         import json as _json
+        from agent.compression_markers import contains_compression_elision
         shrink = self._helper()
         payload = _json.dumps("q" * 500)
         parsed = _json.loads(shrink(payload))
         assert isinstance(parsed, str)
-        assert parsed.endswith("...[truncated]")
+        assert contains_compression_elision(parsed)
 
     def test_unicode_preserved(self):
         import json as _json
         shrink = self._helper()
-        payload = _json.dumps({"content": "非德满" + ("a" * 500)})
+        # A short CJK value is under the shrink threshold, so it survives
+        # intact — and ensure_ascii=False keeps it raw rather than bloating
+        # it into \uXXXX escapes.
+        payload = _json.dumps({"a": "x" * 500, "note": "非德满"}, ensure_ascii=False)
         out = shrink(payload)
-        # ensure_ascii=False keeps CJK intact rather than emitting \uXXXX
         assert "非德满" in out
+        assert "\\u" not in out
 
     def test_pass3_emits_valid_json_for_downstream_provider(self):
         """End-to-end: Pass 3 must never produce the exact failure payload
@@ -3489,7 +3501,25 @@ class TestTruncateToolCallArgsJson:
         # Must parse — otherwise downstream provider returns 400
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        # Card contract: a compressed tool call no longer contains the
+        # natural-language marker inside any string arg value, and the
+        # over-long content is a structural elision the model cannot copy.
+        from agent.compression_markers import contains_compression_elision
+
+        def _walk(obj):
+            if isinstance(obj, str):
+                yield obj
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    yield from _walk(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    yield from _walk(v)
+
+        for s in _walk(parsed):
+            assert "...[truncated]" not in s
+        assert contains_compression_elision(parsed["content"])
+        assert not parsed["content"].startswith("# Shopping")
 
 
 class TestPreflightSentinelGuard:
