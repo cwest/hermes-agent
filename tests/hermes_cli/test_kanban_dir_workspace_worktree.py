@@ -234,16 +234,27 @@ def test_dir_subdir_of_repo_still_returns_directory(kanban_home, tmp_path):
     assert workspace.resolve() == subdir.resolve()
 
 
-def test_dir_deploy_clone_untracked_branch_fails_loudly(kanban_home, tmp_path):
-    """A clone on a branch with no upstream can't ff-only, so it must refuse.
+def test_dir_deploy_clone_branch_with_no_unique_content_self_heals(
+    kanban_home, tmp_path
+):
+    """A clone on a local-only branch with NO unique content self-heals.
 
-    A previous buggy worker left the shared clone on a local-only topic branch
-    that tracks nothing. ``git pull --ff-only`` cannot work there, so building on
-    it is the genuine hazard the guard exists to catch.
+    A previous worker left the shared clone on a local-only topic branch that
+    tracks nothing — but the branch carries no commits of its own (it sits at
+    the merge-base with main), so every path it "touched" is already on the
+    deploy upstream. This is the spec's "no unique content" case: switching to
+    the deploy branch and fast-forwarding strands nothing, so the resolver must
+    self-heal rather than hard-fail. (A branch carrying content NOT on main is
+    covered by ``test_dir_clone_named_local_only_branch_with_unique_content_still_fails``.)
     """
     repo = _make_repo(tmp_path)
-    # A previous buggy worker left the shared clone on a local-only topic branch.
+    _git(repo, "remote", "set-head", "origin", "-a")
+    upstream_sha = _git(repo, "rev-parse", "origin/main").strip()
+    # A previous buggy worker left the shared clone on a local-only topic branch
+    # with no commits of its own.
     _git(repo, "checkout", "-b", "topic/leftover")
+    assert _current_branch(repo) == "topic/leftover"
+    assert _git(repo, "status", "--porcelain").strip() == ""
 
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -252,8 +263,15 @@ def test_dir_deploy_clone_untracked_branch_fails_loudly(kanban_home, tmp_path):
         )
         task = kb.get_task(conn, tid)
 
-    with pytest.raises(RuntimeError, match="cannot .*fast-forward|does not track an upstream"):
-        kb.resolve_workspace(task)
+    workspace = kb.resolve_workspace(task)
+    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    # Switched onto main tracking origin/main at the upstream tip.
+    assert _current_branch(repo) == "main"
+    assert (
+        _git(repo, "rev-parse", "--abbrev-ref", "main@{upstream}").strip()
+        == "origin/main"
+    )
+    assert _git(repo, "rev-parse", "HEAD").strip() == upstream_sha
 
 
 def _make_fork_clone_on_tracked_branch(
@@ -434,15 +452,23 @@ def test_dir_clone_dirty_detached_head_fails_loudly(kanban_home, tmp_path):
     assert _current_branch(repo) == "HEAD"
 
 
-def test_dir_clone_named_local_only_branch_still_fails(kanban_home, tmp_path):
-    """A named local-only branch with no upstream still RAISES (unchanged).
+def test_dir_clone_named_local_only_branch_with_unique_content_still_fails(
+    kanban_home, tmp_path
+):
+    """A named local-only branch carrying content NOT on main still RAISES.
 
-    A named branch is a deliberate state — not the accidental detach the
-    self-heal targets. It must never be auto-reattached; the guard keeps
-    refusing exactly as before.
+    A named branch that has diverged from main — a file differing from the
+    deploy upstream — is unmerged work that must never be silently abandoned.
+    The guard keeps refusing exactly as before: self-heal is reserved for a
+    branch whose every change is already byte-identical on main.
     """
     repo = _make_repo(tmp_path)
     _git(repo, "checkout", "-b", "topic/leftover")
+    # Give the branch a commit whose content is NOT on origin/main — genuine
+    # unmerged work.
+    (repo / "unique.txt").write_text("not on main\n", encoding="utf-8")
+    _git(repo, "add", "unique.txt")
+    _git(repo, "commit", "-m", "unmerged work on the leftover branch")
     assert _current_branch(repo) == "topic/leftover"
 
     with kb.connect() as conn:
@@ -452,10 +478,98 @@ def test_dir_clone_named_local_only_branch_still_fails(kanban_home, tmp_path):
         )
         task = kb.get_task(conn, tid)
 
-    with pytest.raises(RuntimeError, match="does not track an upstream|cannot .*fast-forward"):
+    with pytest.raises(RuntimeError, match="named local-only branch|cannot .*fast-forward"):
         kb.resolve_workspace(task)
-    # The named branch is untouched — never auto-reattached.
+    # The named branch is untouched — never auto-reattached, work preserved.
     assert _current_branch(repo) == "topic/leftover"
+    assert (repo / "unique.txt").read_text(encoding="utf-8") == "not on main\n"
+
+
+def test_dir_clone_named_branch_content_all_on_main_self_heals(
+    kanban_home, tmp_path
+):
+    """Clean named local-only branch whose changes are ALL on main → self-heal.
+
+    The sibling of the detached-HEAD self-heal: a prior worker left the shared
+    clone on a named branch whose PR already squash-merged. The branch's
+    upstream is gone, the tree is clean, and every file it touched (vs the
+    merge-base) is byte-identical to origin/main. The two-command human
+    recovery (``git checkout main && git pull --ff-only``) strands nothing, so
+    the resolver must reach that state instead of hard-failing.
+    """
+    repo = _make_repo(tmp_path)
+    merge_base = _git(repo, "rev-parse", "HEAD").strip()
+    # Branch off, edit a file, then land the IDENTICAL content on origin/main
+    # (modelling a squash-merge of this branch's change) and advance the clone's
+    # main to it. The branch's touched file now matches main byte-for-byte.
+    _git(repo, "checkout", "-b", "research/refresh-brief-20261007")
+    (repo / "brief.md").write_text("refreshed brief\n", encoding="utf-8")
+    _git(repo, "add", "brief.md")
+    _git(repo, "commit", "-m", "refresh brief on the branch")
+    # Land the same content on main and push, then prune the local tracking so
+    # the branch's own upstream is gone (as after a squash-merge + branch delete).
+    _git(repo, "checkout", "main")
+    (repo / "brief.md").write_text("refreshed brief\n", encoding="utf-8")
+    _git(repo, "add", "brief.md")
+    _git(repo, "commit", "-m", "refresh brief (squash-merged)")
+    _git(repo, "push", "origin", "main")
+    upstream_sha = _git(repo, "rev-parse", "origin/main").strip()
+    _git(repo, "remote", "set-head", "origin", "-a")
+    # Park the clone back on the merged branch — the polluted state.
+    _git(repo, "checkout", "research/refresh-brief-20261007")
+    assert _current_branch(repo) == "research/refresh-brief-20261007"
+    assert _git(repo, "status", "--porcelain").strip() == ""
+    # Precondition: the branch's touched file is byte-identical to main.
+    assert (repo / "brief.md").read_text(encoding="utf-8") == "refreshed brief\n"
+    assert merge_base  # merge-base exists; unused beyond documentation
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="office feature",
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
+        )
+        task = kb.get_task(conn, tid)
+
+    # Must NOT raise — the merged named branch self-heals onto main.
+    workspace = kb.resolve_workspace(task)
+    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    # The shared clone is now on main tracking origin/main at the upstream SHA —
+    # exactly what ``git checkout main && git pull --ff-only`` produces.
+    assert _current_branch(repo) == "main"
+    assert (
+        _git(repo, "rev-parse", "--abbrev-ref", "main@{upstream}").strip()
+        == "origin/main"
+    )
+    assert _git(repo, "rev-parse", "HEAD").strip() == upstream_sha
+    assert _git(repo, "status", "--porcelain").strip() == ""
+
+
+def test_dir_clone_named_branch_dirty_tree_still_fails(kanban_home, tmp_path):
+    """A dirty tree on a named local-only branch → RAISE (dirtiness named).
+
+    Even when the branch's committed content is all on main, an uncommitted or
+    untracked change in the tree must never be auto-recovered. The refusal must
+    name the dirtiness explicitly, and the tree must be left exactly as-is.
+    """
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "-b", "research/refresh-brief-20261007")
+    # Content committed to the branch happens to match main (no divergence),
+    # but the tree is left DIRTY with an uncommitted edit.
+    (repo / "wip.txt").write_text("uncommitted\n", encoding="utf-8")
+    assert _git(repo, "status", "--porcelain").strip() != ""
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="office feature",
+            workspace_kind="dir", workspace_path=str(repo), detached=True,
+        )
+        task = kb.get_task(conn, tid)
+
+    with pytest.raises(RuntimeError, match="(?i)dirty|uncommitted"):
+        kb.resolve_workspace(task)
+    # The dirty tree is left exactly as-is — nothing recovered.
+    assert (repo / "wip.txt").read_text(encoding="utf-8") == "uncommitted\n"
+    assert _current_branch(repo) == "research/refresh-brief-20261007"
 
 
 def test_dir_clone_detached_no_local_branch_self_heals_from_origin_head(

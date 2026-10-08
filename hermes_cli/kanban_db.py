@@ -10912,6 +10912,70 @@ def _git_head_is_ancestor_of(path: Path, ref: str) -> bool:
     return result.returncode == 0
 
 
+def _git_branch_content_is_contained_in(path: Path, ref: str) -> bool:
+    """True when HEAD carries no unique content versus ``ref``.
+
+    This is the named-branch sibling of :func:`_git_head_is_ancestor_of`. A
+    merged topic branch — one whose PR already squash-merged into the deploy
+    branch — is NOT an ancestor of the deploy upstream (a squash rewrites
+    history, so the branch commit is unreachable from ``ref``), yet every file
+    it touched is byte-identical to ``ref``. Reattaching to the deploy branch
+    therefore strands nothing: the branch's work is fully present on ``ref`` in
+    content, even though not in commit lineage.
+
+    We prove that by diffing exactly the paths the branch changed since its
+    merge-base with ``ref``, against ``ref`` itself:
+
+    * ``git merge-base HEAD <ref>`` → the fork point. If there is no merge-base
+      (unrelated histories) we cannot prove containment → ``False`` (refuse).
+    * ``git diff --name-only <merge-base> HEAD`` → the files the branch touched.
+      An empty list means the branch added no unique content at all (it sits at
+      or behind the merge-base) → trivially contained → ``True``.
+    * ``git diff --quiet <ref> -- <touched files>`` → exits 0 iff every touched
+      file matches ``ref`` in the WORKING TREE. We scope the diff to only the
+      branch's own touched paths so an UNRELATED drift elsewhere in ``ref``
+      (the clone being behind on other files) does not mask a genuine match, and
+      so we never claim containment for a file the branch never touched.
+
+    Any git error (bad ref, no merge-base, diff failure) is treated as "not
+    provably contained" so the caller refuses rather than risk discarding work.
+    """
+    try:
+        mb = subprocess.run(
+            ["git", "-C", str(path), "merge-base", "HEAD", ref],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, check=False,
+        )
+        if mb.returncode != 0:
+            return False
+        merge_base = (mb.stdout or "").strip()
+        if not merge_base:
+            return False
+
+        names = subprocess.run(
+            ["git", "-C", str(path), "diff", "--name-only", merge_base, "HEAD"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, check=False,
+        )
+        if names.returncode != 0:
+            return False
+        touched = [ln for ln in (names.stdout or "").splitlines() if ln.strip()]
+        # No unique content versus the merge-base → trivially contained.
+        if not touched:
+            return True
+
+        diff = subprocess.run(
+            ["git", "-C", str(path), "diff", "--quiet", ref, "--", *touched],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, check=False,
+        )
+        # exit 0 = no differences (all touched files match ref); exit 1 =
+        # differences; anything else = error. Only a clean 0 proves containment.
+        return diff.returncode == 0
+    except Exception:
+        return False
+
+
 def _git_local_branch_exists(path: Path, branch: str) -> bool:
     """True when a local branch named ``branch`` exists.
 
@@ -11687,18 +11751,56 @@ def _resolve_dir_workspace(task: Task) -> Path:
         dirty = _git_is_dirty(repo_root)
         deploy = None if dirty else _git_deploy_branch_with_upstream(repo_root)
 
-        # Conservative self-heal: ONLY a clean tree, an actual detached HEAD
-        # (a named local-only branch is a DELIBERATE state — never
-        # auto-reattached), a resolvable deploy branch that tracks an
-        # upstream, and a HEAD already contained in that upstream. All four
-        # must hold; otherwise fall through and refuse.
-        if (
+        # Conservative self-heal, two shapes — both demand a CLEAN tree and a
+        # resolvable deploy branch that tracks an upstream, and both reach the
+        # exact end state the human's ``git checkout <deploy> && git pull
+        # --ff-only`` produces, stranding nothing. Otherwise fall through and
+        # refuse.
+        #
+        #  (a) DETACHED HEAD whose commit is an ANCESTOR of the deploy upstream
+        #      — the review-leg-left-detached polluter. Containment is lineage:
+        #      the detached commit is reachable from the upstream.
+        #
+        #  (b) A NAMED local-only branch whose unique CONTENT is already on the
+        #      deploy upstream — a topic branch whose PR squash-merged, so its
+        #      commit is NOT an ancestor of the upstream (squash rewrites
+        #      history) yet every file it touched is byte-identical to main. The
+        #      branch is left in place (never deleted); we only switch off it.
+        #      A named branch carrying content NOT on main is genuine unmerged
+        #      work and still refuses.
+        can_self_heal = (
             not dirty
-            and current_branch is None
             and deploy is not None
-            and _git_head_is_ancestor_of(repo_root, deploy[1])
-        ):
-            deploy_branch, deploy_upstream = deploy
+            and (
+                (
+                    current_branch is None
+                    and _git_head_is_ancestor_of(repo_root, deploy[1])
+                )
+                or (
+                    current_branch is not None
+                    and _git_branch_content_is_contained_in(repo_root, deploy[1])
+                )
+            )
+        )
+        if can_self_heal:
+            deploy_branch, deploy_upstream = deploy  # type: ignore[misc]
+            # Audit the recovery so it is never a silent in-place mutation of a
+            # shared clone: a human reading the dispatcher log sees exactly what
+            # was switched off (a detached HEAD or a merged named branch) and
+            # onto, mirroring the two-command manual recovery.
+            _from = (
+                f"named branch {current_branch!r} (content already on "
+                f"{deploy_upstream})"
+                if current_branch is not None
+                else "detached HEAD (contained in upstream)"
+            )
+            _log.warning(
+                "kanban: self-healed deploy clone %s for task %s — switched "
+                "from %s onto %s and fast-forwarded to %s; the prior branch "
+                "was left in place, nothing discarded.",
+                repo_root, getattr(task, "id", "?"), _from, deploy_branch,
+                deploy_upstream,
+            )
             _git_reattach_ff_only(repo_root, deploy_branch, deploy_upstream)
         else:
             # Name the precondition that failed and the likely cause so the
@@ -11710,18 +11812,19 @@ def _resolve_dir_workspace(task: Task) -> Path:
                     "changes), which must never be auto-recovered — recover "
                     "the tree by hand first"
                 )
-            elif current_branch is not None:
-                why = (
-                    f"it is on the named local-only branch "
-                    f"{current_branch!r} with no upstream — a deliberate "
-                    f"state that is never auto-reattached; put it back on a "
-                    f"branch that tracks its upstream before dispatching"
-                )
             elif deploy is None:
                 why = (
                     "its deploy branch / upstream could not be resolved from "
                     "`refs/remotes/origin/HEAD` (no tracked default branch), "
                     "so a safe reattach target is unknown"
+                )
+            elif current_branch is not None:
+                why = (
+                    f"it is on the named local-only branch "
+                    f"{current_branch!r} whose content is NOT fully on the "
+                    f"deploy upstream {deploy[1]!r} — genuine unmerged work "
+                    f"that is never auto-abandoned; land or stash it, then put "
+                    f"the clone back on a branch that tracks its upstream"
                 )
             else:
                 why = (
