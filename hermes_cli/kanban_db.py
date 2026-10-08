@@ -3469,6 +3469,11 @@ def _review_pr_url(
 #: with a different default (e.g. a writing card -> ``perkins``) pass ``default``.
 DEFAULT_REVIEW_OWNER = "lamport"
 
+#: The default ready/author-lane owner for a card that carries no stamped owner
+#: map (legacy / CLI-created cards). ``code`` cards author in ``easley``; callers
+#: with a different default (e.g. a writing card -> ``lawrence``) pass ``default``.
+DEFAULT_READY_OWNER = "easley"
+
 
 def resolve_review_owner(
     conn: sqlite3.Connection, task_id: str, default: str = DEFAULT_REVIEW_OWNER
@@ -3491,6 +3496,29 @@ def resolve_review_owner(
     """
     try:
         owner = _review_owner_from_owner_map(conn, task_id)
+    except Exception:
+        return default
+    return owner or default
+
+
+def resolve_ready_owner(
+    conn: sqlite3.Connection, task_id: str, default: str = DEFAULT_READY_OWNER
+) -> str:
+    """Return the ready/author-lane owner for a card from its ``state_owners`` map.
+
+    The lane-reversed mirror of :func:`resolve_review_owner`. The ``ready``
+    lane's owner IS the card's implementing author — the identity a
+    CHANGES-REQUESTED bounce must route back to. Reading it from the stamped
+    map (code -> ``easley``, writing -> ``lawrence``) is authoritative and
+    shape-independent rather than a hardcoded name. Delegates to
+    :func:`_ready_owner_from_owner_map` so it honors the SAME
+    authoritative-comment precedence (intentional submit stamp or prose
+    ``Routing (owner map): {…}`` over the defaulted chokepoint stamp) every
+    other owner-map reader uses. Falls back to ``default`` (the code author)
+    only for a card that carries no owner map at all.
+    """
+    try:
+        owner = _ready_owner_from_owner_map(conn, task_id)
     except Exception:
         return default
     return owner or default
@@ -9716,6 +9744,121 @@ def submit_for_review(
             _append_event(
                 conn, task_id, "assigned",
                 {"from": prev_assignee, "to": reviewer, "by": "submit_for_review"},
+                run_id=run_id,
+            )
+    return True
+
+
+def request_changes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    author: str,
+    summary: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """MOVE a card in the review lane ``review``/``running`` -> ``ready`` + author.
+
+    The reviewer's sanctioned CHANGES-REQUESTED bounce — the inner-loop mirror
+    of :func:`submit_for_review`. On an edit-in-place (no-PR) card there is no
+    GitHub review-thread webhook to route a change request back to the author,
+    so without this seam a CHANGES-REQUESTED verdict parks the card ``blocked``
+    and every rework round costs an orchestrator hand-move. This verb MOVES the
+    *same* card back to the ``ready`` lane and assigns the ready/author owner
+    (resolved by the caller from the card's ``state_owners`` map via
+    :func:`resolve_ready_owner`), so the dispatcher re-spawns the author for the
+    next rework round with no human in the loop.
+
+    What it does, atomically, inside one ``write_txn`` (identical discipline to
+    ``submit_for_review``, lane-reversed):
+
+    * Guarded ``UPDATE ... WHERE id=? AND status IN ('review','running')`` — an
+      atomic check-and-set. A card that went terminal (or was already moved)
+      between the read and the write matches zero rows and is NOT moved
+      (returns ``False``), so a TOCTOU race can never drag a ``done`` card back.
+    * Clears ``claim_lock`` / ``claim_expires`` / ``worker_pid`` — REQUIRED, or
+      ``claim_task`` (which needs ``status='ready' AND claim_lock IS NULL``)
+      would never fire and the card would sit un-dispatched.
+    * Sets ``assignee`` to ``author`` (the ready-lane owner).
+    * Closes the reviewer's current run with a non-terminal ``handed_off``
+      outcome and emits ``status_changed`` + ``assigned`` events so the audit
+      trail is complete.
+
+    What it deliberately CANNOT do — the negative contract:
+
+    * It has NO code path to ``done`` or ``blocked``. Its only status target is
+      ``ready``; the guard forbids any other transition. A genuine needs-input
+      block (a question only a human can answer) still goes through
+      ``block_task`` — this verb is strictly the change-request bounce, which is
+      the board move, not a dead-end.
+    * It touches only the board row. It does not undraft, merge, or otherwise
+      touch any PR — this layer has no GitHub surface at all. The change-request
+      verdict comment on GitHub (PR cards) and the §9.1 audit comment are the
+      reviewer's / caller's deliverable, posted alongside this move.
+
+    ``author`` is the ready-lane owner; resolve it from the card's owner map
+    with :func:`resolve_ready_owner` so the card's OWN map (code -> easley,
+    writing -> lawrence) is honored rather than a hardcoded assignee.
+
+    Idempotency: a card already at ``ready`` with the same author is a no-op —
+    returns ``False``, writes nothing, emits no event. Returns ``False`` for an
+    unknown id or a card not in ``review``/``running``.
+    """
+    author_norm = _canonical_assignee(author)
+    if not author_norm:
+        raise ValueError("author is required")
+    author = author_norm
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        prev_status = row["status"]
+        prev_assignee = row["assignee"]
+        # Idempotent no-op: already bounced to this author.
+        if prev_status == "ready" and prev_assignee == author:
+            return False
+        # Atomic guard: only a card in the review lane (status 'review', or
+        # reviewer-held 'running') may bounce. The SET is a literal 'ready', and
+        # the WHERE forbids a terminal or out-of-lane card from matching — so
+        # reaching any status other than 'ready' is impossible.
+        params: tuple = (author, task_id)
+        run_guard = ""
+        if expected_run_id is not None:
+            run_guard = " AND current_run_id = ?"
+            params = (author, task_id, int(expected_run_id))
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'ready',
+                   assignee      = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND status IN ('review', 'running')
+            """ + run_guard,
+            params,
+        )
+        if cur.rowcount != 1:
+            # Not in a bounceable state (terminal, already ready/blocked, or a
+            # stale expected_run_id). No change, no event.
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="handed_off", status="handed_off",
+            summary=summary,
+        )
+        _append_event(
+            conn, task_id, "status_changed",
+            {"from": prev_status, "to": "ready", "by": "request_changes"},
+            run_id=run_id,
+        )
+        if prev_assignee != author:
+            _append_event(
+                conn, task_id, "assigned",
+                {"from": prev_assignee, "to": author, "by": "request_changes"},
                 run_id=run_id,
             )
     return True
