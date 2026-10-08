@@ -921,6 +921,73 @@ def _handle_submit_for_review(args: dict, **kw) -> str:
         return tool_error(f"kanban_submit_for_review: {e}")
 
 
+def _handle_request_changes(args: dict, **kw) -> str:
+    """Bounce the card under review back to the author with changes requested.
+
+    The reviewer's sanctioned CHANGES-REQUESTED verb — the inner-loop mirror of
+    ``kanban_submit_for_review``. It MOVEs the SAME card review -> ready and
+    assigns the author resolved from the card's ``state_owners`` ready lane (or
+    an explicit ``author`` override), so the dispatcher re-spawns the author for
+    the next rework round with no orchestrator hand-move. It never creates a
+    second card and never touches any PR (no undraft, no merge). Use this for a
+    change request; reserve ``kanban_block`` for a genuine needs-input question
+    only a human can answer.
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_request_changes")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    board = args.get("board")
+    author_arg = _normalize_profile(args.get("author"))
+    summary = args.get("summary")
+    if summary:
+        summary = redact_sensitive_text(str(summary), force=True)
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+            # Resolve the author: an explicit arg wins, else read the card's
+            # own state_owners["ready"] (code->easley, writing->lawrence),
+            # falling back to the code author default for un-stamped cards.
+            author = author_arg or kb.resolve_ready_owner(conn, tid)
+            ok = kb.request_changes(
+                conn, tid,
+                author=author,
+                summary=summary,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                landed = kb.get_task(conn, tid)
+                return tool_error(
+                    f"could not bounce {tid} to the author (status is "
+                    f"{landed.status if landed else 'unknown'!r}; the bounce "
+                    f"only moves a review/running card, and is a no-op if the "
+                    f"card is already ready for that author). Nothing was changed."
+                )
+            landed = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                status=landed.status if landed else "ready",
+                assignee=landed.assignee if landed else author,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_request_changes: {e}")
+    except Exception as e:
+        logger.exception("kanban_request_changes failed")
+        return tool_error(f"kanban_request_changes: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1994,6 +2061,53 @@ KANBAN_SUBMIT_FOR_REVIEW_SCHEMA = {
     },
 }
 
+KANBAN_REQUEST_CHANGES_SCHEMA = {
+    "name": "kanban_request_changes",
+    "description": (
+        "Bounce the card you are reviewing back to the author with changes "
+        "requested. This MOVES the SAME card from review to ready and assigns "
+        "the author from the card's owner map — the reviewer's sanctioned "
+        "CHANGES-REQUESTED verb, the inner-loop mirror of "
+        "kanban_submit_for_review. It routes the card back to the author for "
+        "rework with no orchestrator hand-move, and never creates a second "
+        "card. Use this for a change request — any blocking defect or remark "
+        "that sends the work back. It does NOT touch the PR (no undraft, no "
+        "merge) and it is NOT kanban_block: reserve kanban_block for a genuine "
+        "needs-input question that only a human can answer. Post your verdict "
+        "comment first (the §9.1 audit note / the PR review event), then call "
+        "this and end your run."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "author": {
+                "type": "string",
+                "description": (
+                    "Optional author profile override. Omit to use the card's "
+                    "own state_owners ready lane (code -> easley, writing -> "
+                    "lawrence); a legacy card with no owner map falls back to "
+                    "the code author."
+                ),
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "Optional 1-2 sentence note recorded on the run as you "
+                    "bounce (e.g. the gist of the change request). Put the "
+                    "full findings in a kanban_comment; this is just a short "
+                    "handoff line."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -2469,6 +2583,15 @@ registry.register(
     handler=_handle_submit_for_review,
     check_fn=_check_kanban_mode,
     emoji="🔎",
+)
+
+registry.register(
+    name="kanban_request_changes",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_CHANGES_SCHEMA,
+    handler=_handle_request_changes,
+    check_fn=_check_kanban_mode,
+    emoji="↩️",
 )
 
 registry.register(

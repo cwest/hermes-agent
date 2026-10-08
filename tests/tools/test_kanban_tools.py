@@ -59,6 +59,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_submit_for_review",
+        "kanban_request_changes",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -142,6 +143,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock", "kanban_reassign_origin",
         "kanban_submit_for_review",
+        "kanban_request_changes",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -926,6 +928,128 @@ def test_submit_for_review_cannot_set_done(worker_env):
     conn = kb.connect()
     try:
         assert kb.get_task(conn, worker_env).status == "review"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# kanban_request_changes — reviewer's sanctioned review->ready bounce (no-PR)
+# ---------------------------------------------------------------------------
+
+def test_request_changes_visible_in_worker_schema(monkeypatch, tmp_path):
+    """The bounce verb is a reviewer lifecycle tool — it must appear in the
+    dispatcher-spawned worker schema alongside submit_for_review."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # noqa: F401 ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert "kanban_request_changes" in names
+
+
+def test_request_changes_happy_path(worker_env):
+    """A reviewer-held card is MOVED back to ready + the author from the owner
+    map — the no-PR CHANGES-REQUESTED path, no second card."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        kb.add_comment(
+            conn, worker_env, "kanban",
+            "[audit] stage=submit\nnotes: state_owners={ready: test-worker, "
+            "review: lamport, blocked-acceptance: casey}",
+        )
+        before = len(kb.list_tasks(conn))
+    finally:
+        conn.close()
+
+    out = kt._handle_request_changes({})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["status"] == "ready"
+    assert d["assignee"] == "test-worker"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "ready"
+        assert task.assignee == "test-worker"
+        assert task.claim_lock is None
+        # The bounce MOVES the one card — it never creates a second.
+        assert len(kb.list_tasks(conn)) == before
+    finally:
+        conn.close()
+
+
+def test_request_changes_falls_back_to_default_author(worker_env):
+    """No owner map (legacy card) -> the default code author."""
+    from tools import kanban_tools as kt
+
+    out = kt._handle_request_changes({})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["assignee"] == "easley"
+
+
+def test_request_changes_explicit_author_override(worker_env):
+    """An explicit author arg wins over the resolved owner-map author."""
+    from tools import kanban_tools as kt
+
+    out = kt._handle_request_changes({"author": "baldwin"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["assignee"] == "baldwin"
+
+
+def test_request_changes_rejects_foreign_task(worker_env):
+    """A reviewer cannot bounce a task other than its own scoped one."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="not mine", assignee="peer", detached=True)
+    finally:
+        conn.close()
+
+    out = kt._handle_request_changes({"task_id": other})
+    assert "scoped to task" in json.loads(out).get("error", "")
+
+
+def test_request_changes_rejected_from_delegate_child(worker_env, monkeypatch):
+    """A delegate_task child is not a run owner and must not bounce."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_is_delegated_child_context", lambda: True)
+    out = kt._handle_request_changes({})
+    assert "delegate_task child" in json.loads(out).get("error", "")
+
+
+def test_request_changes_cannot_set_done_or_blocked(worker_env):
+    """NEGATIVE CONTROL: the tool exposes no way to reach done/merge/blocked.
+
+    Its schema carries no status/merge/undraft parameter, and after a call the
+    card is in ready — never done or blocked (a genuine needs-input block is a
+    separate verb)."""
+    from tools import kanban_tools as kt
+
+    props = kt.KANBAN_REQUEST_CHANGES_SCHEMA["parameters"]["properties"]
+    for forbidden in ("status", "merge", "undraft", "done", "kind", "reason"):
+        assert forbidden not in props
+
+    from hermes_cli import kanban_db as kb
+    kt._handle_request_changes({})
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "ready"
     finally:
         conn.close()
 

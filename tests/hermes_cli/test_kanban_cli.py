@@ -191,6 +191,47 @@ def test_run_slash_review_explicit_reviewer(kanban_home):
         assert kb.get_task(conn, tid).assignee == "perkins"
 
 
+def test_run_slash_request_changes_bounces_to_author(kanban_home):
+    """`kanban request-changes <id>` MOVEs a reviewer-held card back to ready +
+    the owner-map ready/author owner, clearing the claim so the author is
+    re-dispatched — the no-PR CHANGES-REQUESTED path, no second card."""
+    import re
+    out = kc.run_slash("create 'impl' --assignee easley --detached")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    with kb.connect() as conn:
+        kb.add_comment(
+            conn, tid, "kanban",
+            "[audit] stage=submit\nnotes: state_owners={ready: easley, "
+            "review: lamport, blocked-acceptance: casey}",
+        )
+    # Hand off to review, then the reviewer claims it (review -> running).
+    kc.run_slash(f"claim {tid}")
+    kc.run_slash(f"review {tid}")
+    with kb.connect() as conn:
+        kb.claim_review_task(conn, tid)
+    msg = kc.run_slash(f"request-changes {tid}")
+    assert "easley" in msg
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "ready"
+    assert task.assignee == "easley"
+    assert task.claim_lock is None
+
+
+def test_run_slash_request_changes_explicit_author(kanban_home):
+    import re
+    out = kc.run_slash("create 'impl' --assignee lamport --detached")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    # Put it into review, then bounce with an explicit author override.
+    kc.run_slash(f"claim {tid}")
+    kc.run_slash(f"review {tid} --reviewer lamport")
+    kc.run_slash(f"request-changes {tid} --author baldwin")
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "ready"
+    assert task.assignee == "baldwin"
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json --detached")
     payload = json.loads(out)

@@ -653,6 +653,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
+    p_request_changes = sub.add_parser(
+        "request-changes",
+        help="Bounce a reviewed card back to the author with changes requested (review -> ready)",
+    )
+    p_request_changes.add_argument("task_id")
+    p_request_changes.add_argument(
+        "--author",
+        default=None,
+        help=(
+            "Author profile override. Omit to use the card's own state_owners "
+            "ready lane (code -> easley, writing -> lawrence); a card with no "
+            "owner map falls back to the code author."
+        ),
+    )
+
     p_reconcile = sub.add_parser(
         "reconcile-acceptance",
         help="Walk a merged-PR acceptance card to done (missed github-pr-closed webhook recovery)",
@@ -2383,6 +2398,46 @@ def _cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_request_changes(args: argparse.Namespace) -> int:
+    """Bounce a reviewed card back to the author with changes requested.
+
+    The lane-reversed mirror of :func:`_cmd_review`. MOVEs the card
+    review -> ready and assigns the author, resolved from the card's
+    ``state_owners`` owner map unless ``--author`` overrides it. This is the
+    reviewer's sanctioned CHANGES-REQUESTED bounce for a no-PR card — it does
+    NOT block the card (block is for genuine needs-input) and does not touch
+    any PR.
+    """
+    author_arg = getattr(args, "author", None)
+    if author_arg and author_arg.lower() in {"none", "-", "null"}:
+        author_arg = None
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            print(
+                f"cannot request-changes {args.task_id}: unknown task",
+                file=sys.stderr,
+            )
+            return 1
+        author = author_arg or kb.resolve_ready_owner(conn, args.task_id)
+        if not kb.request_changes(
+            conn,
+            args.task_id,
+            author=author,
+            expected_run_id=_worker_run_id_for(args.task_id),
+        ):
+            landed = kb.get_task(conn, args.task_id)
+            print(
+                f"cannot request-changes on {args.task_id} "
+                f"(status is {landed.status if landed else 'unknown'!r}; "
+                f"only a card in the review lane can be bounced)",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{args.task_id} → ready (author: {author})")
+    return 0
+
+
 def _cmd_reconcile_acceptance(args: argparse.Namespace) -> int:
     """Walk a merged-PR acceptance card to ``done`` — missed-webhook recovery.
 
@@ -3476,6 +3531,7 @@ _HANDLERS = {
     "edit":     _cmd_edit,
     "block":    _cmd_block,
     "review":   _cmd_review,
+    "request-changes": _cmd_request_changes,
     "reconcile-acceptance": _cmd_reconcile_acceptance,
     "schedule": _cmd_schedule,
     "unblock":  _cmd_unblock,
