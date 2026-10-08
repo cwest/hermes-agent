@@ -4260,6 +4260,195 @@ def test_resolve_review_owner_falls_back_when_unstamped(kanban_home):
         assert kb.resolve_review_owner(conn, t, default="custom") == "custom"
 
 
+# ---------------------------------------------------------------------------
+# resolve_ready_owner — read the ready/author lane from the state_owners map
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_ready_owner_reads_stamped_map(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="c", assignee="lamport")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        assert kb.resolve_ready_owner(conn, t) == "easley"
+
+
+def test_resolve_ready_owner_honors_non_default_author(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="w", assignee="perkins")
+        _stamp_owner_map(conn, t, "ready: baldwin, review: perkins, blocked-acceptance: casey")
+        assert kb.resolve_ready_owner(conn, t) == "baldwin"
+
+
+def test_resolve_ready_owner_falls_back_when_unstamped(kanban_home):
+    """A legacy / CLI-created card with no owner map falls back to the default."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="c", assignee="easley")
+        assert kb.resolve_ready_owner(conn, t) == kb.DEFAULT_READY_OWNER
+        assert kb.resolve_ready_owner(conn, t, default="custom") == "custom"
+
+
+# ---------------------------------------------------------------------------
+# request_changes — the reviewer's sanctioned review/running->ready bounce verb
+# ---------------------------------------------------------------------------
+
+
+def _claim_review(conn, task_id):
+    """Test helper: put a card into review then claim it running, like the
+    dispatcher spawning the reviewer (review -> running, reviewer-held)."""
+    _set_task_status(conn, task_id, "review")
+    return kb.claim_review_task(conn, task_id)
+
+
+def test_request_changes_moves_running_review_to_ready(kanban_home):
+    """A reviewer-held (running, claimed-from-review) card MOVES back to ready
+    + its state_owners ready/author owner, and the claim is cleared so the
+    dispatcher re-spawns the author."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        claimed = _claim_review(conn, t)
+        assert claimed is not None and claimed.status == "running"
+
+        ok = kb.request_changes(conn, t, author="easley")
+        assert ok is True
+
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.assignee == "easley"
+        # The reviewer's claim MUST be cleared, else claim_task never fires.
+        assert task.claim_lock is None
+        # The dispatcher's ready claim now succeeds on the bounced card.
+        reclaimed = kb.claim_task(conn, t)
+        assert reclaimed is not None
+        assert reclaimed.status == "running"
+
+
+def test_request_changes_moves_review_to_ready(kanban_home):
+    """An unclaimed review card (reviewer not yet spawned) also bounces to
+    ready + author — the verb accepts both review and running (reviewer-held)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley")
+        _stamp_owner_map(conn, t, "ready: easley, review: lamport, blocked-acceptance: casey")
+        _set_task_status(conn, t, "review")
+        assert kb.request_changes(conn, t, author="easley") is True
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.assignee == "easley"
+
+
+def test_request_changes_emits_status_and_assigned_events(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="lamport")
+        _claim_review(conn, t)
+        kb.request_changes(conn, t, author="easley")
+        events = [e.kind for e in kb.list_events(conn, t)]
+    assert "status_changed" in events
+    assert "assigned" in events
+
+
+def test_request_changes_ends_the_review_run(kanban_home):
+    """The reviewer's run is closed on bounce — it does not stay 'running'."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="lamport")
+        _claim_review(conn, t)
+        kb.request_changes(conn, t, author="easley")
+        task = kb.get_task(conn, t)
+        assert task.current_run_id is None
+        runs = kb.list_runs(conn, t)
+    # The reviewer run closed with a non-terminal bounce outcome.
+    assert runs and runs[-1].ended_at is not None
+    assert runs[-1].outcome != "completed"
+
+
+def test_request_changes_does_not_create_a_second_card(kanban_home):
+    """Done-when: the bounce MOVES the one card — never creates a second."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley")
+        before = len(kb.list_tasks(conn))
+        _claim_review(conn, t)
+        kb.request_changes(conn, t, author="easley")
+        after = len(kb.list_tasks(conn))
+    assert after == before
+
+
+def test_request_changes_is_idempotent_noop(kanban_home):
+    """A second identical call is a no-op (already at target ready/author)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley")
+        _claim_review(conn, t)
+        assert kb.request_changes(conn, t, author="easley") is True
+        # Card is now ready/easley, unclaimed — a repeat converges, no error.
+        assert kb.request_changes(conn, t, author="easley") is False
+
+
+def test_request_changes_refuses_terminal_card(kanban_home):
+    """A done/archived card cannot be dragged back to ready."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="already done", assignee="easley")
+        _set_task_status(conn, t, "done")
+        assert kb.request_changes(conn, t, author="easley") is False
+        assert kb.get_task(conn, t).status == "done"
+
+
+@pytest.mark.parametrize(
+    "status", ["done", "ready", "blocked", "triage", "todo", "scheduled", "archived"]
+)
+def test_request_changes_refuses_every_non_bounceable_status(kanban_home, status):
+    """NEGATIVE CONTROL (the guard): the bounce verb can ONLY act on a card in
+    the review lane ('review' or reviewer-held 'running'). For every other
+    status the call returns False and leaves the row untouched (status AND
+    assignee unchanged). A settled card holds no claim, so the status clause is
+    the sole guard being measured — widening the SQL ``WHERE status IN
+    ('review','running')`` to admit these MUST turn the parametrization RED."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="settled card", assignee="lamport")
+        _set_task_status(conn, t, status)
+        before = kb.get_task(conn, t)
+        assert before is not None
+        assert before.claim_lock is None
+        assert before.claim_expires is None
+        assert before.worker_pid is None
+        assert before.current_run_id is None
+
+        # author != current assignee so a 'ready' card exercises the guard's
+        # rowcount=0 path, not the idempotent already-at-target no-op.
+        assert kb.request_changes(conn, t, author="easley") is False
+
+        after = kb.get_task(conn, t)
+        assert after is not None
+        assert after.status == status
+        assert after.assignee == before.assignee
+
+
+def test_request_changes_only_target_is_ready(kanban_home):
+    """NEGATIVE CONTROL (positive half): the only status the verb can ever
+    produce is 'ready' — never 'done' or back to 'review'."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley")
+        _claim_review(conn, t)
+        assert kb.request_changes(conn, t, author="easley") is True
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_request_changes_refuses_unknown_task(kanban_home):
+    with kb.connect() as conn:
+        assert kb.request_changes(conn, "t_doesnotexist", author="easley") is False
+
+
+def test_request_changes_defaults_author_from_owner_map(kanban_home):
+    """The author is resolved from the card's own owner map (never hardcoded):
+    a writing card's ready owner (baldwin) wins over the default."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="lamport")
+        _stamp_owner_map(conn, t, "ready: baldwin, review: perkins, blocked-acceptance: casey")
+        author = kb.resolve_ready_owner(conn, t)
+        _claim_review(conn, t)
+        assert kb.request_changes(conn, t, author=author) is True
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.assignee == "baldwin"
+
+
 def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
     """dispatch_once dry-run sees review tasks and reports them as spawned."""
     with kb.connect() as conn:

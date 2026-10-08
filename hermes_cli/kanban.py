@@ -638,6 +638,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
+    p_request_changes = sub.add_parser(
+        "request-changes",
+        help="Bounce a reviewed card back to the author with changes requested (review -> ready)",
+    )
+    p_request_changes.add_argument("task_id")
+    p_request_changes.add_argument(
+        "--author",
+        default=None,
+        help=(
+            "Author profile override. Omit to use the card's own state_owners "
+            "ready lane (code -> easley, writing -> lawrence); a card with no "
+            "owner map falls back to the code author."
+        ),
+    )
+
     p_unblock = sub.add_parser(
         "unblock",
         help="Return blocked/scheduled tasks to ready, or todo while parents remain open",
@@ -1058,6 +1073,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "review":   _cmd_review,
+            "request-changes": _cmd_request_changes,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
@@ -2318,6 +2334,46 @@ def _cmd_review(args: argparse.Namespace) -> int:
             )
             return 1
         print(f"{args.task_id} → review (reviewer: {reviewer})")
+    return 0
+
+
+def _cmd_request_changes(args: argparse.Namespace) -> int:
+    """Bounce a reviewed card back to the author with changes requested.
+
+    The reviewer's CHANGES-REQUESTED verb: MOVEs the card review -> ready and
+    assigns the author, resolved from the card's ``state_owners`` ready lane
+    unless ``--author`` overrides it. This is the no-PR counterpart to the
+    PR-review webhook — it routes the SAME card back to the author for rework
+    with no orchestrator hand-move, and never creates a second card. A genuine
+    needs-input question (only a human can answer) still uses ``block``.
+    """
+    author_arg = getattr(args, "author", None)
+    if author_arg and author_arg.lower() in {"none", "-", "null"}:
+        author_arg = None
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            print(
+                f"cannot request-changes {args.task_id}: unknown task",
+                file=sys.stderr,
+            )
+            return 1
+        author = author_arg or kb.resolve_ready_owner(conn, args.task_id)
+        if not kb.request_changes(
+            conn,
+            args.task_id,
+            author=author,
+            expected_run_id=_worker_run_id_for(args.task_id),
+        ):
+            landed = kb.get_task(conn, args.task_id)
+            print(
+                f"cannot bounce {args.task_id} to the author "
+                f"(status is {landed.status if landed else 'unknown'!r}; only a "
+                f"review/running card can have changes requested)",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{args.task_id} → ready (author: {author}, changes requested)")
     return 0
 
 
