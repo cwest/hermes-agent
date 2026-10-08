@@ -263,6 +263,11 @@ def test_dir_non_edit_in_place_repo_root_still_guards(kanban_home, tmp_path):
     """The default-branch/upstream guard still fires for a NON-edit-in-place clone."""
     repo = _make_repo_at(tmp_path / "office", "office")
     _git(repo, "checkout", "-b", "topic/leftover")  # local-only, no upstream
+    # Carry genuine unmerged content so the clone cannot self-heal — the guard
+    # must still fire for a non-edit-in-place repo (the carve-out is NOT applied).
+    (repo / "unmerged.txt").write_text("not on main\n", encoding="utf-8")
+    _git(repo, "add", "unmerged.txt")
+    _git(repo, "commit", "-m", "unmerged work")
 
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -273,7 +278,7 @@ def test_dir_non_edit_in_place_repo_root_still_guards(kanban_home, tmp_path):
         )
         task = kb.get_task(conn, tid)
 
-    with pytest.raises(RuntimeError, match="cannot .*fast-forward|does not track an upstream"):
+    with pytest.raises(RuntimeError, match="cannot .*fast-forward|named local-only branch"):
         kb.resolve_workspace(task)
 
 
