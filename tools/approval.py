@@ -580,6 +580,42 @@ def _segment_words(command: str, start: int, limit: int = 32):
         count += 1
 
 
+_SELF_MERGE_GH_VALUE_FLAGS = ("-r", "--repo")
+
+
+def _gh_positional_words(rest: list) -> list:
+    """Reduce a gh argv tail to its POSITIONAL (non-flag) words, in order.
+
+    ``gh`` accepts repo/global flags before, between, or after the ``pr`` and
+    ``merge``/``ready`` subcommand tokens — ``gh --repo X pr merge``,
+    ``gh pr --repo X merge``, ``gh pr merge --squash`` all reach the real merge.
+    A positional-only reduction lets the verb match key on gh's actual grammar
+    (command then subcommand) instead of a brittle argv 0/1 anchor:
+
+    - drop any ``-``-prefixed token (``--squash``, ``-d``, ``--repo=X`` joined);
+    - a bare ``-R`` / ``--repo`` consumes its following value token too, so the
+      value (``cwest/knowledge-base``) is never mistaken for a positional.
+
+    ``rest`` is already lowercased by the caller.
+    """
+    positional = []
+    i = 0
+    n = len(rest)
+    while i < n:
+        word = rest[i]
+        if word in _SELF_MERGE_GH_VALUE_FLAGS:
+            # a bare value-taking flag swallows its separate value token
+            i += 2
+            continue
+        if word.startswith("-"):
+            # any other flag, incl. joined ``--repo=<val>`` — not positional
+            i += 1
+            continue
+        positional.append(word)
+        i += 1
+    return positional
+
+
 def detect_self_merge_sidedoor(command: str) -> tuple:
     """Detect a KB self-merge side door via command-start-aware segmentation.
 
@@ -633,14 +669,14 @@ def detect_self_merge_sidedoor(command: str) -> tuple:
             if not _is_path_qualified_gh(executable):
                 continue
             # The executable IS a path-qualified gh — does it run pr merge/ready?
-            rest = [w.lower() for w in words[idx + 1:]]
-            for verb_a, verb_b in _SELF_MERGE_GH_VERBS:
-                if (
-                    len(rest) >= 2
-                    and rest[0] == verb_a
-                    and rest[1] == verb_b
-                ):
-                    return (True, _SELF_MERGE_SIDEDOOR_DESCRIPTION)
+            # gh accepts repo/global flags before, between, or after the two
+            # subcommand tokens, so key on the POSITIONAL (non-flag) words in
+            # order — the first two must be ``pr`` then ``merge``/``ready`` — not
+            # a brittle argv 0/1 anchor that leaks ``gh --repo X pr merge`` and
+            # ``gh pr --repo X merge``.
+            positional = _gh_positional_words([w.lower() for w in words[idx + 1:]])
+            if len(positional) >= 2 and (positional[0], positional[1]) in _SELF_MERGE_GH_VERBS:
+                return (True, _SELF_MERGE_SIDEDOOR_DESCRIPTION)
     return (False, None)
 
 

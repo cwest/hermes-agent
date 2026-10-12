@@ -73,6 +73,28 @@ _BLOCKED_SIDEDOOR = [
     f"../bin/gh {_MERGE} 99999 --squash",
     # path-qualified gh after a pipe
     f"true | {_GH} {_MERGE} 99999 --squash",
+    # --- repo flag BEFORE the subcommand tokens: gh accepts global/repo flags
+    #     ahead of `pr merge`, and those forms reach the real merge, so the match
+    #     must find the pr -> merge/ready subsequence among the non-flag words
+    #     rather than anchoring at argv 0/1 (otherwise these leak). ------------
+    f"{_GH} --repo {_KB} {_MERGE} 584 --squash",
+    f"{_GH} -R {_KB} {_MERGE} 584 --squash",
+    f"{_GH} --repo={_KB} {_MERGE} 584",
+    f"{_GH} --repo {_KB} {_READY} 584",
+    # --- repo flag BETWEEN `pr` and `merge`/`ready` (gh also parses this): ----
+    f"{_GH} pr --repo {_KB} merge 584 --squash",
+    f"{_GH} pr -R {_KB} merge 584 --squash",
+    f"{_GH} pr --repo={_KB} merge 584",
+    f"{_GH} pr -R {_KB} ready 584",
+    # --- short -R joined value forms real gh accepts (-R=val and -Rval): ------
+    f"{_GH} -R={_KB} {_MERGE} 584",
+    f"{_GH} -R{_KB} {_MERGE} 584",
+    f"{_GH} pr -R={_KB} merge 584",
+    f"{_GH} pr -R{_KB} merge 584",
+    # --- a boolean flag interleaved before the subcommand split: --------------
+    f"{_GH} --repo {_KB} --squash {_MERGE} 584",
+    # --- flag before AND the pr/verb split, cwd-inferred (no repo flag): ------
+    f"{_GH} pr merge --squash 584",
 ]
 
 # The hand-set sentinel: forging the env var the shim trusts, inline or exported.
@@ -111,6 +133,11 @@ _ALLOWED = [
     f"gh pr list --repo {_KB}",
     f"{_GH} pr view 584 --repo {_KB}",
     f"{_GH} pr list",
+    # read-only gh with the repo flag interleaved before/between the subcommand
+    # tokens — the positional reduction must not misread `view`/`list` as a verb
+    f"{_GH} --repo {_KB} pr view 584",
+    f"{_GH} pr --repo {_KB} view 584",
+    f"{_GH} -R {_KB} pr list",
     f"gh pr create --repo cwest/okfctl --title x --body y",
     # unrelated commands
     "ls -la",
