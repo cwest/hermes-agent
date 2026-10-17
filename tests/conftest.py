@@ -792,6 +792,50 @@ def _live_system_guard(request, monkeypatch):
             tokens = cmd_str.split()
         return any(verb in tokens for verb in _MUTATING_VERBS)
 
+    # Audio players and TTS binaries. A test that shells out to one of these
+    # makes the developer's machine emit SOUND. Casey heard TTS tests from
+    # another room (2026-08-12) while a suite ran in a background worktree.
+    #
+    # Muting the Mac is a workaround: the next run on an unmuted machine
+    # regresses, and CI/other contributors get no protection at all. The real
+    # defect is that `tools.voice_mode.play_audio_file` shells out to a real
+    # system player and nothing stopped it under pytest. Fix it at the source.
+    _AUDIO_PLAYERS = {
+        "afplay",      # macOS audio player
+        "say",         # macOS TTS -> straight to the speakers
+        "ffplay",      # cross-platform
+        "aplay",       # ALSA
+        "paplay",      # PulseAudio
+        "mpg123",
+        "mpv",
+        "vlc",
+        "cvlc",
+        "espeak",      # Linux TTS
+        "spd-say",     # speech-dispatcher
+        "powershell",  # Windows: often used for SoundPlayer/SAPI
+    }
+
+    def _is_audio_player(cmd) -> bool:
+        cmd_str = _cmd_to_string(cmd)
+        try:
+            tokens = _shlex.split(cmd_str)
+        except ValueError:
+            tokens = cmd_str.split()
+        if not tokens:
+            return False
+        head = tokens[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if head in _AUDIO_PLAYERS:
+            # powershell is only audio when it is actually making sound;
+            # blocking it wholesale would break unrelated Windows tests.
+            if head == "powershell":
+                low = cmd_str.lower()
+                return any(
+                    k in low
+                    for k in ("soundplayer", "sapi", "speak", "media.play")
+                )
+            return True
+        return False
+
     def _is_process_killer(cmd) -> bool:
         cmd_str = _cmd_to_string(cmd)
         try:
@@ -816,6 +860,13 @@ def _live_system_guard(request, monkeypatch):
         return False
 
     def _check_subprocess_cmd(name, cmd):
+        if _is_audio_player(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: audio playback is "
+                f"blocked in tests — subprocess.{name}({cmd!r}) would make "
+                "the developer's machine emit sound. Mock the player (or "
+                "tools.voice_mode.play_audio_file) instead of shelling out."
+            )
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
