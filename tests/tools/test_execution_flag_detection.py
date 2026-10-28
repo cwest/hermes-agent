@@ -11,6 +11,32 @@ import pytest
 from tools.approval import detect_dangerous_command, detect_hardline_command
 
 
+def _sort_is_gnu_coreutils():
+    """True only when the host `sort` is GNU coreutils.
+
+    The `sort --compress-program <prog>` payload-execution case relies on a
+    behavior unique to GNU coreutils' `sort`: when the input spills past the
+    in-memory buffer, GNU sort spawns `--compress-program` to compress each
+    temp-file chunk, so a `-payload-marker` program on PATH actually runs.
+    Non-GNU implementations differ: uutils coreutils (the Rust rewrite shipped
+    as `/usr/bin/sort` on ubuntu-25.10+/26.04 runners) rejects the combined
+    `--compress-program -payload-marker` at clap argument-parse time and exits
+    before any spill, and BSD `sort` (macOS) does not support the flag pair at
+    all. In both cases the marker is never written and the assertion would get a
+    spurious FileNotFoundError, so the case is skipped there.
+    """
+    sort_path = shutil.which("sort")
+    if sort_path is None:
+        return False
+    try:
+        completed = subprocess.run(
+            [sort_path, "--version"], text=True, capture_output=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "GNU coreutils" in (completed.stdout or "")
+
+
 @pytest.mark.parametrize(
     ("argv", "stdin", "expected_returncode", "expected_output"),
     [
@@ -49,6 +75,11 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    if tool == "sort" and not _sort_is_gnu_coreutils():
+        pytest.skip(
+            "sort --compress-program only spawns the spill compressor on GNU "
+            "coreutils; host sort is non-GNU (uutils/BSD), so the payload never runs"
+        )
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
