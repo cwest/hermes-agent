@@ -3246,6 +3246,46 @@ def test_unblock_with_pending_parents_goes_to_todo(kanban_home):
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_unblock_with_all_parents_terminal_goes_to_ready(kanban_home):
+    """unblock_task must land in 'ready' when every parent is terminal.
+
+    A card blocked (e.g. a worker/operator kanban_block) whose parents are
+    all done OR archived has nothing left gating it. Landing it in 'todo'
+    (treating an archived parent as still-live) leaves it undispatched; it
+    belongs in 'ready', the same lane recompute_ready/promote would choose.
+    Archived parents must be treated as terminal, matching the live-parent
+    predicate in recompute_ready and claim_task.
+    """
+    with kb.connect() as conn:
+        done_parent = kb.create_task(
+            conn, title="done parent", assignee="a", detached=True,
+        )
+        archived_parent = kb.create_task(
+            conn, title="archived parent", assignee="a", detached=True,
+        )
+        child = kb.create_task(
+            conn, title="child", assignee="a",
+            parents=[done_parent, archived_parent], detached=True,
+        )
+        # Drive one parent to 'done' and the other to 'archived'.
+        kb.claim_task(conn, done_parent)
+        kb.complete_task(conn, done_parent, result="ok")
+        assert kb.archive_task(conn, archived_parent)
+        assert kb.get_task(conn, archived_parent).status == "archived"
+        # Block the child (simulates an operator/worker kanban_block).
+        conn.execute(
+            "UPDATE tasks SET status='blocked' WHERE id=?", (child,),
+        )
+        conn.commit()
+        # Unblock: with no live parent, the card is ready to dispatch.
+        assert kb.unblock_task(conn, child)
+        assert kb.get_task(conn, child).status == "ready"
+        # And the dispatcher can actually claim it.
+        claimed = kb.claim_task(conn, child)
+        assert claimed is not None
+        assert kb.get_task(conn, child).status == "running"
+
+
 def test_unblock_without_parents_goes_to_ready(kanban_home):
     """Parent-free unblock still produces 'ready' (behavior preserved)."""
     with kb.connect() as conn:
