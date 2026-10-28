@@ -10119,13 +10119,18 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # Re-gate on parent completion before flipping 'blocked' back to
         # 'ready'. Unconditionally setting status='ready' here bypasses the
         # parent-completion invariant (the dispatcher trusts that column);
-        # if parents are still in progress the task must wait in 'todo'
-        # until recompute_ready picks it up. RCA: Bug 2 at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        # if a parent is still live the task must wait in 'todo' until
+        # recompute_ready picks it up. "Live" means non-terminal: a parent
+        # that is 'done' OR 'archived' no longer gates the child (an archived
+        # parent is terminal — it will never complete, so leaving the child in
+        # 'todo' strands it undispatched). This predicate must match the
+        # live-parent test in recompute_ready / claim_task
+        # (``status NOT IN ('done', 'archived')``) so the three never disagree.
+        # RCA: Bug 2 at kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
