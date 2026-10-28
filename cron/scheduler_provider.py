@@ -83,10 +83,17 @@ class CronScheduler(ABC):
         return None
 
     def recover_interrupted(self) -> int:
-        """Run profile-local attempt recovery for every provider lifecycle."""
-        from cron.executions import recover_interrupted_executions
+        """Run profile-local attempt recovery for every provider lifecycle.
 
-        return recover_interrupted_executions()
+        Routes through the RESILIENT recovery entry point so a corrupt
+        ``executions.db`` cannot kill the scheduler thread: the store is
+        quarantined and recreated, and scheduling continues. Returns the number
+        of interrupted attempts classified (0 when the store was corrupt and had
+        to be recreated).
+        """
+        from cron.executions import recover_interrupted_executions_resilient
+
+        return int(recover_interrupted_executions_resilient().get("recovered", 0))
 
     def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
@@ -213,11 +220,22 @@ class InProcessCronScheduler(CronScheduler):
             return
 
         # ── Single-profile (legacy) path ──────────────────────────────────
-        recovered = self.recover_interrupted()
-        if recovered:
-            logger.warning(
-                "Marked %d interrupted cron execution(s) unknown after restart",
-                recovered,
+        # Startup recovery must NEVER kill the ticker thread. recover_interrupted
+        # already routes through the resilient (quarantine-and-recreate) path for
+        # a corrupt executions.db; this outer guard is belt-and-suspenders so any
+        # other unexpected startup error still leaves the loop scheduling instead
+        # of silently dying (the ~20-day freeze this fix targets).
+        try:
+            recovered = self.recover_interrupted()
+            if recovered:
+                logger.warning(
+                    "Marked %d interrupted cron execution(s) unknown after restart",
+                    recovered,
+                )
+        except BaseException as e:  # noqa: BLE001 — must not kill the thread
+            logger.error(
+                "Cron startup recovery failed (%s); scheduling continues anyway",
+                e, exc_info=True,
             )
         # Heartbeat once before the first sleep so `hermes cron status` sees a
         # live ticker immediately after startup, not only after the first tick.
@@ -295,7 +313,11 @@ class InProcessCronScheduler(CronScheduler):
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
 
-        # Recovery + initial heartbeat for every profile.
+        # Recovery + initial heartbeat for every profile. A failure in one
+        # profile's recovery must not kill the whole ticker thread or skip the
+        # remaining profiles: recover_interrupted is resilient to a corrupt
+        # executions.db, and this guard catches anything else so scheduling
+        # continues for every profile (the ~20-day freeze this fix targets).
         for entry in profile_homes:
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
@@ -309,6 +331,12 @@ class InProcessCronScheduler(CronScheduler):
                             home,
                         )
                     record_ticker_heartbeat()
+            except BaseException as e:  # noqa: BLE001 — must not kill the thread
+                logger.error(
+                    "Cron startup recovery failed for profile at %s (%s); "
+                    "scheduling continues anyway",
+                    home, e, exc_info=True,
+                )
             finally:
                 reset_hermes_home_override(home_token)
 

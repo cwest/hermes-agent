@@ -111,6 +111,93 @@ def test_quick_backup_includes_execution_ledger():
     assert "cron/executions.db" in _QUICK_STATE_FILES
 
 
+def test_ledger_uses_delete_journal_mode_never_wal(monkeypatch, tmp_path):
+    """The execution ledger must never run in WAL mode.
+
+    Root cause of the recurring executions.db corruption (#third-recurrence):
+    every quarantined corrupt copy was WAL-mode (header byte 18/19 == 2) while
+    the only never-corrupted file is DELETE-mode. The torn-WAL / WAL-reset
+    b-tree corruption class (``Rowid out of order``, ``2nd reference to
+    page``) only reaches a WAL DB, and the home backup excludes the ``.db-wal``
+    sidecar so a stale main-file restore over a live WAL tears the page tree.
+    This ledger is a tiny, synchronous=FULL, single-writer-dominant audit
+    store that gains nothing from WAL — pin it to DELETE unconditionally.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.create_execution("mode-check", source="builtin")
+
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() == "delete", f"ledger must be DELETE-mode, got {mode!r}"
+
+    # Header read/write version bytes 18 & 19: 1 == rollback-journal, 2 == WAL.
+    head = executions.EXECUTIONS_FILE.read_bytes()[:20]
+    assert head[18] == 1 and head[19] == 1, (
+        f"on-disk header reports WAL (bytes 18/19={head[18]}/{head[19]}); "
+        "the ledger must be a rollback-journal file"
+    )
+
+
+def test_legacy_wal_ledger_is_downgraded_to_delete_on_open(monkeypatch, tmp_path):
+    """A pre-existing WAL-mode executions.db (created by an older build) must
+    be downgraded to DELETE on the next open, retiring the corruption class for
+    legacy files instead of leaving them exposed forever."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Seed a WAL-mode DB with the real schema the way an old build left it.
+    seed = sqlite3.connect(executions.EXECUTIONS_FILE)
+    seed.execute("PRAGMA journal_mode=WAL")
+    assert seed.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    seed.close()
+
+    # Any normal ledger operation re-opens and must leave the file in DELETE.
+    executions.list_executions(limit=1)
+
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() == "delete", f"legacy WAL file not downgraded, got {mode!r}"
+
+
+def test_resilient_recovery_quarantines_corrupt_store_and_recreates(monkeypatch, tmp_path):
+    """The scheduler-startup recovery entry point survives a corrupt store:
+    it quarantines the bad file as ``.corrupt-<ts>``, recreates an empty
+    schema, and returns so the scheduler keeps running. The raw
+    ``recover_interrupted_executions`` keeps its fail-closed contract; this
+    resilient wrapper is what the provider lifecycle calls."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    executions.EXECUTIONS_FILE.write_bytes(b"not a sqlite database at all")
+
+    # Must NOT raise — this is the whole point of the resilient path.
+    result = executions.recover_interrupted_executions_resilient()
+    assert result["quarantined"] is True
+    quarantined = Path(result["quarantined_path"])
+    assert quarantined.exists()
+    assert ".corrupt-" in quarantined.name
+    assert quarantined.read_bytes() == b"not a sqlite database at all"
+
+    # A fresh, usable schema now exists in place.
+    record = executions.create_execution("post-recovery", source="builtin")
+    assert record["status"] == "claimed"
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+
+
+def test_resilient_recovery_is_passthrough_on_healthy_store(monkeypatch, tmp_path):
+    """On a healthy store the resilient wrapper quarantines nothing and returns
+    the same recovery count the raw function would."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("healthy", source="builtin")
+    executions.mark_execution_running(record["id"])
+
+    result = executions.recover_interrupted_executions_resilient()
+    assert result["quarantined"] is False
+    assert result["quarantined_path"] is None
+    # Live same-process execution is not swept.
+    assert result["recovered"] == 0
+    assert executions.latest_execution("healthy")["status"] == "running"
+
+
 def test_failed_execution_keeps_error(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
 
