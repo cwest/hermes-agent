@@ -790,6 +790,217 @@ def test_dangling_claim_on_nonrunning_card_is_released(
         assert spawnable is not None
 
 
+def test_lane_exit_release_closes_the_open_run_row(
+    kanban_home, monkeypatch,
+):
+    """A leaked lane-exit claim released on a dead worker must ALSO close the
+    worker's still-open run row — a run must never outlive its lane.
+
+    Regression for the ~400 ``status=running`` ``task_runs`` rows left with a
+    dead ``worker_pid`` and ``ended_at IS NULL`` on done/archived/review cards.
+    When the ``github-prs`` webhook MOVEs a card ``running -> review`` the
+    author's claim leaks AND the author's run row stays ``status='running'``,
+    ``ended_at=NULL`` — the lane-exit release used to clear only the claim,
+    leaving the run open forever. ``hermes kanban show`` then reports a phantom
+    "running @<author> active" run beside the real one, and any liveness/stall
+    logic reading ``task_runs`` sees a false active worker. The release path
+    must terminate the run (``ended_at`` set, terminal status/outcome) in the
+    same transaction, so the invariant "an open run belongs only to a running
+    card" holds.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a", detached=True)
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+        # The claim opened a run; capture it so we can assert it gets closed.
+        open_run_id = kb.get_task(conn, t).current_run_id
+        assert open_run_id is not None
+        run_before = conn.execute(
+            "SELECT status, ended_at FROM task_runs WHERE id = ?",
+            (open_run_id,),
+        ).fetchone()
+        assert run_before["status"] == "running"
+        assert run_before["ended_at"] is None
+
+        now = int(time.time())
+        conn.execute(
+            # Webhook MOVEd the card to review but left the author's claim +
+            # run attached. claim_expires still in the FUTURE — a lane-exit
+            # leak, not a TTL-stale claim.
+            "UPDATE tasks SET status = 'review', assignee = 'lamport', "
+            "claim_expires = ? WHERE id = ?",
+            (now + 3600, t),
+        )
+        # Author process has exited, so the leaked claim points at a DEAD PID
+        # and falls through to the release.
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+
+        # The run row is now CLOSED: ended_at set, a terminal status/outcome,
+        # and its own claim state cleared. A run never outlives its lane.
+        run_after = conn.execute(
+            "SELECT status, outcome, ended_at, worker_pid, claim_lock "
+            "FROM task_runs WHERE id = ?",
+            (open_run_id,),
+        ).fetchone()
+        assert run_after["ended_at"] is not None
+        assert run_after["status"] != "running"
+        assert run_after["outcome"] is not None
+        assert run_after["worker_pid"] is None
+        assert run_after["claim_lock"] is None
+
+        # And the task no longer points at the now-closed run — the next lane's
+        # spawn opens a fresh run instead of inheriting a dead one.
+        assert kb.get_task(conn, t).current_run_id is None
+
+        # Not a single ``status=running`` run row with a dead pid remains.
+        orphans = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_runs "
+            "WHERE task_id = ? AND status = 'running' AND ended_at IS NULL",
+            (t,),
+        ).fetchone()
+        assert orphans["n"] == 0
+
+
+def test_reconcile_dead_running_runs_dry_run_then_apply(
+    kanban_home, monkeypatch,
+):
+    """The one-shot reconcile closes every ``status=running`` run row with a
+    dead pid, keeps the one genuinely-live run, is read-only in dry-run, and is
+    idempotent.
+
+    Models the live board rot: ~400 ``task_runs`` rows stuck
+    ``status='running'`` / ``ended_at IS NULL`` on cards whose worker is long
+    dead, plus a handful of genuinely-live runs. A run is KEPT only if it is its
+    task's ``current_run_id`` AND its pid is alive; everything else is a dead
+    orphan to close.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    live_pid = os.getpid()
+    dead_pid = 999999  # not a running process
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+
+        # (A) A genuinely-live run: current_run_id + live pid. MUST be kept.
+        t_live = kb.create_task(conn, title="live", assignee="a", detached=True)
+        kb.claim_task(conn, t_live, claimer=f"{host}:w")
+        kb._set_worker_pid(conn, t_live, live_pid)
+        live_run_id = kb.get_task(conn, t_live).current_run_id
+
+        # (B) A dead CURRENT run: current_run_id but pid is dead. Close it.
+        t_dead_cur = kb.create_task(conn, title="deadcur", assignee="a", detached=True)
+        kb.claim_task(conn, t_dead_cur, claimer=f"{host}:w")
+        kb._set_worker_pid(conn, t_dead_cur, dead_pid)
+        dead_cur_run_id = kb.get_task(conn, t_dead_cur).current_run_id
+
+        # (C) A dead NON-current run: a newer run took over the lane, but the old
+        #     author run was never closed (the lane-exit leak). Close the old one,
+        #     keep the new live one.
+        t_orphan = kb.create_task(conn, title="orphan", assignee="a", detached=True)
+        kb.claim_task(conn, t_orphan, claimer=f"{host}:w")
+        kb._set_worker_pid(conn, t_orphan, dead_pid)
+        old_orphan_run_id = kb.get_task(conn, t_orphan).current_run_id
+        # Simulate a fresh live run taking over the lane (the next-lane spawn).
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, worker_pid, started_at) "
+            "VALUES (?, 'a', 'running', ?, ?)",
+            (t_orphan, live_pid, int(time.time())),
+        )
+        new_orphan_run_id = conn.execute(
+            "SELECT last_insert_rowid() AS id"
+        ).fetchone()["id"]
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ?, worker_pid = ? WHERE id = ?",
+            (new_orphan_run_id, live_pid, t_orphan),
+        )
+        # The old run is still status=running / ended_at NULL — a dead orphan.
+        assert conn.execute(
+            "SELECT status FROM task_runs WHERE id = ?", (old_orphan_run_id,)
+        ).fetchone()["status"] == "running"
+
+        # (D) A run with a NULL pid, still open. _pid_alive(None) is False → dead.
+        t_nullpid = kb.create_task(conn, title="nullpid", assignee="a", detached=True)
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, worker_pid, started_at) "
+            "VALUES (?, 'a', 'running', NULL, ?)",
+            (t_nullpid, int(time.time())),
+        )
+        null_run_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+
+        # (E) A foreign-host claim: its pid is meaningless here, so it is skipped,
+        #     not assumed dead.
+        t_foreign = kb.create_task(conn, title="foreign", assignee="a", detached=True)
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, worker_pid, "
+            "claim_lock, started_at) "
+            "VALUES (?, 'a', 'running', ?, 'otherhost:w', ?)",
+            (t_foreign, dead_pid, int(time.time())),
+        )
+        foreign_run_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+
+        # --- DRY RUN: read-only, reports the dead set without writing. ---
+        dry = kb.reconcile_dead_running_runs(conn, apply=False)
+        assert dry["applied"] is False
+        # Two genuinely-live current runs are kept: (A) t_live and (C-new) the
+        # fresh run that took over t_orphan's lane.
+        assert dry["kept_live"] == 2
+        assert dry["foreign_host"] == 1       # only (E)
+        # Dead orphans: (B), (C-old), (D). (A) kept, (C-new) live, (E) foreign.
+        assert dry["dead"] == 3
+        assert set(dry["dead_run_ids"]) == {
+            dead_cur_run_id, old_orphan_run_id, null_run_id,
+        }
+        assert dry["closed"] == 0
+        # Nothing was written — all three dead runs are still open.
+        for rid in (dead_cur_run_id, old_orphan_run_id, null_run_id):
+            assert conn.execute(
+                "SELECT ended_at FROM task_runs WHERE id = ?", (rid,)
+            ).fetchone()["ended_at"] is None
+
+        # --- APPLY: closes exactly the dead set. ---
+        applied = kb.reconcile_dead_running_runs(conn, apply=True)
+        assert applied["applied"] is True
+        assert applied["closed"] == 3
+        for rid in (dead_cur_run_id, old_orphan_run_id, null_run_id):
+            row = conn.execute(
+                "SELECT status, outcome, ended_at, worker_pid, claim_lock "
+                "FROM task_runs WHERE id = ?", (rid,)
+            ).fetchone()
+            assert row["ended_at"] is not None
+            assert row["status"] == "superseded"
+            assert row["outcome"] == "superseded"
+            assert row["worker_pid"] is None
+            assert row["claim_lock"] is None
+
+        # The live run (A), the live new orphan run (C-new), and the foreign run
+        # (E) are all UNTOUCHED.
+        for rid in (live_run_id, new_orphan_run_id, foreign_run_id):
+            assert conn.execute(
+                "SELECT ended_at FROM task_runs WHERE id = ?", (rid,)
+            ).fetchone()["ended_at"] is None
+
+        # The dead CURRENT run's task pointer was nulled; the non-current dead
+        # run's task still points at its live successor.
+        assert kb.get_task(conn, t_dead_cur).current_run_id is None
+        assert kb.get_task(conn, t_orphan).current_run_id == new_orphan_run_id
+
+        # Board-wide invariant: zero running rows with a dead, host-local pid.
+        remaining = kb.reconcile_dead_running_runs(conn, apply=False)
+        assert remaining["dead"] == 0
+
+        # --- IDEMPOTENT: a second apply closes nothing more. ---
+        again = kb.reconcile_dead_running_runs(conn, apply=True)
+        assert again["closed"] == 0
+        assert again["dead"] == 0
+
+
 def test_lane_exit_release_holds_leaked_claim_on_live_worker(
     kanban_home, monkeypatch,
 ):

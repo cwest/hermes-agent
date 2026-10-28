@@ -689,6 +689,28 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Task id of the stranded acceptance card to reconcile",
     )
 
+    p_reconcile_runs = sub.add_parser(
+        "reconcile-runs",
+        help="Close task_runs rows stuck status=running with a dead worker pid",
+        description=(
+            "Reap board-state rot: task_runs rows left status=running / "
+            "ended_at=NULL whose worker is no longer alive. These accumulate "
+            "when a card leaves 'running' without its open run being closed, so "
+            "`kanban show` reports a phantom 'running @<worker> active' attempt "
+            "and any liveness/stall logic sees a false active worker. A run is "
+            "KEPT only if it is its task's current run AND its pid is alive on "
+            "this host; a foreign-host claim's pid is meaningless here and is "
+            "left untouched. Default is a READ-ONLY dry run that prints the "
+            "count; pass --apply to close the dead runs (ended_at set, terminal "
+            "'superseded' status). Idempotent — a second --apply finds zero."
+        ),
+    )
+    p_reconcile_runs.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually close the dead runs. Without it, dry-run only (no writes).",
+    )
+
     p_unblock = sub.add_parser(
         "unblock",
         help="Return blocked/scheduled tasks to ready, or todo while parents remain open",
@@ -1146,6 +1168,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "unblock",
     "promote",
     "reconcile-acceptance",
+    "reconcile-runs",
     "archive",
     "dispatch",
     "daemon",
@@ -2572,6 +2595,46 @@ def _cmd_reconcile_acceptance(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_reconcile_runs(args: argparse.Namespace) -> int:
+    """Close ``task_runs`` rows stuck ``status=running`` with a dead worker pid.
+
+    A thin CLI shim over :func:`kanban_db.reconcile_dead_running_runs`. Default
+    is a READ-ONLY dry run that prints the count of dead orphan runs; ``--apply``
+    closes them (ended_at set, terminal ``superseded`` status). Idempotent — a
+    second ``--apply`` finds zero.
+    """
+    apply = bool(getattr(args, "apply", False))
+    with kb.connect_closing() as conn:
+        result = kb.reconcile_dead_running_runs(conn, apply=apply)
+    scanned = result["scanned"]
+    dead = result["dead"]
+    kept = result["kept_live"]
+    foreign = result["foreign_host"]
+    if apply:
+        print(
+            f"reconcile-runs: closed {result['closed']} dead run(s) "
+            f"(scanned {scanned} open; kept {kept} live; "
+            f"skipped {foreign} foreign-host)."
+        )
+        if result["closed"] != dead:
+            print(
+                f"  note: {dead - result['closed']} dead run(s) raced a "
+                "legitimate close and were left to the owner.",
+                file=sys.stderr,
+            )
+    else:
+        print(
+            f"reconcile-runs (dry run): {dead} dead run(s) would be closed "
+            f"(scanned {scanned} open; kept {kept} live; "
+            f"skipped {foreign} foreign-host). Pass --apply to close them."
+        )
+        if dead:
+            preview = result["dead_run_ids"][:20]
+            print("  run ids: " + ", ".join(str(r) for r in preview)
+                  + (" …" if dead > len(preview) else ""))
+    return 0
+
+
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
@@ -3533,6 +3596,7 @@ _HANDLERS = {
     "review":   _cmd_review,
     "request-changes": _cmd_request_changes,
     "reconcile-acceptance": _cmd_reconcile_acceptance,
+    "reconcile-runs": _cmd_reconcile_runs,
     "schedule": _cmd_schedule,
     "unblock":  _cmd_unblock,
     "promote":  _cmd_promote,
@@ -3570,6 +3634,7 @@ Common subcommands:
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `review <id>`         Hand a running task off to the review lane (running → review)
   `reconcile-acceptance <id>`  Walk a merged-PR acceptance card to done (missed webhook recovery)
+  `reconcile-runs [--apply]`  Close task_runs stuck running with a dead pid (dry-run without --apply)
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

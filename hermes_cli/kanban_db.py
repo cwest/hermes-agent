@@ -6891,6 +6891,25 @@ def release_stale_claims(
                 # Raced with a legitimate re-claim (card moved back to
                 # running) between the read and the write — leave it alone.
                 continue
+            # A run must never outlive its lane. The card left ``running`` with
+            # the author's run still open (``status='running'``,
+            # ``ended_at=NULL``, ``current_run_id`` still pointing at it): the
+            # webhook MOVE updated status/assignee but never closed the run, and
+            # neither the TTL scan nor ``detect_crashed_workers`` can see it
+            # (both scan ``status='running'`` cards only). Left open it becomes
+            # a phantom "running @<author> active" run beside the real next-lane
+            # run, and any liveness/stall logic reading ``task_runs`` sees a
+            # false active worker. We only reach here when the claiming worker
+            # is dead (the live-PID case deferred above), so closing its run is
+            # safe. ``_end_run`` closes the ``current_run_id`` run and nulls the
+            # pointer; if the pointer already moved on (a fresh run claimed the
+            # card) it is a no-op, and the stranded old run is swept by the
+            # reconcile pass instead.
+            lane_exit_run_id = _end_run(
+                conn, row["id"],
+                outcome="superseded", status="superseded",
+                error="lane_exit_claim_released",
+            )
             _append_event(
                 conn, row["id"], "claim_released_lane_exit",
                 {
@@ -6902,8 +6921,10 @@ def release_stale_claims(
                         if row["worker_pid"] is not None else None
                     ),
                     "host_local": host_local,
+                    "closed_run_id": lane_exit_run_id,
                     "now": now,
                 },
+                run_id=lane_exit_run_id,
             )
             reclaimed += 1
 
@@ -13822,6 +13843,128 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # return so a completed card is never falsely stranded.
     detect_crashed_workers._last_clean_exit_after_done = clean_exit_after_done_ids  # type: ignore[attr-defined]
     return crashed
+
+
+def reconcile_dead_running_runs(
+    conn: sqlite3.Connection, *, apply: bool = False,
+) -> dict:
+    """Close ``task_runs`` rows left ``status='running'`` by a dead worker.
+
+    A one-shot, idempotent reconcile for the board-state rot where a run row
+    outlives its lane: ``status='running'``, ``ended_at IS NULL``, and a
+    ``worker_pid`` that is no longer alive (or NULL). These accumulate whenever
+    a card leaves ``running`` without the open run being closed — historically
+    the lane-exit leaked-claim release (fixed in :func:`release_stale_claims`)
+    and any raw status write that bypassed the ``_end_run`` paths. Left open
+    they make ``hermes kanban show`` report a phantom "running @<worker> active"
+    attempt beside the real one, and any liveness/stall logic reading
+    ``task_runs`` sees a false active worker.
+
+    Liveness rule — a run is KEPT (treated as genuinely live) iff BOTH hold:
+
+    * it is its task's ``current_run_id`` (the lane's one live attempt), AND
+    * its ``worker_pid`` is alive on this host (:func:`_pid_alive`).
+
+    Every other ``status='running'`` run with ``ended_at IS NULL`` is a dead
+    orphan and gets closed: a non-current run (a newer run already took over
+    the lane), a current run whose PID is dead, or any run with a NULL PID.
+    ``_pid_alive(None)`` is False, so a NULL-pid run is correctly dead. PIDs are
+    only meaningful on this host, so a run whose ``claim_lock`` belongs to
+    another host is NOT assumed dead — it is left untouched and reported under
+    ``foreign_host`` (a cross-host board must reconcile from each host).
+
+    ``apply=False`` (default) is a READ-ONLY dry run: it returns the counts and
+    the dead run ids WITHOUT writing anything. ``apply=True`` closes each dead
+    orphan in one ``write_txn`` with ``ended_at`` set, a terminal
+    ``superseded`` status/outcome, and its claim fields cleared. When a dead run
+    IS still its task's ``current_run_id`` the pointer is nulled too (mirroring
+    :func:`_end_run`), so the next lane's spawn opens a fresh run.
+
+    Idempotent: a second run finds zero (the first closed them; the scan is
+    gated on ``ended_at IS NULL``).
+
+    Returns a dict:
+      ``{"scanned", "dead", "kept_live", "foreign_host", "closed",
+         "dead_run_ids", "applied"}``.
+    """
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    rows = conn.execute(
+        "SELECT r.id AS run_id, r.task_id AS task_id, r.worker_pid AS worker_pid, "
+        "       r.claim_lock AS claim_lock, t.current_run_id AS current_run_id "
+        "FROM task_runs r "
+        "LEFT JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.status = 'running' AND r.ended_at IS NULL"
+    ).fetchall()
+
+    dead_run_ids: list[int] = []
+    dead_current: set[int] = set()
+    kept_live = 0
+    foreign_host = 0
+    for row in rows:
+        run_id = int(row["run_id"])
+        is_current = (
+            row["current_run_id"] is not None
+            and int(row["current_run_id"]) == run_id
+        )
+        lock = row["claim_lock"] or ""
+        host_local = lock.startswith(host_prefix) if lock else True
+        # A foreign-host claim's PID is meaningless here — don't guess it dead.
+        # (A NULL/empty lock is treated as host-local: an orphaned run with no
+        # lock can only be reaped here.)
+        if lock and not host_local:
+            foreign_host += 1
+            continue
+        alive = _pid_alive(row["worker_pid"])
+        if is_current and alive:
+            # The lane's one genuinely-live attempt — leave it alone.
+            kept_live += 1
+            continue
+        dead_run_ids.append(run_id)
+        if is_current:
+            dead_current.add(run_id)
+
+    result = {
+        "scanned": len(rows),
+        "dead": len(dead_run_ids),
+        "kept_live": kept_live,
+        "foreign_host": foreign_host,
+        "closed": 0,
+        "dead_run_ids": dead_run_ids,
+        "applied": bool(apply),
+    }
+    if not apply or not dead_run_ids:
+        return result
+
+    now = int(time.time())
+    closed = 0
+    with write_txn(conn):
+        for run_id in dead_run_ids:
+            cur = conn.execute(
+                "UPDATE task_runs "
+                "   SET status = 'superseded', outcome = 'superseded', "
+                "       error = 'reconcile_dead_running_run', "
+                "       ended_at = ?, claim_lock = NULL, "
+                "       claim_expires = NULL, worker_pid = NULL "
+                " WHERE id = ? AND status = 'running' AND ended_at IS NULL",
+                (now, run_id),
+            )
+            if cur.rowcount != 1:
+                # Raced with a legitimate close between the dry read and the
+                # write — leave it alone.
+                continue
+            closed += 1
+            if run_id in dead_current:
+                # The task still pointed at this now-closed run; null the
+                # pointer so the next lane's spawn opens a fresh run (mirrors
+                # ``_end_run``).
+                conn.execute(
+                    "UPDATE tasks SET current_run_id = NULL "
+                    "WHERE id = (SELECT task_id FROM task_runs WHERE id = ?) "
+                    "  AND current_run_id = ?",
+                    (run_id, run_id),
+                )
+    result["closed"] = closed
+    return result
 
 
 def _record_task_failure(
