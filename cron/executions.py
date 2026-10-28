@@ -8,6 +8,7 @@ proved gone. Terminal states are immutable.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -18,6 +19,8 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
+
+logger = logging.getLogger("cron.executions")
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
 MAX_TERMINAL_EXECUTIONS = 1000
@@ -31,12 +34,35 @@ def _connect() -> sqlite3.Connection:
     return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
+def _apply_delete_journal_mode(conn: sqlite3.Connection) -> None:
+    """Pin the execution ledger to DELETE (rollback-journal) mode — never WAL.
 
+    Root cause of the recurring ``executions.db`` corruption: every quarantined
+    corrupt copy was WAL-mode (on-disk header bytes 18/19 == 2) while the only
+    never-corrupted file is DELETE-mode (bytes == 1). The torn-WAL / WAL-reset
+    b-tree corruption class (``Rowid out of order``, ``2nd reference to page``,
+    ``wrong # of entries in index``) only reaches a WAL database, and the
+    ``~/.hermes`` backup excludes the ``.db-wal`` sidecar — so a stale main-file
+    restore over a live WAL tears the page tree. The partial WAL-reset-bug fix
+    (#69784) only *refuses* WAL on fresh DBs for vulnerable SQLite builds and
+    deliberately leaves an existing WAL DB in WAL ("no live downgrade under
+    concurrent openers"), so a legacy WAL ledger kept corrupting until it
+    happened to be recreated in DELETE mode.
+
+    This ledger is a tiny, ``synchronous=FULL``, single-writer-dominant audit
+    store opened via short-lived connections under ``_lock`` — it gains nothing
+    from WAL. Pinning DELETE unconditionally retires the entire WAL-corruption
+    class for this file AND one-time-downgrades any legacy WAL ledger on open
+    (safe here precisely because connections are short-lived and serialized,
+    unlike the shared state.db/kanban.db the generic helper must protect).
+    """
+    conn.execute("PRAGMA journal_mode=DELETE")
+
+
+def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
-    apply_wal_with_fallback(conn, db_label="cron/executions.db")
+    _apply_delete_journal_mode(conn)
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS executions (
@@ -205,6 +231,90 @@ def recover_interrupted_executions() -> int:
         if changed:
             _prune_unlocked(conn)
     return changed
+
+
+def _quarantine_corrupt_store() -> Optional[Path]:
+    """Rename a corrupt ``executions.db`` (plus any WAL/SHM/journal sidecars)
+    aside as ``executions.db.corrupt-<ts>`` so the next open recreates a fresh,
+    empty schema. Returns the quarantined main-file path, or None if there was
+    nothing to move. Best-effort: never raises into the caller."""
+    import time
+
+    if not EXECUTIONS_FILE.exists():
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    target = EXECUTIONS_FILE.with_name(f"{EXECUTIONS_FILE.name}.corrupt-{stamp}")
+    # Avoid clobbering an existing quarantine from the same second.
+    suffix = 1
+    while target.exists():
+        target = EXECUTIONS_FILE.with_name(
+            f"{EXECUTIONS_FILE.name}.corrupt-{stamp}-{suffix}"
+        )
+        suffix += 1
+    try:
+        EXECUTIONS_FILE.rename(target)
+    except OSError as exc:
+        logger.error("Could not quarantine corrupt executions.db: %s", exc)
+        return None
+    # SQLite names sidecars <dbfile>-wal / -shm / -journal. Move them too so a
+    # stale sidecar can't poison the freshly recreated store.
+    for ext in ("-wal", "-shm", "-journal"):
+        sidecar = Path(str(EXECUTIONS_FILE) + ext)
+        if sidecar.exists():
+            try:
+                sidecar.rename(Path(str(target) + ext))
+            except OSError:
+                pass
+    return target
+
+
+def recover_interrupted_executions_resilient() -> Dict[str, Any]:
+    """Scheduler-lifecycle recovery that SURVIVES a corrupt execution store.
+
+    The raw :func:`recover_interrupted_executions` keeps its fail-closed
+    contract (it raises ``sqlite3.DatabaseError`` on a corrupt store and never
+    overwrites the file). But the scheduler thread must not die when that
+    happens: a corrupt ``executions.db`` at gateway startup used to propagate
+    out of ``provider.start()``, killing the daemon thread silently and
+    freezing every scheduled job while the gateway looked healthy (the ~20-day
+    freeze this fix targets).
+
+    This wrapper catches that corruption, LOUDLY logs it, quarantines the bad
+    file as ``executions.db.corrupt-<ts>``, recreates an empty schema, and
+    returns so the scheduler keeps running. Losing run-history audit must never
+    stop every job.
+
+    Returns a dict: ``{"recovered": int, "quarantined": bool,
+    "quarantined_path": Optional[str]}``.
+    """
+    try:
+        recovered = recover_interrupted_executions()
+        return {"recovered": recovered, "quarantined": False, "quarantined_path": None}
+    except sqlite3.DatabaseError as exc:
+        logger.error(
+            "CRON SCHEDULER: execution ledger at %s is CORRUPT (%s). "
+            "Quarantining it and recreating an empty store so scheduling "
+            "continues — run history before now is lost. This is the recurring "
+            "executions.db corruption; the store is now pinned to DELETE "
+            "journal mode to retire the WAL-corruption class.",
+            EXECUTIONS_FILE, exc,
+        )
+        quarantined = _quarantine_corrupt_store()
+        # Recreate a fresh, usable schema (DELETE mode) so later writes succeed.
+        try:
+            with _transaction():
+                pass
+        except sqlite3.DatabaseError as exc2:
+            logger.error(
+                "CRON SCHEDULER: failed to recreate execution ledger after "
+                "quarantine: %s. Scheduling continues; the ledger stays empty.",
+                exc2,
+            )
+        return {
+            "recovered": 0,
+            "quarantined": quarantined is not None,
+            "quarantined_path": str(quarantined) if quarantined else None,
+        }
 
 
 def list_executions(

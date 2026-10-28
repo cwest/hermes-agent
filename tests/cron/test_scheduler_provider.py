@@ -791,3 +791,72 @@ def test_multiplex_heartbeat_scoped_per_profile(tmp_path, monkeypatch):
         "default profile heartbeat file missing"
     assert (p_sec / "cron" / "ticker_heartbeat").exists(), \
         "secondary profile heartbeat file missing"
+
+
+# ── Corrupt-ledger survival: a bad executions.db must not kill the scheduler ──
+
+
+def test_start_survives_corrupt_executions_db_and_keeps_ticking(tmp_path, monkeypatch):
+    """A corrupt executions.db at startup must NOT kill the scheduler thread.
+
+    Regression for the third executions.db corruption (~20-day freeze): the
+    startup ``recover_interrupted()`` call ran OUTSIDE the tick loop's
+    try/except, so a ``sqlite3.DatabaseError`` from the corrupt store
+    propagated out of ``start()``, the daemon thread died silently, and every
+    scheduled job froze while the gateway otherwise looked healthy. The
+    resilient recovery path quarantines the bad file and the loop keeps firing.
+    """
+    import cron.executions as executions
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    # Point the ledger at a corrupt file inside this test's tmp HERMES_HOME.
+    cron_dir = tmp_path / "cron"
+    cron_dir.mkdir(parents=True)
+    corrupt = cron_dir / "executions.db"
+    corrupt.write_bytes(b"not a sqlite database")
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", corrupt)
+
+    calls = []
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+
+    with patch("cron.scheduler.tick", side_effect=lambda *a, **k: calls.append(k) or 0), \
+         patch("cron.jobs.record_ticker_heartbeat"):
+        t = threading.Thread(
+            target=prov.start, args=(stop,), kwargs={"interval": 0}, daemon=True
+        )
+        t.start()
+        # The thread must survive the corrupt-store recovery AND keep ticking.
+        assert _wait_until(lambda: len(calls) >= 1), \
+            "scheduler never ticked — the corrupt executions.db killed the thread"
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive(), "scheduler thread died on a corrupt executions.db"
+    # The corrupt file was quarantined, not left in place, and a fresh store exists.
+    assert not corrupt.read_bytes() == b"not a sqlite database" or \
+        any(p.name.startswith("executions.db.corrupt-") for p in cron_dir.iterdir()), \
+        "corrupt executions.db was not quarantined"
+    assert any(p.name.startswith("executions.db.corrupt-") for p in cron_dir.iterdir())
+
+
+def test_recover_interrupted_hook_uses_resilient_path(monkeypatch):
+    """The provider lifecycle hook routes through the resilient recovery entry
+    point so every provider (built-in, desktop, external) survives a corrupt
+    store, not just the built-in ticker."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    called = {}
+
+    def _fake_resilient():
+        called["resilient"] = True
+        return {"recovered": 0, "quarantined": False, "quarantined_path": None}
+
+    monkeypatch.setattr(
+        "cron.executions.recover_interrupted_executions_resilient",
+        _fake_resilient,
+    )
+    out = InProcessCronScheduler().recover_interrupted()
+    assert called.get("resilient") is True
+    assert out == 0
+

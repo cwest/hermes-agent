@@ -17537,6 +17537,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
+    async def _send_home_channel_alert(self, message: str) -> int:
+        """Post an unsolicited operational ALERT to every connected home channel.
+
+        Used by the out-of-band cron-liveness watchdog (and reusable for any
+        gateway-level alarm). Unlike the startup notification this ignores the
+        ``gateway_restart_notification`` opt-out — an operator alert that
+        scheduled jobs have silently frozen must not be suppressible by a
+        restart-notification preference. Best-effort per platform; returns the
+        number of home channels the alert reached.
+        """
+        delivered = 0
+        for platform, platform_cfg in self.config.platforms.items():
+            home = platform_cfg.home_channel
+            if not home or not home.chat_id:
+                continue
+            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            if transport is None:
+                continue
+            try:
+                metadata = self._thread_metadata_for_target(
+                    platform, home.chat_id, home.thread_id, adapter=transport.adapter,
+                )
+                if transport.is_relay:
+                    metadata = dict(metadata or {})
+                    if home.user_id:
+                        metadata["user_id"] = home.user_id
+                    if home.scope_id:
+                        metadata["scope_id"] = home.scope_id
+                send_metadata = _non_conversational_metadata(metadata, platform=platform)
+                if send_metadata is not None or transport.is_relay:
+                    await transport.send(
+                        platform, str(home.chat_id), message, metadata=send_metadata,
+                    )
+                else:
+                    await transport.adapter.send(str(home.chat_id), message)
+                delivered += 1
+                logger.warning(
+                    "Sent home-channel operational alert to %s:%s",
+                    platform.value, home.chat_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Home-channel alert failed for %s:%s: %s",
+                    platform.value, home.chat_id, exc,
+                )
+        return delivered
+
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
 
@@ -23740,7 +23787,66 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+# Default cron-liveness alarm threshold (seconds). The cron ticker heartbeats
+# every TICKER_INTERVAL_SECONDS (60s); 5 minutes is well past several missed
+# ticks, so a stale-beyond-this heartbeat means the scheduler thread is wedged
+# or dead, not merely between ticks.
+_CRON_LIVENESS_ALARM_THRESHOLD_SECONDS = 300.0
+
+
+@dataclasses.dataclass
+class _CronLivenessDecision:
+    """Pure decision for the out-of-band cron-liveness watchdog."""
+    should_alarm: bool
+    next_already_alarmed: bool
+    message: str = ""
+
+
+def _evaluate_cron_liveness_alarm(
+    *,
+    heartbeat_age: Optional[float],
+    threshold_seconds: float,
+    already_alarmed: bool,
+) -> _CronLivenessDecision:
+    """Decide whether the cron-scheduler liveness watchdog should alarm.
+
+    The cron scheduler runs in its OWN daemon thread; if that thread dies (a
+    corrupt executions.db that escaped recovery, or any unhandled error), every
+    scheduled job freezes while the gateway process still looks healthy — and
+    the original alerting lived ON the cron that died. This watchdog runs in the
+    gateway housekeeping thread (independent of the cron thread) and fires a
+    ONE-SHOT alarm to the home channel when the ticker heartbeat goes stale,
+    re-arming only after it recovers.
+
+    Pure function (no I/O) so the latch logic is tested directly:
+
+    - ``heartbeat_age is None`` → unknown (marker missing/unreadable, older
+      build, cron never started, torn read). Treated as "cannot determine",
+      NOT a stall — never alarm, and clear the latch.
+    - age > threshold → stale. Alarm once (only when not ``already_alarmed``),
+      and set the latch so it does not re-fire every tick while still stale.
+    - age <= threshold → healthy. Clear the latch so a future stall re-fires.
+    """
+    if heartbeat_age is None:
+        return _CronLivenessDecision(should_alarm=False, next_already_alarmed=False)
+    if heartbeat_age > threshold_seconds:
+        mins = heartbeat_age / 60.0
+        message = (
+            "🚨 Cron scheduler appears STALLED — the ticker heartbeat is "
+            f"{mins:.0f} min old (threshold {threshold_seconds / 60:.0f} min). "
+            "Scheduled jobs are not firing. Check the gateway log for a cron "
+            "scheduler thread crash (e.g. a corrupt cron/executions.db) and "
+            "restart the gateway if needed."
+        )
+        return _CronLivenessDecision(
+            should_alarm=not already_alarmed,
+            next_already_alarmed=True,
+            message=message,
+        )
+    return _CronLivenessDecision(should_alarm=False, next_already_alarmed=False)
+
+
+def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, runner=None):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -23762,9 +23868,11 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
     AUTO_ARCHIVE_EVERY = 60  # ticks — poll hourly (state_meta gate owns the real cadence)
+    CRON_LIVENESS_EVERY = 1  # ticks — check the cron heartbeat every housekeeping tick
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
+    cron_liveness_alarmed = False
     while not stop_event.is_set():
         tick_count += 1
 
@@ -23847,6 +23955,37 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                         _adb.close()
             except Exception as e:
                 logger.debug("Auto-archive tick error: %s", e)
+
+        # Out-of-band cron-scheduler liveness watchdog. The cron scheduler runs
+        # in its OWN daemon thread; if that thread dies (a corrupt
+        # executions.db that escaped recovery, or any unhandled error), every
+        # scheduled job freezes while the gateway still looks healthy — and the
+        # original alerting lived ON the cron that died. This check runs HERE, in
+        # the independent housekeeping thread, so a dead scheduler is surfaced
+        # even when nothing else is. One-shot: alarms once per stall, re-arms on
+        # recovery. Only meaningful when a runner (home channel) is available.
+        if runner is not None and tick_count % CRON_LIVENESS_EVERY == 0:
+            try:
+                from cron.jobs import get_ticker_heartbeat_age
+
+                decision = _evaluate_cron_liveness_alarm(
+                    heartbeat_age=get_ticker_heartbeat_age(),
+                    threshold_seconds=_CRON_LIVENESS_ALARM_THRESHOLD_SECONDS,
+                    already_alarmed=cron_liveness_alarmed,
+                )
+                cron_liveness_alarmed = decision.next_already_alarmed
+                if decision.should_alarm:
+                    logger.error(
+                        "CRON LIVENESS: %s", decision.message.replace("🚨 ", "")
+                    )
+                    if loop is not None:
+                        safe_schedule_threadsafe(
+                            runner._send_home_channel_alert(decision.message), loop,
+                            logger=logger,
+                            log_message="Cron liveness alarm scheduling error",
+                        )
+            except Exception as e:
+                logger.debug("Cron liveness watchdog error: %s", e)
 
         stop_event.wait(timeout=interval)
     logger.info("Gateway housekeeping stopped")
@@ -24448,7 +24587,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(), "runner": runner},
         daemon=True,
         name="gateway-housekeeping",
     )
