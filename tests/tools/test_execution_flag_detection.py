@@ -1,14 +1,60 @@
 """Execution-bearing option detection across interpreters and read-only tools."""
 
+import functools
 import os
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 
 import pytest
 
 from tools.approval import detect_dangerous_command, detect_hardline_command
+
+_BULK_SORT_INPUT = "\n".join(str(number) for number in range(10_000, 0, -1)) + "\n"
+
+
+@functools.lru_cache(maxsize=1)
+def _sort_runs_leading_dash_compress_program():
+    """Probe whether the installed ``sort`` runs a leading-dash --compress-program.
+
+    GNU coreutils sort spills temporary runs to disk under ``--buffer-size=1K``
+    and shells out to the ``--compress-program`` even when its name starts with
+    ``-`` (resolved from ``PATH``). BSD sort (macOS default) and the Rust uutils
+    sort that ships as the default on Ubuntu 25.10+ do not: BSD sort does not run
+    it at all under these conditions, and uutils sort reparses a leading-dash
+    program name instead of executing it. The real-binary payload test only has
+    meaning where that program is actually invoked, so this benign probe gates it
+    on capability rather than on a distro guess. It mirrors the real test's
+    mechanism exactly (a leading-dash program resolved from ``PATH``) and returns
+    ``True`` only when the benign program is observed running.
+    """
+    if shutil.which("sort") is None:
+        return False
+    with tempfile.TemporaryDirectory() as probe_dir:
+        marker = os.path.join(probe_dir, "compress-ran")
+        compressor = os.path.join(probe_dir, "-probe-compressor")
+        with open(compressor, "w", encoding="utf-8") as handle:
+            handle.write('#!/bin/sh\nprintf ran > "$COMPRESS_MARKER"\nexec cat\n')
+        os.chmod(compressor, 0o755)
+        env = {
+            **os.environ,
+            "PATH": f"{probe_dir}{os.pathsep}{os.environ['PATH']}",
+            "COMPRESS_MARKER": marker,
+        }
+        try:
+            subprocess.run(
+                ["sort", "--buffer-size=1K", "--compress-program", "-probe-compressor"],
+                input=_BULK_SORT_INPUT,
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return os.path.exists(marker)
 
 
 @pytest.mark.parametrize(
@@ -49,6 +95,11 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    if tool == "sort" and not _sort_runs_leading_dash_compress_program():
+        pytest.skip(
+            "installed sort does not run a leading-dash --compress-program "
+            "(not GNU coreutils); the leading-dash payload cannot be exercised here"
+        )
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
@@ -57,11 +108,7 @@ def test_real_binaries_execute_leading_dash_program_payload(
     input_file = tmp_path / "input.txt"
     input_file.write_text("needle\n")
     resolved_args = [arg.format(input=str(input_file)) for arg in args]
-    input_text = (
-        "\n".join(str(number) for number in range(10_000, 0, -1)) + "\n"
-        if stdin == "{bulk}"
-        else stdin
-    )
+    input_text = _BULK_SORT_INPUT if stdin == "{bulk}" else stdin
     env = {
         **os.environ,
         "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
