@@ -522,6 +522,180 @@ def detect_hardline_command(command: str) -> tuple:
     return (False, None)
 
 
+# The env sentinel the KB self-merge PATH shim trusts. A caller that forges it
+# (inline prefix or a prior ``export``) tricks the shim into passing a bare
+# ``gh pr merge``. Deny hand-setting it just like the absolute-path side door.
+_KB_SELF_MERGE_SENTINEL = "hermes_kb_self_merge_gated"
+
+_SELF_MERGE_GH_VERBS = (("pr", "merge"), ("pr", "ready"))
+
+_SELF_MERGE_SIDEDOOR_DESCRIPTION = (
+    "path-qualified `gh pr merge`/`pr ready` (self-merge side door). A "
+    "path-qualified gh skips the PATH shim that gates cwest/knowledge-base, so "
+    "a self-merge/undraft must go through the sanctioned findings gate "
+    "(onecard_common.self_merge_kb_pr via subprocess), never a direct gh. Use a "
+    "bare `gh` (which the shim resolves) for non-KB repos, or the gate for KB"
+)
+
+_SELF_MERGE_SENTINEL_DESCRIPTION = (
+    "hand-setting HERMES_KB_SELF_MERGE_GATED (forging the KB self-merge "
+    "sentinel the PATH shim trusts). Only onecard_common.self_merge_kb_pr may "
+    "set it; a hand-set value lets a bare `gh pr merge` bypass the findings gate"
+)
+
+
+def _is_path_qualified_gh(word: str) -> bool:
+    """True when ``word`` is a PATH-QUALIFIED ``gh`` executable.
+
+    A path-qualified gh has a ``/`` in the program word and a basename of
+    exactly ``gh`` — an absolute path (``/opt/homebrew/bin/gh``) or a relative
+    one (``./gh``, ``../bin/gh``). A BARE ``gh`` (no slash) is deliberately NOT
+    matched: it routes through the PATH shim that resolves the cwd remote and
+    gates only cwest/knowledge-base, which is the sanctioned path.
+    """
+    program = _deobfuscate_shell_word_for_detection(word)
+    program = _strip_optional_shell_quotes(program).strip()
+    if "/" not in program:
+        return False
+    # Strip a trailing path (basename) and compare to ``gh`` exactly, so
+    # ``/usr/bin/github`` or ``/opt/ghostty`` never match.
+    return program.rsplit("/", 1)[-1] == "gh"
+
+
+def _segment_words(command: str, start: int, limit: int = 32):
+    """Yield deobfuscated words of a single command segment from ``start``.
+
+    Stops at the segment boundary (``;``/``&``/``|``/newline) — the same
+    boundaries ``_read_shell_word`` breaks on — so one call never bleeds into
+    the next command segment.
+    """
+    pos = start
+    count = 0
+    while count < limit:
+        word_start, word_end, word = _read_shell_word(command, pos)
+        if word_start == word_end:
+            break
+        yield _deobfuscate_shell_word_for_detection(word)
+        pos = word_end
+        count += 1
+
+
+_SELF_MERGE_GH_VALUE_FLAGS = ("-r", "--repo")
+
+
+def _gh_positional_words(rest: list) -> list:
+    """Reduce a gh argv tail to its POSITIONAL (non-flag) words, in order.
+
+    ``gh`` accepts repo/global flags before, between, or after the ``pr`` and
+    ``merge``/``ready`` subcommand tokens — ``gh --repo X pr merge``,
+    ``gh pr --repo X merge``, ``gh pr merge --squash`` all reach the real merge.
+    A positional-only reduction lets the verb match key on gh's actual grammar
+    (command then subcommand) instead of a brittle argv 0/1 anchor:
+
+    - drop any ``-``-prefixed token (``--squash``, ``-d``, ``--repo=X`` joined);
+    - a bare ``-R`` / ``--repo`` consumes its following value token too, so the
+      value (``cwest/knowledge-base``) is never mistaken for a positional.
+
+    ``rest`` is already lowercased by the caller.
+    """
+    positional = []
+    i = 0
+    n = len(rest)
+    while i < n:
+        word = rest[i]
+        if word in _SELF_MERGE_GH_VALUE_FLAGS:
+            # a bare value-taking flag swallows its separate value token
+            i += 2
+            continue
+        if word.startswith("-"):
+            # any other flag, incl. joined ``--repo=<val>`` — not positional
+            i += 1
+            continue
+        positional.append(word)
+        i += 1
+    return positional
+
+
+def detect_self_merge_sidedoor(command: str) -> tuple:
+    """Detect a KB self-merge side door via command-start-aware segmentation.
+
+    Unlike the whole-line fnmatch of ``approvals.deny``, this inspects the
+    EXECUTABLE of each REAL command segment (reusing the quote-aware
+    ``_iter_shell_command_starts`` / ``_read_shell_word`` machinery). It fires
+    only when a segment's executable is a PATH-QUALIFIED ``gh`` running
+    ``pr merge`` / ``pr ready``, or when a segment hand-sets the
+    ``HERMES_KB_SELF_MERGE_GATED`` sentinel. A path-qualified ``gh pr merge``
+    quoted INSIDE an argument to another command (a kanban comment body, a
+    ``python -c`` string, an ``echo``) is never a command-position executable,
+    so it is never a match — closing the residual false-positive the config-glob
+    layer could not.
+
+    Code-shipped and hardline-class: it applies to every profile with no
+    per-config duplication and fires before the yolo / mode=off bypass. The
+    sanctioned seam runs ``gh`` via ``subprocess`` and never routes a command
+    line through here, so it is untouched.
+
+    Returns:
+        (is_blocked, description) or (False, None)
+    """
+    # Scan every real (quote-aware) command start across the detection variants,
+    # so quoting/obfuscation of the executable itself cannot sidestep it, while
+    # quoted ARGUMENTS of another command are never surfaced as command starts.
+    for variant in _command_detection_variants(command):
+        for start in _iter_shell_command_starts(variant):
+            words = list(_segment_words(variant, start))
+            if not words:
+                continue
+            # Skip leading ``VAR=value`` env-assignment prefixes to find the
+            # real executable — but inspect each assignment for the sentinel.
+            idx = 0
+            while idx < len(words) and _ENV_ASSIGNMENT_RE.fullmatch(words[idx]):
+                if words[idx].split("=", 1)[0].lower() == _KB_SELF_MERGE_SENTINEL:
+                    return (True, _SELF_MERGE_SENTINEL_DESCRIPTION)
+                idx += 1
+            if idx >= len(words):
+                continue
+            executable = words[idx]
+            # ``export HERMES_KB_SELF_MERGE_GATED=…`` (assignment via the export
+            # builtin, not an inline prefix).
+            if executable.lower() == "export":
+                for assignment in words[idx + 1:]:
+                    name = assignment.split("=", 1)[0].lower()
+                    if name == _KB_SELF_MERGE_SENTINEL:
+                        return (True, _SELF_MERGE_SENTINEL_DESCRIPTION)
+                    if not _ENV_ASSIGNMENT_RE.fullmatch(assignment):
+                        break
+                continue
+            if not _is_path_qualified_gh(executable):
+                continue
+            # The executable IS a path-qualified gh — does it run pr merge/ready?
+            # gh accepts repo/global flags before, between, or after the two
+            # subcommand tokens, so key on the POSITIONAL (non-flag) words in
+            # order — the first two must be ``pr`` then ``merge``/``ready`` — not
+            # a brittle argv 0/1 anchor that leaks ``gh --repo X pr merge`` and
+            # ``gh pr --repo X merge``.
+            positional = _gh_positional_words([w.lower() for w in words[idx + 1:]])
+            if len(positional) >= 2 and (positional[0], positional[1]) in _SELF_MERGE_GH_VERBS:
+                return (True, _SELF_MERGE_SIDEDOOR_DESCRIPTION)
+    return (False, None)
+
+
+def _self_merge_block_result(description: str) -> dict:
+    """Build the standard block result for a self-merge side-door match."""
+    return {
+        "approved": False,
+        "hardline": True,
+        "self_merge_sidedoor": True,
+        "message": (
+            f"BLOCKED (hardline): {description}. "
+            "This command is on the unconditional blocklist and cannot be "
+            "executed via the agent — not even with --yolo, /yolo, "
+            "approvals.mode=off, or cron approve mode. Do NOT retry or rephrase "
+            "it."
+        ),
+    }
+
+
 def _match_user_deny_rule(command: str) -> str | None:
     """Return the matching ``approvals.deny`` glob, or None.
 
@@ -3046,6 +3220,17 @@ def check_dangerous_command(command: str, env_type: str,
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
 
+    # Code-shipped self-merge side-door floor: a path-qualified `gh pr merge`/
+    # `pr ready` (or a hand-set HERMES_KB_SELF_MERGE_GATED sentinel) in command
+    # position. Command-start-aware (unlike the whole-line approvals.deny glob),
+    # so a merge/ready quoted inside another command's argument never matches.
+    # Unconditional, before the yolo bypass — applies to every profile.
+    is_sidedoor, sidedoor_desc = detect_self_merge_sidedoor(command)
+    if is_sidedoor:
+        logger.warning("Self-merge side-door block: %s (command: %s)",
+                       sidedoor_desc, command[:200])
+        return _self_merge_block_result(sidedoor_desc)
+
     # User-defined deny rules (approvals.deny in config.yaml): like the
     # hardline floor, these fire BEFORE the yolo bypass — a deny rule is the
     # user saying "never, even under yolo".
@@ -3356,6 +3541,15 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("Sudo stdin guard block: %s (command: %s)",
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
+
+    # Code-shipped self-merge side-door floor (command-start-aware): see
+    # detect_self_merge_sidedoor. Unconditional, before the yolo / mode=off
+    # bypass, shipped for every profile with no per-config duplication.
+    is_sidedoor, sidedoor_desc = detect_self_merge_sidedoor(command)
+    if is_sidedoor:
+        logger.warning("Self-merge side-door block: %s (command: %s)",
+                       sidedoor_desc, command[:200])
+        return _self_merge_block_result(sidedoor_desc)
 
     # User-defined deny rules (approvals.deny in config.yaml): like the
     # hardline floor, these fire BEFORE the yolo / mode=off bypass — a deny
