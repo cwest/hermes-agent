@@ -3413,6 +3413,48 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _machine_id(host_or_lock: Optional[str]) -> str:
+    """Return a stable machine identity from a hostname or a ``host:pid`` lock.
+
+    macOS flips the reported hostname between the mDNS ``.local`` name and the
+    DHCP/router ``.lan`` name for the SAME physical box depending on the active
+    network (e.g. ``home-m2u-01.local`` vs ``home-m2u-01.lan``). Comparing the
+    raw hostname prefix of a ``claim_lock`` therefore treats one machine's two
+    faces as different hosts, so a claim taken under one name is never judged
+    host-local — and its run never gets reaped — once the box starts reporting
+    the other. Normalizing to the stem (the label before the first dot) collapses
+    every DNS/mDNS alias of one machine to a single identity.
+
+    Accepts either a bare host (``home-m2u-01.local``) or a full claim lock
+    (``home-m2u-01.local:12345``) and is case-insensitive. An empty/None input
+    yields ``""``.
+    """
+    if not host_or_lock:
+        return ""
+    # A claim lock is ``host:pid`` — take the host part.
+    host = str(host_or_lock).split(":", 1)[0].strip().lower()
+    # Strip the DNS/mDNS domain suffix: the stem (first label) is the stable id.
+    # ``home-m2u-01.local`` / ``home-m2u-01.lan`` / ``home-m2u-01.corp.x`` all
+    # collapse to ``home-m2u-01``.
+    return host.split(".", 1)[0]
+
+
+def _lock_is_host_local(claim_lock: Optional[str]) -> bool:
+    """Return True when ``claim_lock`` was taken on THIS machine.
+
+    Compares stable machine identities (:func:`_machine_id`) rather than raw
+    hostname prefixes, so a lock written under one DNS/mDNS alias of this box
+    (``.local``) still counts as host-local when the box now reports the other
+    (``.lan``), and vice versa. A genuinely different machine stays foreign.
+
+    A NULL/empty lock is treated as host-local: an orphaned run carrying no lock
+    can only be reaped here, which matches the reconcile's documented contract.
+    """
+    if not claim_lock:
+        return True
+    return _machine_id(claim_lock) == _machine_id(_claimer_id())
+
+
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
@@ -6805,7 +6847,6 @@ def release_stale_claims(
     """
     now = int(time.time())
     reclaimed = 0
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     # ------------------------------------------------------------------
     # Lane-exit leaked-claim release (fix the starvation at its source).
@@ -6849,7 +6890,7 @@ def release_stale_claims(
         # retry next tick; the claim is released the moment the worker exits
         # and its PID goes dead. Dead-PID and non-host-local leaks fall
         # through to the release below, preserving the lane-exit self-heal.
-        host_local = str(row["claim_lock"] or "").startswith(host_prefix)
+        host_local = _lock_is_host_local(row["claim_lock"])
         if (
             host_local
             and row["worker_pid"]
@@ -6937,7 +6978,7 @@ def release_stale_claims(
     ).fetchall()
     for row in stale:
         lock = row["claim_lock"] or ""
-        host_local = lock.startswith(host_prefix)
+        host_local = _lock_is_host_local(lock)
         hb = row["last_heartbeat_at"]
         # Heartbeat staleness backstop: if we have a heartbeat at all
         # and it's older than the max-stale threshold, the worker is
@@ -12779,8 +12820,7 @@ def _terminate_reclaimed_worker(
     if not pid or pid <= 0 or not claim_lock:
         return info
 
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    if not str(claim_lock).startswith(host_prefix):
+    if not _lock_is_host_local(claim_lock):
         return info
     info["host_local"] = True
 
@@ -12950,7 +12990,6 @@ def enforce_max_runtime(
     import signal
     timed_out: list[str] = []
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
@@ -12964,7 +13003,7 @@ def enforce_max_runtime(
     ).fetchall()
     for row in rows:
         lock = row["claim_lock"] or ""
-        if not lock.startswith(host_prefix):
+        if not _lock_is_host_local(lock):
             continue
         # Runtime is per attempt, not lifetime-of-task. ``tasks.started_at``
         # intentionally records the first time a task ever started, so retries
@@ -13084,7 +13123,6 @@ def detect_stale_running(
 
 
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     reclaimed: list[str] = []
 
     rows = conn.execute(
@@ -13352,11 +13390,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             "LEFT JOIN task_runs r ON r.id = t.current_run_id "
             "WHERE t.worker_pid IS NOT NULL"
         ).fetchall()
-        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
             # Only check liveness for claims owned by this host.
             lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
+            if not _lock_is_host_local(lock):
                 continue
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID
@@ -13892,7 +13929,6 @@ def reconcile_dead_running_runs(
       ``{"scanned", "dead", "kept_live", "foreign_host", "closed",
          "dead_run_ids", "applied"}``.
     """
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     rows = conn.execute(
         "SELECT r.id AS run_id, r.task_id AS task_id, r.worker_pid AS worker_pid, "
         "       r.claim_lock AS claim_lock, t.current_run_id AS current_run_id "
@@ -13912,7 +13948,7 @@ def reconcile_dead_running_runs(
             and int(row["current_run_id"]) == run_id
         )
         lock = row["claim_lock"] or ""
-        host_local = lock.startswith(host_prefix) if lock else True
+        host_local = _lock_is_host_local(lock) if lock else True
         # A foreign-host claim's PID is meaningless here — don't guess it dead.
         # (A NULL/empty lock is treated as host-local: an orphaned run with no
         # lock can only be reaped here.)
