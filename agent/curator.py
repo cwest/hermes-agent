@@ -189,18 +189,6 @@ def get_archive_after_days() -> int:
         return DEFAULT_ARCHIVE_AFTER_DAYS
 
 
-def get_prune_builtins() -> bool:
-    """Whether the curator may prune (archive) bundled built-in skills too.
-
-    ON by default. When on, built-ins become curation candidates and are
-    archived after the same inactivity period as agent-created skills, with a
-    suppression list keeping them archived across `hermes update` re-seeds.
-    Hub-installed skills are never pruned regardless of this flag.
-    """
-    cfg = _load_config()
-    return bool(cfg.get("prune_builtins", True))
-
-
 def get_consolidate() -> bool:
     """Whether the curator runs its LLM consolidation (umbrella-building) pass.
 
@@ -302,15 +290,27 @@ def _cron_referenced_skills() -> Set[str]:
         return set()
 
 
+def _kanban_referenced_skills() -> Set[str]:
+    """Skill names force-loaded by any non-terminal kanban card (any board)."""
+    return skill_usage.kanban_referenced_skills()
+
+
+def referenced_skills() -> Set[str]:
+    """Every skill a scheduled or queued job depends on: cron jobs (incl.
+    paused/disabled) plus open kanban cards. All prune paths exempt these."""
+    return _cron_referenced_skills() | _kanban_referenced_skills()
+
+
 def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int]:
     """Walk every curator-managed skill and move active/stale/archived based on
-    the latest real activity timestamp. Pinned skills are never touched.
+    the latest real activity timestamp. Pinned skills are never touched, nor
+    are skills referenced by a cron job or an open kanban card.
 
-    Built-ins (eligible only when ``curator.prune_builtins`` is on) are seeded
-    with a baseline record the first time they're seen so their inactivity
-    clock starts NOW rather than at epoch — a long-unused built-in is therefore
-    archived only after a fresh ``archive_after_days`` of non-use, not on the
-    first pass after the flag flips on.
+    Only agent-created skills are walked — bundled and hub-installed skills
+    are never candidates (see ``skill_usage.list_agent_created_skill_names``).
+    A candidate with no persisted record is seeded with a baseline record the
+    first time it is seen so its inactivity clock starts NOW rather than at
+    epoch.
 
     Returns a counter dict describing what changed.
     """
@@ -321,7 +321,7 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
     stale_cutoff = now - timedelta(days=get_stale_after_days())
     archive_cutoff = now - timedelta(days=get_archive_after_days())
 
-    cron_referenced = _cron_referenced_skills()
+    referenced = referenced_skills()
 
     counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
 
@@ -331,17 +331,17 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
         if row.get("pinned"):
             continue
 
-        # A skill referenced by any cron job (incl. paused/disabled) is in
-        # use by definition — resuming or the next fire must find it. The
-        # scheduler only bumps usage when a job actually fires, so jobs that
-        # fire less often than archive_after_days, paused jobs, and far-future
-        # one-shots would otherwise have their skills aged out from under
-        # them. Treat referenced skills like pinned: never auto-transition.
-        if name in cron_referenced:
+        # A skill referenced by any cron job (incl. paused/disabled) or open
+        # kanban card is in use by definition — resuming, the next fire, or
+        # the card's next worker spawn must find it. Usage is only bumped
+        # when a skill actually loads, so a paused job, a far-future one-shot,
+        # or a card parked in review/blocked would otherwise have its skills
+        # aged out from under it. Treat referenced skills like pinned.
+        if name in referenced:
             continue
 
         # First sight of a curation-eligible skill with no persisted record
-        # (e.g. a newly-eligible built-in): anchor its clock to now and defer.
+        # (no telemetry yet): anchor its clock to now and defer.
         if not row.get("_persisted", True):
             _u.seed_record_if_missing(name)
             counts["seeded"] += 1
@@ -449,6 +449,9 @@ CURATOR_REVIEW_PROMPT = (
     "run. You MAY still consolidate it into an umbrella — but only because "
     "the curator rewrites cron job skill references to follow consolidations; "
     "never simply prune it.\n"
+    "3d. DO NOT archive, prune, or consolidate any skill marked `card=yes` in "
+    "the candidate list. An open kanban card force-loads it by name on every "
+    "worker it spawns; if the skill is gone the spawn fails outright.\n"
     "4. DO NOT use usage counters as a reason to skip consolidation. The "
     "counters are new and often mostly zero. Judge overlap on CONTENT, "
     "not on use_count. 'use=0' is not evidence a skill is valuable; it's "
@@ -1477,6 +1480,7 @@ def _render_candidate_list() -> str:
     if not rows:
         return "No agent-created skills to review."
     cron_referenced = _cron_referenced_skills()
+    card_referenced = _kanban_referenced_skills()
     lines = [f"Agent-created skills ({len(rows)}):\n"]
     for r in rows:
         lines.append(
@@ -1484,6 +1488,7 @@ def _render_candidate_list() -> str:
             f"state={r['state']}  "
             f"pinned={'yes' if r.get('pinned') else 'no'}  "
             f"cron={'yes' if r['name'] in cron_referenced else 'no'}  "
+            f"card={'yes' if r['name'] in card_referenced else 'no'}  "
             f"activity={r.get('activity_count', 0)}  "
             f"use={r.get('use_count', 0)}  "
             f"view={r.get('view_count', 0)}  "
@@ -1652,30 +1657,14 @@ def run_curator_review(
                     "error": None,
                 }
             else:
-                # When pruning built-ins is enabled, the candidate list now
-                # includes bundled skills. Override the default "don't touch
-                # bundled" rule for them — but only archiving is permitted, and
-                # hub-installed skills remain strictly off-limits.
-                builtins_note = ""
-                if get_prune_builtins():
-                    builtins_note = (
-                        "\n\nPRUNE-BUILTINS MODE IS ON: bundled built-in skills "
-                        "ARE included in the candidate list below and MAY be "
-                        "archived for staleness/irrelevance, overriding hard "
-                        "rule #1 for bundled skills ONLY. Hub-installed skills "
-                        "remain strictly off-limits. Treat a stale built-in the "
-                        "same as a stale agent-created skill: archive it (never "
-                        "delete). It will be restored on `hermes update` only if "
-                        "the user explicitly restores it."
-                    )
                 if dry_run:
                     prompt = (
                         f"{CURATOR_DRY_RUN_BANNER}\n\n"
-                        f"{CURATOR_REVIEW_PROMPT}{builtins_note}\n\n"
+                        f"{CURATOR_REVIEW_PROMPT}\n\n"
                         f"{candidate_list}"
                     )
                 else:
-                    prompt = f"{CURATOR_REVIEW_PROMPT}{builtins_note}\n\n{candidate_list}"
+                    prompt = f"{CURATOR_REVIEW_PROMPT}\n\n{candidate_list}"
                 llm_meta = _run_llm_review(prompt)
                 final_summary = (
                     f"{prefix}{auto_summary}; llm: {llm_meta.get('summary', 'no change')}"

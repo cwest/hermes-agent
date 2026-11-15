@@ -1441,6 +1441,82 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     return entries
 
 
+def open_card_skill_names() -> set[str]:
+    """Skill names force-loaded by any non-terminal card, across every board.
+
+    A card's ``skills`` field becomes ``hermes --skills ...`` on every worker
+    it spawns, so each listed skill must stay loadable for as long as the card
+    can still be dispatched (any status but ``done`` / ``archived``). Archived
+    boards are included — they can be unarchived with their cards intact.
+
+    Read-only and side-effect free: a board whose DB file does not exist is
+    skipped rather than created, and each DB is opened ``mode=ro``. An
+    unreadable board (corrupt file, pre-``skills`` schema) contributes nothing
+    instead of raising, so callers can treat the result as best-effort.
+
+    Board paths are built from the boards tree directly, not through
+    :func:`kanban_db_path`: the dispatcher pins ``HERMES_KANBAN_DB`` in every
+    worker env, and that override would collapse every slug onto one board.
+    The pinned DB is scanned as well, in case it lives outside the tree.
+    """
+    names: set[str] = set()
+    seen_paths: set[str] = set()
+    try:
+        boards = list_boards(include_archived=True)
+    except Exception:
+        _log.debug("open_card_skill_names: could not enumerate boards", exc_info=True)
+        boards = [{"slug": DEFAULT_BOARD}]
+    paths: list[Path] = []
+    for meta in boards:
+        try:
+            slug = _normalize_board_slug(meta.get("slug")) or DEFAULT_BOARD
+        except ValueError:
+            continue
+        if slug == DEFAULT_BOARD:
+            paths.append(kanban_home() / "kanban.db")
+        else:
+            paths.append(board_dir(slug) / "kanban.db")
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if override:
+        paths.append(Path(override).expanduser())
+    for path in paths:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        if key in seen_paths or not path.exists():
+            continue
+        seen_paths.add(key)
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error:
+            continue
+        try:
+            placeholders = ",".join("?" for _ in _TERMINAL_STATUSES)
+            rows = conn.execute(
+                "SELECT skills FROM tasks WHERE skills IS NOT NULL "
+                f"AND status NOT IN ({placeholders})",
+                tuple(_TERMINAL_STATUSES),
+            ).fetchall()
+        except sqlite3.Error:
+            _log.debug("open_card_skill_names: unreadable board %s", key, exc_info=True)
+            continue
+        finally:
+            conn.close()
+        for (raw,) in rows:
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(parsed, list):
+                continue
+            for item in parsed:
+                cleaned = str(item or "").strip().lstrip("/")
+                if cleaned:
+                    names.add(cleaned)
+    return names
+
+
 def remove_board(slug: str, *, archive: bool = True) -> dict:
     """Remove or archive a board.
 

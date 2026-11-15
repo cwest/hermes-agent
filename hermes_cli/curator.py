@@ -319,10 +319,14 @@ def _idle_days(record: dict) -> Optional[int]:
 def _cmd_prune(args) -> int:
     """Bulk-archive agent-created skills idle for >= N days.
 
-    Pinned skills are exempt. Already-archived skills are skipped. Default
-    ``--days 90`` matches a conservative read of the curator's own archive
-    threshold; adjust with ``--days``. Use ``--dry-run`` to preview.
+    Pinned skills are exempt, as are skills referenced by a cron job or an
+    open kanban card (the same reference set the automatic curator pass
+    honors). Bundled and hub-installed skills are never candidates.
+    Already-archived skills are skipped. Default ``--days 90`` matches a
+    conservative read of the curator's own archive threshold; adjust with
+    ``--days``. Use ``--dry-run`` to preview.
     """
+    from agent import curator
     from tools import skill_usage
     days = getattr(args, "days", 90)
     if days < 1:
@@ -332,9 +336,12 @@ def _cmd_prune(args) -> int:
     dry_run = bool(getattr(args, "dry_run", False))
     skip_confirm = bool(getattr(args, "yes", False))
 
+    referenced = curator.referenced_skills()
     candidates = []
     for r in skill_usage.agent_created_report():
         if r.get("pinned"):
+            continue
+        if r["name"] in referenced:
             continue
         if r.get("state") == skill_usage.STATE_ARCHIVED:
             continue
@@ -344,7 +351,7 @@ def _cmd_prune(args) -> int:
         candidates.append((r["name"], idle))
 
     if not candidates:
-        print(f"curator: nothing to prune (no unpinned skills idle >= {days}d)")
+        print(f"curator: nothing to prune (no unpinned, unreferenced skills idle >= {days}d)")
         return 0
 
     candidates.sort(key=lambda c: -c[1])

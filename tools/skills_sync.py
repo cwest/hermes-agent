@@ -654,10 +654,11 @@ def sync_skills(quiet: bool = False) -> dict:
 
     for skill_name, skill_src in bundled_skills:
         # Curator-pruned built-ins: do not re-seed. The suppression list
-        # (~/.hermes/skills/.curator_suppressed) is written when the curator
-        # archives a bundled skill with curator.prune_builtins enabled. Without
-        # this skip, every `hermes update` would resurrect a skill the user
-        # deliberately pruned. Restoring the skill clears its suppression entry.
+        # (~/.hermes/skills/.curator_suppressed) records bundled skills an
+        # older curator archived; the curator no longer archives built-ins,
+        # but those entries persist until `hermes curator restore` clears
+        # them. Without this skip, every `hermes update` would resurrect them
+        # alongside their archived copies.
         if skill_name in suppressed:
             suppressed_skipped.append(skill_name)
             continue

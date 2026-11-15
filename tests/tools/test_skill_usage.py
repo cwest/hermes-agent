@@ -18,13 +18,7 @@ def _bump_view_many(hermes_home: str, skill_name: str, iterations: int) -> None:
 
 @pytest.fixture
 def skills_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with a clean skills/ dir for each test.
-
-    Pins ``curator.prune_builtins`` OFF so the bundled/hub-protection tests in
-    this module exercise the off-path semantics regardless of the shipped
-    default. Tests that want built-ins to be curation-eligible flip it back on
-    explicitly via ``monkeypatch.setattr(mod, "_prune_builtins_enabled", ...)``.
-    """
+    """Isolated HERMES_HOME with a clean skills/ dir for each test."""
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "skills").mkdir()
@@ -34,7 +28,6 @@ def skills_home(tmp_path, monkeypatch):
     import importlib
     import tools.skill_usage as mod
     importlib.reload(mod)
-    monkeypatch.setattr(mod, "_prune_builtins_enabled", lambda: False)
     return home
 
 

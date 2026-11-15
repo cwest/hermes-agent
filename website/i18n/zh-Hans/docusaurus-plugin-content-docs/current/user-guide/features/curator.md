@@ -10,7 +10,11 @@ Curator 是针对 **agent 创建的技能**的后台维护流程。它跟踪每�
 
 它的存在是为了防止通过[自我改进循环](/user-guide/features/skills#agent-managed-skills-skill_manage-tool)创建的技能无限堆积。每次 agent 解决新问题并保存技能时，该技能都会落入 `~/.hermes/skills/`。若没有维护，最终会出现数十个范围狭窄的近似重复项，污染技能目录并浪费 token（令牌）。
 
-默认情况下（`prune_builtins: true`），Curator 在 `archive_after_days` 天未使用后，可以归档**未使用的捆绑内置技能**（随仓库附带），与它主要管理的 agent 自创技能一并处理。通过 [agentskills.io](https://agentskills.io) 安装的 hub 技能始终不受影响。设置 `curator.prune_builtins: false` 可恢复旧的“仅 agent 自创”行为，此时捆绑技能绝不会被触碰。Curator 也**绝不自动删除**——最坏的结果是归档到 `~/.hermes/skills/.archive/`，这是可恢复的。
+Curator 只处理 agent 创建的技能。**捆绑内置技能**（随仓库附带）和 **hub 安装的技能**（来自 [agentskills.io](https://agentskills.io)）绝不会被归档、修补或合并——这与 `hermes curator pin` 拒绝固定它们所依据的来源规则相同。被 cron 任务引用、或被未结束的 kanban 卡片（其 `skills` 字段）强制加载的技能，无论多久未使用，也不会被归档。Curator 也**绝不自动删除**——最坏的结果是归档到 `~/.hermes/skills/.archive/`，这是可恢复的。
+
+:::note `prune_builtins` 已停用
+早期版本提供 `curator.prune_builtins`（默认开启），允许 Curator 归档未使用的捆绑技能。该配置项现已被忽略。在其作用下被归档的内置技能会保留在 `~/.hermes/skills/.archive/` 和重新播种的抑制列表中，直到你运行 `hermes curator restore <name>`。
+:::
 
 跟踪 [issue #7816](https://github.com/NousResearch/hermes-agent/issues/7816)。
 
