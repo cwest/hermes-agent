@@ -152,7 +152,8 @@ def test_restore_still_recovers_a_previously_pruned_bundled_skill(env):
     archive = env.skills / ".archive"
     archive.mkdir()
     src.rename(archive / "github-auth")
-    env.usage.add_suppressed_name("github-auth")
+    # Pre-fix releases recorded pruned built-ins on the suppression list.
+    (env.skills / ".curator_suppressed").write_text("github-auth\n", encoding="utf-8")
 
     ok, msg = env.usage.restore_skill("github-auth")
 
@@ -218,6 +219,37 @@ def test_open_card_skill_names_spans_boards_and_strips_slash(env):
                        detached=True)
 
     assert {"lead-slash", "plain", "other-board"} <= kb.open_card_skill_names()
+
+
+@pytest.mark.parametrize("pinned", ["default", "other"])
+def test_open_card_skill_names_ignores_single_board_db_pin(env, monkeypatch, pinned):
+    """A worker env pins HERMES_KANBAN_DB to one board; the scan still covers all."""
+    kb = env.kb
+    _card(env, ["default-skill"])
+    kb.create_board("other")
+    with kb.connect_closing(board="other") as conn:
+        kb.create_task(conn, title="t", assignee="w", skills=["other-board-skill"],
+                       detached=True)
+    pinned_path = kb.kanban_db_path(pinned)
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned_path))
+
+    assert {"default-skill", "other-board-skill"} <= kb.open_card_skill_names()
+
+
+def test_open_card_skill_names_includes_off_tree_pinned_db(env, monkeypatch, tmp_path):
+    """A HERMES_KANBAN_DB outside the boards tree is scanned in addition."""
+    kb = env.kb
+    _card(env, ["default-skill"])
+    off_tree = tmp_path / "elsewhere" / "kanban.db"
+    off_tree.parent.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(off_tree))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        kb.create_task(conn, title="t", assignee="w", skills=["pinned-skill"],
+                       detached=True)
+
+    assert {"default-skill", "pinned-skill"} <= kb.open_card_skill_names()
 
 
 def test_candidate_list_marks_card_referenced_skills(env):

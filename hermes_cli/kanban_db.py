@@ -1453,6 +1453,11 @@ def open_card_skill_names() -> set[str]:
     skipped rather than created, and each DB is opened ``mode=ro``. An
     unreadable board (corrupt file, pre-``skills`` schema) contributes nothing
     instead of raising, so callers can treat the result as best-effort.
+
+    Board paths are built from the boards tree directly, not through
+    :func:`kanban_db_path`: the dispatcher pins ``HERMES_KANBAN_DB`` in every
+    worker env, and that override would collapse every slug onto one board.
+    The pinned DB is scanned as well, in case it lives outside the tree.
     """
     names: set[str] = set()
     seen_paths: set[str] = set()
@@ -1461,12 +1466,24 @@ def open_card_skill_names() -> set[str]:
     except Exception:
         _log.debug("open_card_skill_names: could not enumerate boards", exc_info=True)
         boards = [{"slug": DEFAULT_BOARD}]
+    paths: list[Path] = []
     for meta in boards:
         try:
-            path = kanban_db_path(meta.get("slug"))
-        except Exception:
+            slug = _normalize_board_slug(meta.get("slug")) or DEFAULT_BOARD
+        except ValueError:
             continue
-        key = str(path)
+        if slug == DEFAULT_BOARD:
+            paths.append(kanban_home() / "kanban.db")
+        else:
+            paths.append(board_dir(slug) / "kanban.db")
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if override:
+        paths.append(Path(override).expanduser())
+    for path in paths:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
         if key in seen_paths or not path.exists():
             continue
         seen_paths.add(key)
