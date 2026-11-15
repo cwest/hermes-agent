@@ -14331,24 +14331,52 @@ def _lane_work_provably_done(conn: sqlite3.Connection, task_id: str) -> bool:
     Only proof is a carve-out; absence of proof keeps the strict
     protocol-violation behavior (a genuinely-incomplete quiet exit STILL
     counts), so this cannot mask real breakage.
+
+    Every proof must POSTDATE the latest rework requeue
+    (:func:`_latest_rework_requeue_ts` — an unblock, or a ``request_changes``
+    bounce to ``ready``). After a review bounce the card still carries the
+    original PR handoff, the reviewer's verdict quoting the PR URL, and the
+    build run's ``completed`` row; all of it describes the work being
+    reworked, not the rework. Without the cutoff a rework worker that dies at
+    startup (e.g. an unknown pinned skill aborts the CLI) rides that stale
+    evidence to ``review`` and the reviewer sees the same head again. Comments
+    from recovery actors (:data:`_RESPAWN_GUARD_RECOVERY_AUTHOR_PREFIXES`)
+    never count: they audit the card, they never do its lane work.
     """
     now = int(time.time())
+    rework_ts = _latest_rework_requeue_ts(conn, task_id)
+    # Strictly newer than the requeue: the requeue causally follows the
+    # evidence it supersedes, and a rework worker cannot produce new evidence
+    # in the same second it was requeued.
+    after = -1 if rework_ts is None else rework_ts
+    recovery_filter = " AND ".join(
+        "author NOT LIKE ?" for _ in _RESPAWN_GUARD_RECOVERY_AUTHOR_PREFIXES
+    )
+    recovery_params = tuple(
+        f"{p}%" for p in _RESPAWN_GUARD_RECOVERY_AUTHOR_PREFIXES
+    )
+
+    def _lane_comments(since: int) -> list:
+        return conn.execute(
+            "SELECT body FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ? AND created_at > ? "
+            f"AND {recovery_filter}",
+            (task_id, since, after, *recovery_params),
+        ).fetchall()
 
     # Proof 1: a completed run within the success window.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     if conn.execute(
         "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
-        (task_id, cutoff),
+        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
+        "AND ended_at > ?",
+        (task_id, cutoff, after),
     ).fetchone():
         return True
 
     # Proof 2: a GitHub PR URL in a recent comment (ready-for-review handoff).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
+    for c in _lane_comments(pr_cutoff):
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
             return True
 
@@ -14367,11 +14395,7 @@ def _lane_work_provably_done(conn: sqlite3.Connection, task_id: str) -> bool:
         trow["workspace_kind"], trow["workspace_path"]
     ):
         handoff_cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
-        for c in conn.execute(
-            "SELECT body FROM task_comments "
-            "WHERE task_id = ? AND created_at >= ?",
-            (task_id, handoff_cutoff),
-        ).fetchall():
+        for c in _lane_comments(handoff_cutoff):
             if c["body"] and _LANE_DONE_HANDOFF_RE.search(c["body"]):
                 return True
 

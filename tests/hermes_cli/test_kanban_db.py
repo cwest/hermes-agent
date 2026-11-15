@@ -2810,6 +2810,184 @@ def test_clean_exit_after_done_pr_card_without_owner_map_still_releases_ready(
 
 
 # ---------------------------------------------------------------------------
+# A rework run that dies at startup must not be advanced to review.
+#
+# After a review bounce, the card still carries the original PR-open handoff
+# comment, the reviewer's verdict comment quoting the PR URL, and the build
+# run's ``completed`` row. All of that evidence belongs to the work being
+# reworked. A rework worker that crashes before doing anything (e.g. an
+# unknown pinned skill aborts the CLI) leaves no new evidence, so the reap
+# must treat it as a crash, not as clean-exit-after-done.
+# ---------------------------------------------------------------------------
+
+
+def _seed_reviewed_pr_card(conn, *, backdate):
+    """A PR-open code card that was built, reviewed, and bounced for rework.
+
+    Every pre-bounce artifact is backdated by ``backdate`` seconds so the
+    rework requeue is strictly newer than the evidence it supersedes.
+    """
+    tid = kb.create_task(
+        conn, title="fix: a bug", assignee="easley",
+        workspace_kind="worktree",
+        workspace_path="/Users/caseywest/src/hermes-agent", detached=True,
+    )
+    _stamp_submit_owner_map(conn, tid, ready="easley", review="lamport")
+    kb.add_comment(
+        conn, tid, "easley",
+        "PR opened (draft): https://github.com/cwest/hermes-agent/pull/601 "
+        "head=b69fece",
+    )
+    kb.add_comment(
+        conn, tid, "lamport",
+        "Verdict: CHANGES-REQUESTED\n"
+        "PR: https://github.com/cwest/hermes-agent/pull/601 @ head b69fece",
+    )
+    old = int(time.time()) - backdate
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, outcome, "
+        "started_at, ended_at) VALUES (?, 'easley', 'completed', "
+        "'completed', ?, ?)",
+        (tid, old - 60, old),
+    )
+    conn.execute(
+        "UPDATE task_comments SET created_at = ? WHERE task_id = ?",
+        (old, tid),
+    )
+    conn.commit()
+    # The review bounce: a block auto-routed back to the author + unblock.
+    assert kb.block_task(conn, tid, reason="review-changes-requested: F1")
+    assert kb.unblock_task(conn, tid)
+    return tid
+
+
+def test_rework_worker_dying_at_startup_is_not_advanced_to_review(
+    kanban_home, monkeypatch,
+):
+    """Startup failure on a rework run: the pid is gone with no captured
+    status and no new commit, comment, or terminal verb. The pre-bounce PR
+    handoff must not count as proof, so the card is not moved to review.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = _seed_reviewed_pr_card(conn, backdate=120)
+
+        _stage_unknown_exit(conn, _kb, tid, 71001)
+        crashed = kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task.status != "review", (
+            "a rework run that died at startup must not be advanced to review"
+        )
+        assert task.assignee == "easley", task.assignee
+        assert tid in crashed, "a startup death is a crash"
+        events = kb.list_events(conn, tid)
+        assert not [
+            e for e in events
+            if (e.payload or {}).get("by")
+            == "dispatcher:clean-exit-after-done-advance"
+        ], [e.kind for e in events]
+        assert "crashed" in [e.kind for e in events]
+
+
+def test_rework_worker_dying_at_startup_rc1_is_not_advanced(
+    kanban_home, monkeypatch,
+):
+    """Same startup death, but the reap captured the CLI's non-zero exit."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = _seed_reviewed_pr_card(conn, backdate=120)
+
+        _stage_clean_exit(conn, _kb, tid, 71002)
+        _kb._record_worker_exit(71002, _exited_status(1))
+        crashed = kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task.status != "review", task.status
+        assert tid in crashed
+
+
+def test_rework_worker_posting_new_pr_handoff_still_advances(
+    kanban_home, monkeypatch,
+):
+    """A rework run that did its lane (posted a fresh PR handoff after the
+    bounce) and exited without a terminal verb still auto-advances.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = _seed_reviewed_pr_card(conn, backdate=120)
+        # Push the bounce into the past so the new handoff is strictly newer.
+        conn.execute(
+            "UPDATE task_events SET created_at = ? "
+            "WHERE task_id = ? AND kind IN ('blocked', 'unblocked')",
+            (int(time.time()) - 30, tid),
+        )
+        conn.commit()
+        kb.add_comment(
+            conn, tid, "easley",
+            "Rework pushed: https://github.com/cwest/hermes-agent/pull/601 "
+            "head=c0ffee1",
+        )
+
+        _stage_clean_exit(conn, _kb, tid, 71003)
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid not in crashed
+        task = kb.get_task(conn, tid)
+        assert task.status == "review", task.status
+        assert task.assignee == "lamport", task.assignee
+
+
+def test_no_pr_card_stale_handoff_before_rework_is_not_proof(
+    kanban_home, monkeypatch,
+):
+    """Sibling path: a no-PR edit-in-place card bounced for rework still
+    carries its old ``review-required:`` handoff. A rework worker that crashes
+    at startup must not ride that stale handoff to review.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="edit-in-place", assignee="easley", detached=True,
+        )
+        _stamp_submit_owner_map(conn, tid, ready="easley", review="lamport")
+        kb.add_comment(
+            conn, tid, "easley",
+            "review-required: applied the config edit; validator green",
+        )
+        conn.execute(
+            "UPDATE task_comments SET created_at = ? WHERE task_id = ?",
+            (int(time.time()) - 120, tid),
+        )
+        conn.commit()
+        assert kb.block_task(conn, tid, reason="review-changes-requested: F1")
+        assert kb.unblock_task(conn, tid)
+
+        _stage_signaled_exit(conn, _kb, tid, 71004)
+        crashed = kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task.status != "review", task.status
+        assert tid in crashed
+
+
+# ---------------------------------------------------------------------------
 # Sibling path (#47 missed): transient API / connection failures.
 #
 # A worker whose run dies because the model endpoint was transiently
