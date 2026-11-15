@@ -53,6 +53,43 @@ def test_regex_preserves_user_env():
         assert not rx.search(line), f"{line!r} must be preserved in the snapshot"
 
 
+def _lineage_marker_names():
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER,
+        KANBAN_ENV_KEYS,
+        KANBAN_ORIGIN_ENV_KEY,
+    )
+
+    return (DELEGATED_CHILD_ENV_MARKER, KANBAN_ORIGIN_ENV_KEY, *KANBAN_ENV_KEYS)
+
+
+def test_regex_matches_lineage_and_kanban_markers():
+    """Per-turn / per-lineage markers must never persist in the snapshot.
+
+    A delegate_task child's command exports HERMES_DELEGATED_CHILD_CONTEXT=1;
+    a gateway turn mirrors HERMES_KANBAN_ORIGIN. If either lands in the shared
+    snapshot, every later command of every later session sources it back.
+    """
+    rx = re.compile(_SNAPSHOT_EXCLUDED_ENV_REGEX)
+    for name in _lineage_marker_names():
+        for line in (f'declare -x {name}="v"', f"declare -x {name}"):
+            assert rx.search(line), f"{line!r} should be excluded from the snapshot"
+
+
+def test_regex_lineage_names_are_exact_not_prefixes():
+    rx = re.compile(_SNAPSHOT_EXCLUDED_ENV_REGEX)
+    for name in _lineage_marker_names():
+        line = f'declare -x {name}_SUFFIX="v"'
+        assert not rx.search(line), f"{line!r} must be preserved (exact-name match)"
+
+
+def test_session_context_origin_key_is_the_shared_constant():
+    from agent.delegation_context import KANBAN_ORIGIN_ENV_KEY
+    from gateway.session_context import _KANBAN_ORIGIN_ENV
+
+    assert _KANBAN_ORIGIN_ENV == KANBAN_ORIGIN_ENV_KEY
+
+
 def test_export_snippet_shape():
     snippet = _export_dump_excluding_session_vars("/tmp/snap.tmp.$BASHPID")
     assert "export -p" in snippet
@@ -109,5 +146,54 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
         if os.path.exists(snap):
             with open(snap) as f:
                 assert "HERMES_SESSION_ID" not in f.read()
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_shared_snapshot_drops_lineage_markers(tmp_path, monkeypatch):
+    """A command that exports lineage/kanban markers must not poison later ones.
+
+    Reproduces the orchestrator wake that inherited a delegate child's
+    HERMES_DELEGATED_CHILD_CONTEXT=1 (every ``hermes kanban`` call then refused
+    to run) and a stale HERMES_KANBAN_ORIGIN from an earlier turn.
+    """
+    import threading
+
+    from tools.environments.local import LocalEnvironment
+
+    names = _lineage_marker_names()
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    env.init_session()
+    try:
+        exports = " ".join(f"{n}=stale-{n}" for n in names)
+        first = env.execute(f"export {exports}; echo ok")
+        assert "ok" in first.get("output", "")
+
+        # Ordinary user exports still persist (the snapshot keeps working).
+        env.execute("export T5991_USER_VAR=kept")
+
+        probe = " ".join(f'"{n}=[${{{n}-unset}}]"' for n in names)
+        out = {}
+
+        def later_session():
+            out["r"] = env.execute(f'printf "%s\\n" {probe} "U=[$T5991_USER_VAR]"')
+
+        t = threading.Thread(target=later_session)
+        t.start()
+        t.join()
+        text = out["r"].get("output", "")
+
+        assert "U=[kept]" in text, text
+        for name in names:
+            assert f"{name}=[unset]" in text, f"{name} leaked via snapshot: {text!r}"
+
+        with open(env._snapshot_path) as f:
+            snap = f.read()
+        for name in names:
+            assert f"stale-{name}" not in snap, f"{name} persisted in the snapshot"
     finally:
         env.cleanup()

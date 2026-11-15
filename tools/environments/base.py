@@ -398,8 +398,32 @@ def _cwd_marker(session_id: str) -> str:
 #
 # Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
 # with one of these prefixes.
+#
+# Per-turn / per-lineage markers are excluded too, by EXACT name: the
+# delegate_task child marker (HERMES_DELEGATED_CHILD_CONTEXT), the kanban
+# delivery-origin mirror (HERMES_KANBAN_ORIGIN) and the dispatcher-owned
+# HERMES_KANBAN_* worker keys. A delegate child's command runs with the marker
+# exported, so a snapshot written by that command would hand it to every later
+# command of every later session — turning an ordinary orchestrator turn into a
+# "delegate child" that the kanban layer refuses to serve, and replaying a stale
+# origin/task binding. Whoever legitimately owns these vars (a dispatched
+# worker's process env, a delegate child's scrubbed Popen env) supplies them
+# fresh on each command, so dropping them from the snapshot loses nothing.
+# The names are derived from agent.delegation_context, the single owner of the
+# lineage key set, rather than hand-listed again here.
+def _lineage_env_names() -> tuple[str, ...]:
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER,
+        KANBAN_ENV_KEYS,
+        KANBAN_ORIGIN_ENV_KEY,
+    )
+
+    return (DELEGATED_CHILD_ENV_MARKER, KANBAN_ORIGIN_ENV_KEY, *KANBAN_ENV_KEYS)
+
+
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_"
+    f"|({'|'.join(_lineage_env_names())})(=|$))"
 )
 
 

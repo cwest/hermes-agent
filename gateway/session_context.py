@@ -39,6 +39,8 @@ needs to replace the import + call site:
 from contextvars import ContextVar
 from typing import Any
 
+from agent.delegation_context import KANBAN_ORIGIN_ENV_KEY
+
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
 # When it holds "" (after clear_session_vars resets it), we return "" — no fallback.
@@ -184,7 +186,7 @@ def set_current_session_id(session_id: str) -> None:
 # Kanban origin helpers
 # ---------------------------------------------------------------------------
 
-_KANBAN_ORIGIN_ENV = "HERMES_KANBAN_ORIGIN"
+_KANBAN_ORIGIN_ENV = KANBAN_ORIGIN_ENV_KEY
 _KANBAN_ORIGIN_FIELDS = ("platform", "chat_id", "thread_id", "user_id", "session_id")
 # Internal key stamped into the mirror blob (NOT one of _KANBAN_ORIGIN_FIELDS, so
 # it never leaks into a returned origin dict): the pid of the process that wrote

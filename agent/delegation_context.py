@@ -19,6 +19,10 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
+# Env mirror of the kanban delivery origin (see gateway.session_context). Owned
+# here so the gateway mirror and the terminal snapshot filter share one name.
+KANBAN_ORIGIN_ENV_KEY = "HERMES_KANBAN_ORIGIN"
+
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
     "HERMES_KANBAN_RUN_ID",
