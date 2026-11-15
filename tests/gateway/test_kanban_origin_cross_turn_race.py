@@ -107,7 +107,8 @@ def test_detached_worker_inherits_foreign_pid_mirror():
     A dispatched worker inherits the mirror via the parent's copied environ; its
     ContextVar is _UNSET and the mirror's owner pid is the parent's (not the
     worker's own). That value is legitimate and must be returned — this is the
-    whole reason the mirror exists.
+    whole reason the mirror exists. The worker's session vars are unbound (the
+    hermetic fixture scrubs them), so the reader-identity guard does not apply.
     """
     sc._KANBAN_ORIGIN.set(sc._UNSET)
     # Simulate the seeded worker env: a mirror written by the PARENT process
