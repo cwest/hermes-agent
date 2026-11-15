@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -4058,6 +4059,86 @@ def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
             (t, now - 10),
         )
         assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_recent_success_bypassed_by_request_changes_bounce(kanban_home):
+    """A reviewer's request_changes bounce (review -> running -> ready +
+    author) after a fresh build completion is a deliberate rework requeue.
+    The guard must let the author respawn instead of holding the card for the
+    whole success window."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley", detached=True)
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        conn.commit()
+        _claim_review(conn, t)
+        assert kb.request_changes(conn, t, author="easley") is True
+        task = kb.get_task(conn, t)
+        assert task is not None and task.status == "ready"
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_recent_success_not_bypassed_by_move_to_review(kanban_home):
+    """A status_changed into a lane other than ready (the normal build ->
+    review handoff) is not a requeue: the completed build still guards."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley", detached=True)
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'status_changed', ?, ?)",
+            (t, json.dumps({"from": "running", "to": "review"}), now - 30),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, t) == "recent_success"
+
+
+def test_respawn_guard_active_pr_cleared_by_request_changes_bounce(
+    kanban_home, monkeypatch,
+):
+    """A request_changes bounce sends the author back to rework the SAME
+    open PR, so the PR-handoff comment posted before the bounce must not veto
+    the respawn (same rationale as an explicit unblock). A PR URL posted after
+    the bounce still guards."""
+    monkeypatch.setattr(kb, "_resolve_pr_state", lambda url: "open")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="impl", assignee="easley", detached=True)
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'easley', "
+            "'PR: https://github.com/cwest/hermes-agent/pull/7', ?)",
+            (t, now - 120),
+        )
+        conn.commit()
+        _claim_review(conn, t)
+        # Backdate the bounce so the pre-bounce PR comment is strictly older.
+        assert kb.request_changes(conn, t, author="easley") is True
+        conn.execute(
+            "UPDATE task_events SET created_at = ? "
+            "WHERE task_id = ? AND kind = 'status_changed'",
+            (now - 60, t),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, t) is None
+
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'easley', "
+            "'PR: https://github.com/cwest/hermes-agent/pull/8', ?)",
+            (t, now - 30),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
 
 
 def test_respawn_guard_stale_success_not_guarded(kanban_home):
