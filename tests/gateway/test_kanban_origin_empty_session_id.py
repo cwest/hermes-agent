@@ -267,3 +267,60 @@ def test_real_subprocess_files_to_its_own_thread():
     assert out["captured"] is not None
     assert out["captured"]["thread_id"] == LIVE_THREAD, out
     assert out["captured"]["session_id"] == LIVE_SESSION, out
+
+
+REASSIGNED_THREAD = "1999999999999999999"
+
+
+def test_real_subprocess_after_reassign_inherits_reassigned_thread():
+    """reassign_origin re-points the task's origin; later children must follow.
+
+    kanban_reassign_origin calls set_kanban_origin with the new thread, so the
+    task's own origin ContextVar names a thread that differs from the live
+    HERMES_SESSION_THREAD_ID. The bridge hands that binding to the child as its
+    own; the reader's sibling-thread guard is for inherited last-writer mirrors,
+    not for the spawning task's deliberate binding.
+    """
+    runner = object.__new__(GatewayRunner)
+    tokens = runner._set_session_env(_live_context())
+    try:
+        sc.set_kanban_origin(
+            platform="discord", chat_id=REASSIGNED_THREAD,
+            thread_id=REASSIGNED_THREAD, user_id=None,
+        )
+        child_env = _make_run_env({})
+    finally:
+        clear_session_vars(tokens)
+
+    proc = subprocess.run(
+        [sys.executable, "-c", _CHILD_PROGRAM, str(_REPO_ROOT)],
+        env=child_env, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip())
+    assert out["origin"] is not None, out
+    assert out["origin"]["thread_id"] == REASSIGNED_THREAD, out
+    assert out["captured"]["thread_id"] == REASSIGNED_THREAD, out
+
+
+def test_bridged_origin_still_guarded_when_inherited_unchanged():
+    """With no task binding, a stamped sibling mirror stays subject to the guard."""
+    runner = object.__new__(GatewayRunner)
+    tokens = runner._set_session_env(_live_context())
+    try:
+        sc._KANBAN_ORIGIN.set(sc._UNSET)
+        os.environ[_ORIGIN_ENV] = _sibling_mirror(owner_pid=os.getpid())
+        child_env = _make_run_env({})
+    finally:
+        clear_session_vars(tokens)
+
+    blob = json.loads(child_env[_ORIGIN_ENV])
+    assert "_owner_pid" in blob, "an inherited mirror must keep its owner stamp"
+    proc = subprocess.run(
+        [sys.executable, "-c", _CHILD_PROGRAM, str(_REPO_ROOT)],
+        env=child_env, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip())
+    assert out["origin"] is None, out
+    assert out["captured"]["thread_id"] == LIVE_THREAD, out
