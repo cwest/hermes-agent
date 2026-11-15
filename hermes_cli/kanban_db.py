@@ -14378,6 +14378,37 @@ def _lane_work_provably_done(conn: sqlite3.Connection, task_id: str) -> bool:
     return False
 
 
+def _latest_rework_requeue_ts(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[int]:
+    """Timestamp of the newest deliberate rework requeue on ``task_id``.
+
+    A rework requeue is an ``unblocked`` event or a ``status_changed`` event
+    whose payload moves the card into ``ready`` — the event a reviewer's
+    :func:`request_changes` bounce emits. Either one sends the card back to
+    its author to rework the existing artifact, so ``check_respawn_guard``
+    uses it as the cutoff past which an earlier completed build or PR-handoff
+    comment no longer vetoes the respawn. Returns None if neither exists.
+    """
+    latest: Optional[int] = None
+    for ev in conn.execute(
+        "SELECT kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind IN ('unblocked', 'status_changed')",
+        (task_id,),
+    ).fetchall():
+        if ev["kind"] == "status_changed":
+            try:
+                payload = json.loads(ev["payload"]) if ev["payload"] else {}
+            except (ValueError, TypeError):
+                payload = {}
+            if not isinstance(payload, dict) or payload.get("to") != "ready":
+                continue
+        ts = int(ev["created_at"])
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -14413,7 +14444,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
         seconds.  Useful work already succeeded for this task; wait for
         human review rather than immediately re-spawning. Bypassed when an
-        explicit re-queue event (status change, promote, unblock, reclaim)
+        explicit re-queue event (status change, promote, unblock, reclaim, or
+        a ``status_changed`` into ``ready`` from a ``request_changes`` bounce)
         arrives AFTER that completion — that's a deliberate re-run request.
         Also **skipped when the task is in status ``review``** — the build
         run that produced the artifact under review is itself a recent
@@ -14423,11 +14455,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ``"active_pr"``
         A GitHub PR URL that is still LIVE (open, or unresolvable) appears in a
         recent task comment (within ``_RESPAWN_GUARD_PR_WINDOW`` seconds) at or
-        after the latest explicit unblock.  A prior worker already opened a PR;
+        after the latest explicit rework requeue (an unblock, or a
+        ``request_changes`` bounce to ``ready``).  A prior worker already opened a PR;
         re-spawning risks a duplicate PR on the same task — unless an operator/
-        orchestrator unblocked it to resume work on that same PR (e.g. to
+        reviewer sent it back to resume work on that same PR (e.g. to
         address review feedback), in which case only PR URLs added at/after the
-        unblock guard.  The PR's LIVE state is resolved via ``_resolve_pr_state``
+        requeue guard.  The PR's LIVE state is resolved via ``_resolve_pr_state``
         (``gh``): a closed/merged PR is never active work and does NOT guard, so
         a card whose PR was closed on GitHub dispatches even though the stale
         comment link was never cleared.  An unresolvable state (``gh`` missing /
@@ -14513,29 +14546,29 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    would otherwise block the reviewer from ever spawning.
     #
     #    A completed run is additionally "superseded" — selected out at the SQL
-    #    level — by any ``unblocked`` event recorded at or after that run's
-    #    completion. When a card is deliberately unblocked to resume work (a
-    #    review-changes-requested bounce auto-routed back to the author, or any
-    #    operator block→unblock cutoff), the build run that triggered the
-    #    bounce/block is the very work being reworked, so it must not veto the
-    #    respawn. An unblock causally FOLLOWS the completion that triggered the
-    #    review (complete → move-to-review → reviewer block → unblock), and
-    #    timestamps are second-granular, so ``created_at >= ended_at`` lets a
-    #    same-second unblock clear it, matching the causal order. A run with no
-    #    such trailing unblock still guards (the normal post-build case). This
-    #    is narrower than, and composes with, the requeued_after bypass below.
+    #    level — by any rework requeue (see ``_latest_rework_requeue_ts``: an
+    #    ``unblocked`` event, or a ``status_changed`` into ``ready`` such as a
+    #    reviewer's ``request_changes`` bounce) recorded at or after that run's
+    #    completion. When a card is deliberately sent back to resume work (a
+    #    request_changes bounce, a review-changes-requested block auto-routed
+    #    back to the author, or any operator block→unblock cutoff), the build
+    #    run that triggered the bounce/block is the very work being reworked, so
+    #    it must not veto the respawn. A requeue causally FOLLOWS the completion
+    #    that triggered the review (complete → move-to-review → reviewer
+    #    bounce), and timestamps are second-granular, so ``ended_at > rework_ts``
+    #    lets a same-second requeue clear it, matching the causal order. A run
+    #    with no such trailing requeue still guards (the normal post-build case;
+    #    a ``status_changed`` into ``review`` is not a requeue). This is
+    #    narrower than, and composes with, the requeued_after bypass below.
     if not is_review:
+        rework_ts = _latest_rework_requeue_ts(conn, task_id)
         cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
         recent_completed = conn.execute(
             "SELECT r.ended_at FROM task_runs r "
             "WHERE r.task_id = ? AND r.outcome = 'completed' AND r.ended_at >= ? "
-            "AND NOT EXISTS ("
-            "  SELECT 1 FROM task_events e "
-            "  WHERE e.task_id = r.task_id AND e.kind = 'unblocked' "
-            "  AND e.created_at >= r.ended_at"
-            ") "
+            "AND r.ended_at > ? "
             "ORDER BY r.ended_at DESC LIMIT 1",
-            (task_id, cutoff),
+            (task_id, cutoff, -1 if rework_ts is None else rework_ts),
         ).fetchone()
         if recent_completed:
             completed_at = int(recent_completed["ended_at"] or 0)
@@ -14552,10 +14585,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     #    Skipped for review tasks: the PR-URL comment is exactly what the
     #    reviewer needs to act on, not a signal of a duplicate-PR risk.
-    #    If the task was explicitly unblocked after the PR handoff, honor that
-    #    as operator/orchestrator intent to resume work on the SAME PR (e.g.
-    #    addressing review feedback) and only guard on PR URLs added at or after
-    #    that unblock. Timestamps are second-granular, so a same-second PR URL is
+    #    If the task was explicitly sent back for rework after the PR handoff
+    #    (an unblock, or a ``status_changed`` into ``ready`` such as a
+    #    ``request_changes`` bounce), honor that as operator/reviewer intent to
+    #    resume work on the SAME PR (e.g. addressing review feedback) and only
+    #    guard on PR URLs added at or after that requeue. Timestamps are
+    #    second-granular, so a same-second PR URL is
     #    still guarded conservatively. (Carried from upstream PR #46204.)
     #    The dispatcher's / orchestrator's OWN audit comments (authored
     #    ``dispatcher`` / ``hollis`` / ``onecard`` / ``orchestrator`` — the
@@ -14569,13 +14604,9 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    normally.
     if not is_review:
         pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-        latest_unblock = conn.execute(
-            "SELECT MAX(created_at) AS ts FROM task_events "
-            "WHERE task_id = ? AND kind = 'unblocked'",
-            (task_id,),
-        ).fetchone()
-        if latest_unblock and latest_unblock["ts"] is not None:
-            pr_cutoff = max(pr_cutoff, int(latest_unblock["ts"]))
+        rework_ts = _latest_rework_requeue_ts(conn, task_id)
+        if rework_ts is not None:
+            pr_cutoff = max(pr_cutoff, rework_ts)
         # Live-state cache: resolve each distinct PR URL at most once per call.
         # A closed/merged PR is never active work — only an ``open`` (or an
         # unresolvable ``unknown``, fail-open) PR justifies the guard. This is
