@@ -182,6 +182,21 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_THREAD_ID",
     "HERMES_SESSION_SOURCE",
     "HERMES_SESSION_KEY",
+    # The rest of gateway.session_context._VAR_MAP. get_session_env falls back
+    # to os.environ while its ContextVar is unset, so a value inherited from a
+    # Hermes tool subprocess (HERMES_SESSION_ID is bridged per turn) changes
+    # behaviour — e.g. the kanban origin mirror guard treats the test as a
+    # per-turn context and rejects an inherited mirror. Pinned in agreement by
+    # tests/test_conftest_session_env_scrub.py.
+    "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_USER_NAME",
+    "HERMES_SESSION_ID",
+    "HERMES_UI_SESSION_ID",
+    "HERMES_SESSION_MESSAGE_ID",
+    "HERMES_SESSION_PROFILE",
+    "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+    "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+    "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
     "HERMES_GATEWAY_SESSION",
     "HERMES_CRON_SESSION",
     "_HERMES_GATEWAY",
