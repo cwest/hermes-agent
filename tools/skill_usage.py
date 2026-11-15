@@ -278,11 +278,13 @@ def _suppressed_file() -> Path:
 
 
 def read_suppressed_names() -> Set[str]:
-    """Built-in skills the curator pruned — the re-seeder must leave archived.
+    """Built-in skills the re-seeder must leave archived.
 
-    One skill name per line in ``~/.hermes/skills/.curator_suppressed``. This is
-    what makes pruning a built-in durable: without it, ``hermes update`` would
-    re-copy the bundled skill on the next sync.
+    One skill name per line in ``~/.hermes/skills/.curator_suppressed``. The
+    curator no longer prunes built-ins, so nothing adds to this list now; it
+    only holds names written by earlier releases (``curator.prune_builtins``).
+    Those entries stay honoured until ``restore_skill`` clears them, so a
+    built-in archived back then is not silently re-copied by ``hermes update``.
     """
     path = _suppressed_file()
     if not path.exists():
@@ -318,16 +320,6 @@ def _write_suppressed_names(names: Set[str]) -> None:
             raise
     except Exception as e:
         logger.debug("Failed to write curator suppression list: %s", e, exc_info=True)
-
-
-def add_suppressed_name(skill_name: str) -> None:
-    """Record that a built-in skill was pruned, so sync won't restore it."""
-    if not skill_name:
-        return
-    names = read_suppressed_names()
-    if skill_name not in names:
-        names.add(skill_name)
-        _write_suppressed_names(names)
 
 
 def remove_suppressed_name(skill_name: str) -> None:
@@ -558,8 +550,9 @@ def get_record(skill_name: str) -> Dict[str, Any]:
 def seed_record_if_missing(skill_name: str) -> None:
     """Persist a baseline usage record for a curation-eligible skill.
 
-    Built-ins carry no usage record until something touches them, which leaves
-    their inactivity clock with no anchor. Seeding a record here fixes
+    A curation-eligible skill can reach the curator with no usage record (e.g.
+    one marked agent-created before telemetry recorded it), which leaves its
+    inactivity clock with no anchor. Seeding a record here fixes
     ``created_at`` to the moment the curator first sees the skill, so the
     archive/stale clock measures non-use FROM THEN — not from epoch. No-op when
     a record already exists or the skill isn't curation-eligible.
@@ -657,7 +650,7 @@ def mark_agent_created(skill_name: str) -> None:
 
 def set_state(skill_name: str, state: str) -> None:
     """Set lifecycle state. No-op if *state* is invalid or the skill isn't
-    curator-manageable (hub skills, or built-ins with pruning disabled)."""
+    curator-manageable (bundled built-ins and hub-installed skills never are)."""
     if state not in _VALID_STATES:
         logger.debug("set_state: invalid state %r for %s", state, skill_name)
         return
@@ -875,8 +868,8 @@ def agent_created_report() -> List[Dict[str, Any]]:
     backfilled with defaults so callers can always index fields.
 
     Each row carries ``_persisted``: True when a real record exists in
-    ``.usage.json``, False when the row is a fresh backfill (e.g. a built-in
-    seen for the first time). The curator uses this to seed the inactivity
+    ``.usage.json``, False when the row is a fresh backfill (an eligible skill
+    the curator has not recorded yet). The curator uses this to seed the inactivity
     clock instead of treating an unrecorded skill as ancient.
     """
     data = load_usage()

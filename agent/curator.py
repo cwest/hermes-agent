@@ -341,7 +341,7 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
             continue
 
         # First sight of a curation-eligible skill with no persisted record
-        # (e.g. a newly-eligible built-in): anchor its clock to now and defer.
+        # (no telemetry yet): anchor its clock to now and defer.
         if not row.get("_persisted", True):
             _u.seed_record_if_missing(name)
             counts["seeded"] += 1
