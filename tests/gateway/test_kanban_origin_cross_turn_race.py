@@ -158,6 +158,144 @@ def test_own_task_contextvar_still_wins():
 # Consumer chain: card filing must NOT inherit a poisoned sibling origin.
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# (C/D) A per-turn TOOL SUBPROCESS must not read a FOREIGN turn's mirror.
+#
+# The owner-pid guard alone (requirement A/B above) is read IN the gateway
+# process. A terminal/execute_code/delegate tool subprocess spawned by the
+# gateway has a DIFFERENT pid, so a mirror written by the gateway parent — whose
+# value is whichever concurrent turn wrote it LAST — passes the foreign-pid
+# check and is wrongly accepted as a legitimate spawn-boundary inheritance. The
+# per-turn HERMES_SESSION_ID *is* bridged correctly into that subprocess env, so
+# it is the discriminator: a mirror whose session_id disagrees with the
+# subprocess's own HERMES_SESSION_ID is a foreign turn's leftover, not this
+# turn's origin.
+# --------------------------------------------------------------------------- #
+
+def test_subprocess_rejects_foreign_turn_mirror_by_session_id(monkeypatch):
+    """A tool subprocess must reject a mirror whose session_id is a foreign turn.
+
+    Reproduces the live 2026-11-15 wrong-thread report: the gateway parent wrote
+    the process-global mirror for turn B (last-writer-wins). Turn A then spawns a
+    terminal subprocess; in that subprocess the ContextVar is _UNSET and the
+    bridged HERMES_SESSION_ID is turn A's. The mirror's owner pid is the gateway
+    parent's (foreign to the subprocess), so the owner-pid guard accepts it — but
+    its session_id is turn B's. The subprocess must NOT resolve turn B's origin.
+    """
+    sc._KANBAN_ORIGIN.set(sc._UNSET)
+    # Seeded subprocess env: mirror written by the gateway PARENT (foreign pid)
+    # for turn B (the last concurrent turn to write the process-global mirror).
+    foreign_pid = os.getpid() + 100000
+    os.environ[_ORIGIN_ENV] = json.dumps({
+        "platform": "discord", "chat_id": "TURN_B_CHAT", "thread_id": "TURN_B_THREAD",
+        "user_id": "UB", "session_id": "SESSION_B",
+        "_owner_pid": foreign_pid,
+    })
+    # This subprocess belongs to turn A: HERMES_SESSION_ID is bridged in as A's.
+    monkeypatch.setenv("HERMES_SESSION_ID", "SESSION_A")
+
+    got = get_kanban_origin()
+    assert got is None, (
+        "tool subprocess read a FOREIGN turn's origin off the process-global "
+        f"mirror: got {got!r} (session_id SESSION_B) while its own turn is "
+        "SESSION_A"
+    )
+
+
+def test_subprocess_accepts_same_turn_mirror_by_session_id(monkeypatch):
+    """A subprocess whose own session_id matches the mirror accepts it.
+
+    The same-turn subprocess case: turn A spawns a tool subprocess and the
+    mirror the subprocess inherited IS turn A's own origin. Its session_id
+    matches the bridged HERMES_SESSION_ID, so it must be returned — the fix must
+    only reject a *disagreeing* session_id, never a matching one.
+    """
+    sc._KANBAN_ORIGIN.set(sc._UNSET)
+    foreign_pid = os.getpid() + 100000
+    os.environ[_ORIGIN_ENV] = json.dumps({
+        "platform": "discord", "chat_id": "TURN_A_CHAT", "thread_id": "TURN_A_THREAD",
+        "user_id": "UA", "session_id": "SESSION_A",
+        "_owner_pid": foreign_pid,
+    })
+    monkeypatch.setenv("HERMES_SESSION_ID", "SESSION_A")
+
+    got = get_kanban_origin()
+    assert got is not None, "same-turn subprocess lost its own inherited origin"
+    assert got["chat_id"] == "TURN_A_CHAT", got
+    assert got["thread_id"] == "TURN_A_THREAD", got
+
+
+def test_detached_worker_without_local_session_still_inherits(monkeypatch):
+    """A detached worker with no bound session_id keeps the inherited origin.
+
+    The legitimate detached-worker case (requirement B) must survive the
+    session_id guard: a dispatched worker's own session is foreign/unbound, so it
+    has NO HERMES_SESSION_ID to compare against. With nothing to disagree with,
+    the foreign-pid mirror it inherited is still accepted.
+    """
+    sc._KANBAN_ORIGIN.set(sc._UNSET)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    foreign_pid = os.getpid() + 100000
+    os.environ[_ORIGIN_ENV] = json.dumps({
+        "platform": "discord", "chat_id": "WORKER_HUMAN", "thread_id": "WT",
+        "user_id": "UW", "session_id": "SW",
+        "_owner_pid": foreign_pid,
+    })
+
+    got = get_kanban_origin()
+    assert got is not None, "detached worker lost its inherited origin"
+    assert got["chat_id"] == "WORKER_HUMAN", got
+
+
+def test_subprocess_rejects_foreign_mirror_with_null_session_id(monkeypatch):
+    """A foreign mirror with a NULL session_id is rejected by a per-turn reader.
+
+    The exact live 2026-11-15 repro shape: the gateway parent's process-global
+    mirror carried ``session_id=null`` (a surface captured with no session
+    handle) while the tool subprocess's own turn had HERMES_SESSION_ID bound. A
+    null session_id cannot be attributed to this turn, so a per-turn reader must
+    NOT accept it — otherwise the card routes to the parent/Home channel instead
+    of the live thread.
+    """
+    sc._KANBAN_ORIGIN.set(sc._UNSET)
+    monkeypatch.setenv("HERMES_SESSION_ID", "20261031_155357_ddba09e6")
+    foreign_pid = os.getpid() + 100000
+    os.environ[_ORIGIN_ENV] = json.dumps({
+        "platform": "discord", "chat_id": "1515879019269197885", "thread_id": None,
+        "user_id": None, "session_id": None,
+        "_owner_pid": foreign_pid,
+    })
+
+    got = get_kanban_origin()
+    assert got is None, (
+        "per-turn subprocess accepted a null-session_id foreign mirror (the live "
+        f"wrong-thread repro): got {got!r}, expected None"
+    )
+
+
+def test_detached_worker_accepts_null_session_id_mirror(monkeypatch):
+    """A detached worker (no bound session) still inherits a null-session_id seed.
+
+    The dispatcher seeds a worker's HERMES_KANBAN_ORIGIN from the card's
+    notify-sub, which carries ``session_id=None`` by construction
+    (kanban_db.worker_origin_env). The worker binds no HERMES_SESSION_ID, so the
+    null-session_id guard must NOT fire — the seed is the worker's legitimate
+    origin and must be returned.
+    """
+    sc._KANBAN_ORIGIN.set(sc._UNSET)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    foreign_pid = os.getpid() + 100000
+    os.environ[_ORIGIN_ENV] = json.dumps({
+        "platform": "discord", "chat_id": "WORKER_HUMAN", "thread_id": "WT",
+        "user_id": None, "session_id": None,
+        "_owner_pid": foreign_pid,
+    })
+
+    got = get_kanban_origin()
+    assert got is not None, "detached worker lost its null-session_id seed origin"
+    assert got["chat_id"] == "WORKER_HUMAN", got
+
+
 def test_capture_ignores_poisoned_mirror_and_snapshots_live_session():
     """The card-filing seam resolves the LIVE session, not the sibling's mirror.
 

@@ -243,15 +243,29 @@ def get_kanban_origin() -> dict | None:
        :func:`set_kanban_origin` / :func:`capture_root_origin_if_absent`), that
        value is authoritative for this task and is returned. Concurrency-safe by
        construction — a ContextVar is task-local.
-    2. **os.environ mirror, PID-scoped.** When the ContextVar is ``_UNSET`` the
-       value can only come from the process-global mirror. That mirror is
-       last-writer-wins across concurrent turns, so it is returned ONLY when it
-       was written by a *different* process — i.e. inherited across a spawn
-       boundary (the detached-worker case the mirror exists to serve). A mirror
-       stamped with THIS process's pid is a concurrent sibling turn's leftover
-       (the poisoning race) and is rejected → ``None``. A mirror with no owner-pid
-       stamp (a legacy/raw-env value that cannot be attributed to this process's
-       turns) is treated as inherited and returned, preserving back-compat.
+    2. **os.environ mirror, PID- and session-scoped.** When the ContextVar is
+       ``_UNSET`` the value can only come from the process-global mirror. That
+       mirror is last-writer-wins across concurrent turns, so two guards gate it:
+
+       a. **Owner pid.** A mirror stamped with THIS process's pid is a concurrent
+          sibling turn's leftover (the in-process poisoning race) and is rejected
+          → ``None``. A foreign pid (or no stamp) means the value crossed a spawn
+          boundary.
+       b. **Session id.** A foreign-pid mirror is normally an inherited origin —
+          but a *per-turn tool subprocess* (terminal / execute_code / delegate)
+          also has a foreign pid relative to the gateway parent that wrote the
+          mirror, and that mirror holds whichever concurrent turn wrote it LAST,
+          not necessarily this subprocess's turn. The subprocess's OWN turn
+          identity rides in via the bridged ``HERMES_SESSION_ID``, so it is the
+          discriminator: when this process HAS a live ``HERMES_SESSION_ID`` (a
+          per-turn context), the mirror is this turn's origin ONLY if its
+          ``session_id`` is present AND equals ours — a differing session_id OR a
+          null/absent one (which cannot be attributed to this turn) is a foreign
+          turn's leftover and is rejected → ``None``. When the reader has NO bound
+          session (a genuinely detached worker / CLI / cron, whose seeded mirror
+          legitimately carries ``session_id=None``), the mirror is its only origin
+          source and is accepted — preserving the spawn-boundary inheritance the
+          mirror exists for.
     3. ``None`` when neither source yields a usable value or the blob can't be
        parsed.
     """
@@ -280,6 +294,33 @@ def get_kanban_origin() -> dict | None:
     # legitimate (requirement B).
     if owner_pid is not None and owner_pid == os.getpid():
         return None
+    # Session-id guard for the foreign-pid case. A per-turn tool subprocess
+    # (terminal / execute_code / delegate) also carries a foreign pid relative to
+    # the gateway parent that wrote the mirror, so the owner-pid check alone would
+    # accept whatever turn wrote the process-global mirror LAST — not necessarily
+    # this subprocess's turn. The subprocess's own turn identity is bridged in via
+    # HERMES_SESSION_ID (see tools/environments/local._inject_session_context_env),
+    # and it is the discriminator:
+    #
+    #   * Reader HAS a live HERMES_SESSION_ID → this is a per-turn context (a
+    #     gateway turn or a tool subprocess of one). The inherited mirror is this
+    #     turn's origin ONLY if its session_id is present AND equals ours. Anything
+    #     else — a DIFFERING session_id, or a NULL/absent one we cannot attribute
+    #     to this turn — is a foreign turn's last-writer leftover and is rejected.
+    #     (The live 2026-11-15 repro is exactly the null-session_id case: the
+    #     gateway parent's mirror carried session_id=null while the turn's
+    #     HERMES_SESSION_ID was bound, so a "null → accept" policy mis-routed it.)
+    #   * Reader has NO live HERMES_SESSION_ID → a genuinely detached worker /
+    #     CLI / cron. The seeded mirror is its only origin source (the worker seed
+    #     itself carries session_id=None by construction, see
+    #     kanban_db.worker_origin_env), so there is nothing to attribute it against
+    #     and it is accepted — preserving the spawn-boundary inheritance the mirror
+    #     exists for.
+    local_session_id = get_session_env("HERMES_SESSION_ID", "")
+    if local_session_id:
+        mirror_session_id = parsed.get("session_id")
+        if not mirror_session_id or mirror_session_id != local_session_id:
+            return None
     return {k: parsed.get(k) for k in _KANBAN_ORIGIN_FIELDS}
 
 
