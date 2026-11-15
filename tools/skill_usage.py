@@ -55,14 +55,14 @@ STATE_STALE = "stale"
 STATE_ARCHIVED = "archived"
 _VALID_STATES = {STATE_ACTIVE, STATE_STALE, STATE_ARCHIVED}
 
-# Load-bearing bundled built-ins the curator must NEVER archive or consolidate,
-# regardless of ``curator.prune_builtins``, pin state, or LLM judgment. These
+# Load-bearing built-ins the curator must NEVER archive or consolidate,
+# regardless of pin state, LLM judgment, or whether the bundled manifest still
+# lists them (bundled skills are already exempt by provenance). These
 # back advertised UX paths (e.g. ``plan`` powers the ``/plan`` slash-command
 # flow and is referenced in tips/docs/fresh-profile seeding); silently archiving
 # one turns its slash command into "Unknown command" with no signal to the user.
 # Protection is by skill ``name`` (frontmatter ``name:``), matching the keys used
-# throughout this module. Keep this list tiny and intentional — it is not a
-# substitute for ``curator.prune_builtins: false``, which exempts ALL built-ins.
+# throughout this module. Keep this list tiny and intentional.
 PROTECTED_BUILTIN_SKILLS: Set[str] = {
     "plan",
 }
@@ -247,25 +247,30 @@ def _read_hub_installed_names() -> Set[str]:
     return set()
 
 
-def _prune_builtins_enabled() -> bool:
-    """Whether bundled built-in skills are eligible for curator pruning.
+def kanban_referenced_skills() -> Set[str]:
+    """Skill names force-loaded by any non-terminal kanban card, on any board.
 
-    Reads ``curator.prune_builtins`` from config (default True). Lazy import
-    keeps this module importable without the CLI config layer (e.g. in the
-    update/sync context); on any failure we fall back to the default. The real
-    safety against a mass-prune is the curator's seed-on-first-sight, not this
-    flag — built-ins only archive after a fresh inactivity window.
+    A card's ``skills`` field is passed to every worker it spawns as
+    ``hermes --skills ...``; if one of those skills is archived the spawn
+    fails with "Unknown skill(s)" and the card can never make progress. Such
+    a skill is in use by definition, however long ago it was last loaded.
+
+    Best-effort: a missing kanban module or unreadable board yields an empty
+    set rather than raising, so a kanban problem can never break curation.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.kanban_db import open_card_skill_names
+        return open_card_skill_names()
+    except Exception as e:
+        logger.debug("Could not read kanban card skill references: %s", e, exc_info=True)
+        return set()
 
-        cfg = load_config()
-        cur = cfg.get("curator") if isinstance(cfg, dict) else None
-        if isinstance(cur, dict):
-            return bool(cur.get("prune_builtins", True))
-    except Exception as e:  # pragma: no cover — best-effort config read
-        logger.debug("Failed to read curator.prune_builtins: %s", e)
-    return True
+
+def _kanban_referenced_message(skill_name: str) -> str:
+    return (
+        f"skill '{skill_name}' is force-loaded by an open kanban card; "
+        "archiving it would break that card's next worker spawn"
+    )
 
 
 def _suppressed_file() -> Path:
@@ -338,20 +343,17 @@ def remove_suppressed_name(skill_name: str) -> None:
 def list_agent_created_skill_names() -> List[str]:
     """Enumerate skills the curator may manage.
 
-    Always includes agent-authored skills (those marked in ``.usage.json`` via
-    ``skill_manage(action="create")``). When ``curator.prune_builtins`` is
-    enabled, bundled built-in skills are ALSO included even though they have no
-    agent-created usage record — their inactivity clock is anchored on first
-    sight (see ``apply_automatic_transitions``). Hub-installed skills are never
-    included; manually authored skills are not inferred from filesystem
-    location.
+    Only agent-authored skills (those marked in ``.usage.json`` via
+    ``skill_manage(action="create")``) are included. Bundled built-ins and
+    hub-installed skills are never included — the same provenance test
+    ``hermes curator pin`` applies via ``is_agent_created``. Manually authored
+    skills are not inferred from filesystem location.
     """
     base = _skills_dir()
     if not base.exists():
         return []
     hub = _read_hub_installed_names()
     bundled = _read_bundled_manifest_names()
-    prune_builtins = _prune_builtins_enabled()
     usage = load_usage()
 
     names: List[str] = []
@@ -369,19 +371,13 @@ def list_agent_created_skill_names() -> List[str]:
         except ValueError:
             continue
         name = _read_skill_name(skill_md, fallback=skill_md.parent.name)
-        # Hub-installed skills are always off-limits.
-        if name in hub:
+        # Bundled and hub-installed skills have an upstream owner — never
+        # candidates, whatever their usage record says.
+        if name in hub or name in bundled:
             continue
         # Protected built-ins are never curation candidates — exempt from the
         # automatic transition walk AND the LLM consolidation pass.
         if is_protected_builtin(name):
-            continue
-        if name in bundled:
-            # Built-ins are only candidates when pruning is enabled. They never
-            # carry a curator-managed record, so the record gate is skipped.
-            if not prune_builtins:
-                continue
-            names.append(name)
             continue
         # Agent-authored (or local-manual) skills must opt in via their record.
         if not _is_curator_managed_record(usage.get(name)):
@@ -455,21 +451,18 @@ def _external_read_only_message(skill_name: str) -> str:
 def is_curation_eligible(skill_name: str, skill_path: Optional[Path] = None) -> bool:
     """Whether the curator may track/archive *skill_name*.
 
-    Agent-created skills are always eligible. Bundled built-ins become eligible
-    only when ``curator.prune_builtins`` is enabled. Hub-installed and external
-    skill-dir skills are NEVER eligible — they have an external upstream owner.
-    Protected built-ins (``PROTECTED_BUILTIN_SKILLS``) are NEVER eligible
-    regardless of any flag — they back load-bearing UX and must never be
-    archived or consolidated.
+    Agent-created skills are eligible. Bundled built-ins, hub-installed, and
+    external skill-dir skills are NEVER eligible — they have an upstream owner,
+    and this is the same provenance test ``hermes curator pin`` applies.
+    Protected built-ins (``PROTECTED_BUILTIN_SKILLS``) are bundled too and are
+    likewise never eligible.
     """
     if skill_path is not None and is_external_skill_path(skill_path):
         return False
     if is_protected_builtin(skill_name):
         return False
-    if is_hub_installed(skill_name):
+    if is_hub_installed(skill_name) or is_bundled(skill_name):
         return False
-    if is_bundled(skill_name):
-        return _prune_builtins_enabled()
     local_dir = _find_skill_dir(skill_name)
     if local_dir is not None:
         return not is_external_skill_path(local_dir)
@@ -704,10 +697,12 @@ def forget(skill_name: str) -> None:
 def archive_skill(skill_name: str) -> Tuple[bool, str]:
     """Move a curator-eligible skill directory to ~/.hermes/skills/.archive/.
 
-    Returns (ok, message). Never archives hub-installed skills. Bundled
-    built-ins are only archivable when ``curator.prune_builtins`` is enabled;
-    when one is archived, its name is added to the suppression list so the
-    update-time re-seeder leaves it archived instead of restoring it.
+    Returns (ok, message). Never archives bundled built-ins or hub-installed
+    skills (the provenance test ``hermes curator pin`` applies), and never
+    archives a skill an open kanban card force-loads via its ``skills`` field.
+    Every archive path — the automatic inactivity walk, ``hermes curator
+    prune``/``archive``, and the LLM review fork — funnels through here, so
+    these refusals hold no matter which caller picked the candidate.
     """
     local_skill_dir = _find_skill_dir(skill_name)
     if local_skill_dir is None and _find_external_skill_dir(skill_name) is not None:
@@ -721,10 +716,12 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
             )
         if is_hub_installed(skill_name):
             return False, f"skill '{skill_name}' is hub-installed; never archive"
-        return False, (
-            f"skill '{skill_name}' is a bundled built-in; enable "
-            "curator.prune_builtins to allow pruning it"
-        )
+        if is_bundled(skill_name):
+            return False, f"skill '{skill_name}' is a bundled built-in; never archive"
+        return False, f"skill '{skill_name}' is not curator-managed; never archive"
+
+    if skill_name in kanban_referenced_skills():
+        return False, _kanban_referenced_message(skill_name)
 
     skill_dir = local_skill_dir
     if skill_dir is None:
@@ -754,10 +751,6 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
         except Exception as e2:
             return False, f"failed to archive: {e2}"
 
-    # Pruning a built-in only sticks if the re-seeder is told to leave it alone.
-    if is_bundled(skill_name):
-        add_suppressed_name(skill_name)
-
     set_state(skill_name, STATE_ARCHIVED)
     return True, f"archived to {dest}"
 
@@ -768,10 +761,10 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
 
     Refuses to restore under a name that now collides with a hub-installed
     skill — that would shadow the upstream version. Also refuses to restore
-    over a bundled built-in UNLESS ``curator.prune_builtins`` is enabled (in
-    which case built-ins are curator-managed and restoring is the documented
-    way to lift a prune). Restoring clears any suppression entry so future
-    updates may re-seed the built-in again.
+    over a bundled built-in, UNLESS the curator itself pruned that built-in
+    (its name is on the suppression list): built-ins archived before the
+    curator stopped pruning them must stay recoverable. Restoring clears any
+    suppression entry so future updates may re-seed the built-in again.
     """
     # Hub skills always have an external upstream owner — never shadow them.
     if is_hub_installed(skill_name):
@@ -779,9 +772,10 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
             f"skill '{skill_name}' is now hub-installed; "
             "restore would shadow the upstream version"
         )
-    # A bundled built-in is upstream-owned UNLESS prune_builtins is on. With the
-    # flag off, restoring over it would shadow the bundled version.
-    if is_bundled(skill_name) and not _prune_builtins_enabled():
+    # A bundled built-in is upstream-owned. Restoring an archive over it would
+    # shadow the bundled version — unless the archive IS that built-in, pruned
+    # by the curator and suppressed from re-seeding.
+    if is_bundled(skill_name) and skill_name not in read_suppressed_names():
         return False, (
             f"skill '{skill_name}' is now bundled; "
             "restore would shadow the upstream version"

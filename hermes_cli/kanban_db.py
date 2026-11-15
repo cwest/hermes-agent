@@ -1441,6 +1441,65 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     return entries
 
 
+def open_card_skill_names() -> set[str]:
+    """Skill names force-loaded by any non-terminal card, across every board.
+
+    A card's ``skills`` field becomes ``hermes --skills ...`` on every worker
+    it spawns, so each listed skill must stay loadable for as long as the card
+    can still be dispatched (any status but ``done`` / ``archived``). Archived
+    boards are included — they can be unarchived with their cards intact.
+
+    Read-only and side-effect free: a board whose DB file does not exist is
+    skipped rather than created, and each DB is opened ``mode=ro``. An
+    unreadable board (corrupt file, pre-``skills`` schema) contributes nothing
+    instead of raising, so callers can treat the result as best-effort.
+    """
+    names: set[str] = set()
+    seen_paths: set[str] = set()
+    try:
+        boards = list_boards(include_archived=True)
+    except Exception:
+        _log.debug("open_card_skill_names: could not enumerate boards", exc_info=True)
+        boards = [{"slug": DEFAULT_BOARD}]
+    for meta in boards:
+        try:
+            path = kanban_db_path(meta.get("slug"))
+        except Exception:
+            continue
+        key = str(path)
+        if key in seen_paths or not path.exists():
+            continue
+        seen_paths.add(key)
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error:
+            continue
+        try:
+            placeholders = ",".join("?" for _ in _TERMINAL_STATUSES)
+            rows = conn.execute(
+                "SELECT skills FROM tasks WHERE skills IS NOT NULL "
+                f"AND status NOT IN ({placeholders})",
+                tuple(_TERMINAL_STATUSES),
+            ).fetchall()
+        except sqlite3.Error:
+            _log.debug("open_card_skill_names: unreadable board %s", key, exc_info=True)
+            continue
+        finally:
+            conn.close()
+        for (raw,) in rows:
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(parsed, list):
+                continue
+            for item in parsed:
+                cleaned = str(item or "").strip().lstrip("/")
+                if cleaned:
+                    names.add(cleaned)
+    return names
+
+
 def remove_board(slug: str, *, archive: bool = True) -> dict:
     """Remove or archive a board.
 
