@@ -429,6 +429,8 @@ def _inject_session_context_env(env: dict) -> None:
     """
     try:
         from gateway.session_context import (
+            _KANBAN_ORIGIN,
+            _KANBAN_ORIGIN_ENV,
             _UNSET,
             _VAR_MAP,
             session_context_engaged,
@@ -446,6 +448,38 @@ def _inject_session_context_env(env: dict) -> None:
             # Unset for THIS task while a concurrent host is engaged: drop any
             # inherited global so a sibling session's value can't leak in.
             env.pop(var_name, None)
+
+    # The kanban origin has the same last-writer-wins os.environ mirror. When
+    # this task bound its own origin, that ContextVar value is what the child
+    # inherits — not whichever concurrent turn wrote the mirror last. When it is
+    # _UNSET the mirror is left in place: it may be a legitimately inherited
+    # worker seed, and get_kanban_origin's reader guards decide in the child.
+    #
+    # The task's own binding is handed over as an explicit spawn-boundary seed:
+    # the owner-pid stamp is dropped. The stamp exists so a reader can tell a
+    # last-writer mirror (possibly a sibling turn's) from its own origin; this
+    # value is the spawning task's deliberate binding, read from its ContextVar,
+    # so the child must not second-guess it against its live thread. Without
+    # this, a kanban_reassign_origin (which re-binds the task to a different
+    # thread) would be rejected by every child it spawns afterwards.
+    origin = _KANBAN_ORIGIN.get()
+    if origin is not _UNSET and origin:
+        env[_KANBAN_ORIGIN_ENV] = _as_spawn_seed(str(origin))
+
+
+def _as_spawn_seed(raw: str) -> str:
+    """Return an origin blob with its owner-pid stamp removed (or ``raw`` as-is)."""
+    import json
+
+    try:
+        from gateway.session_context import _KANBAN_ORIGIN_OWNER_PID
+        blob = json.loads(raw)
+    except Exception:
+        return raw
+    if not isinstance(blob, dict):
+        return raw
+    blob.pop(_KANBAN_ORIGIN_OWNER_PID, None)
+    return json.dumps(blob)
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
