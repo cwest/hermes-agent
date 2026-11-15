@@ -381,3 +381,72 @@ class TestCLIJudgeGate:
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
         assert complete_calls == ["t1"]
+
+
+# ---------------------------------------------------------------------------
+# Lane-exit handoffs end the goal loop (submit_for_review / request_changes)
+# ---------------------------------------------------------------------------
+
+def test_loop_stops_after_submit_for_review(monkeypatch):
+    """submit_for_review moves the card to `review`; the worker is done."""
+    _patch_judge(monkeypatch, ["continue"] * 5)
+    res = goals.run_kanban_goal_loop(
+        task_id="t7",
+        goal_text="task",
+        run_turn=lambda p: pytest.fail("should not run a turn"),
+        task_status_fn=lambda: "review",
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=3,
+        first_response="handed off",
+    )
+    assert res["outcome"] == "handed_off_by_worker"
+
+
+def test_loop_stops_after_request_changes_handoff(monkeypatch):
+    """A reviewer's request_changes bounce ends its run; the loop must not
+    nudge it toward kanban_complete or sticky-block the bounced card."""
+    _patch_judge(monkeypatch, ["continue"] * 5)
+    res = goals.run_kanban_goal_loop(
+        task_id="t8",
+        goal_text="task",
+        run_turn=lambda p: pytest.fail("should not run a turn"),
+        task_status_fn=lambda: goals.KANBAN_GOAL_HANDED_OFF,
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=3,
+        first_response="bounced to author",
+    )
+    assert res["outcome"] == "handed_off_by_worker"
+
+
+def test_goal_task_status_reports_handoff_after_request_changes(kanban_home):
+    """E2E against a real board: once the worker's own run is ended by
+    request_changes (review -> ready), the status probe reports a handoff
+    rather than the still-open-looking `ready`."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review me", assignee="reviewer", detached=True)
+        claimed = kb.claim_task(conn, tid)
+        run_id = claimed.current_run_id
+        assert goals.kanban_goal_task_status(kb.get_task(conn, tid), run_id) == "running"
+        assert kb.request_changes(conn, tid, author="author") is True
+        task = kb.get_task(conn, tid)
+    assert task.status == "ready"
+    assert goals.kanban_goal_task_status(task, run_id) == goals.KANBAN_GOAL_HANDED_OFF
+    assert goals.kanban_goal_task_status(task, str(run_id)) == goals.KANBAN_GOAL_HANDED_OFF
+
+
+def test_goal_task_status_without_run_id_keeps_raw_status():
+    import types
+    t = types.SimpleNamespace(status="ready", current_run_id=None)
+    assert goals.kanban_goal_task_status(t, None) == "ready"
+    assert goals.kanban_goal_task_status(None, 5) is None
+
+
+def test_goal_prompts_offer_every_lane_exit():
+    """Continuation/finalize prompts must not present complete/block as the
+    only exits — that steers a reviewed-handoff worker to mark work done."""
+    from agent.kanban_stop import KANBAN_LANE_EXIT_TOOLS
+
+    for tmpl in (goals.KANBAN_GOAL_CONTINUATION_TEMPLATE, goals.KANBAN_GOAL_FINALIZE_TEMPLATE):
+        text = tmpl.format(reason="r")
+        for name in KANBAN_LANE_EXIT_TOOLS:
+            assert f"`{name}" in text, (name, tmpl[:40])

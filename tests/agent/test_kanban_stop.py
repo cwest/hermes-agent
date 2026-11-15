@@ -202,3 +202,12 @@ def test_nudge_and_dispatcher_budgets_are_independent(clear_kanban_env):
     # Dispatcher-side streak is tracked in the DB, not in the nudge module —
     # the nudge module has no knowledge of the streak counter.
     assert not hasattr(build_kanban_stop_nudge, "_streak")
+
+
+def test_nudge_does_not_tie_submit_for_review_to_opening_a_pr(clear_kanban_env):
+    """A draft-PR workflow ends at a handoff comment; the submit_for_review
+    bullet must not contradict that by naming PR-open as its trigger."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    nudge = build_kanban_stop_nudge(messages=[], attempts=0)
+    line = next(l for l in nudge.splitlines() if "`kanban_submit_for_review" in l)
+    assert "opening a PR" not in line
