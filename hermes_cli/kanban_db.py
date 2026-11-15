@@ -13567,12 +13567,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # ``build_worker_context`` (guidance approach from #61817).
                 protocol_violation = True
                 error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
+                    "worker exited cleanly (rc=0) without a board tool that "
+                    "moves the card out of running — protocol violation. "
                     "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
+                    "end with the exit your workflow calls for "
+                    "(kanban_submit_for_review to hand off for review, "
+                    "kanban_request_changes to bounce a reviewed card, "
+                    "kanban_complete only if nothing is left to review or "
+                    "merge, kanban_block if a human is needed); a run that "
+                    "ends without one counts as failed no matter what it did."
                 )
                 event_kind = "protocol_violation"
                 event_payload = {

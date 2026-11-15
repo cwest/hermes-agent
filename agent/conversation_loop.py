@@ -6467,7 +6467,8 @@ def run_conversation(
                     continue
 
                 # ── Kanban worker terminal-tool stop guard ─────────────
-                # Workers must end with kanban_complete / kanban_block.
+                # Workers must end with a lane-exiting board tool
+                # (agent.kanban_stop.KANBAN_LANE_EXIT_TOOLS).
                 # Models sometimes narrate the next step ("Let me write the
                 # report") and stop with finish_reason=stop — a clean exit
                 # that the dispatcher records as protocol_violation. Nudge
@@ -6503,7 +6504,7 @@ def run_conversation(
                     )
                     agent._emit_status(
                         "⚠️ Kanban worker tried to exit without "
-                        "kanban_complete/kanban_block — nudging to finish"
+                        "a lane-exiting kanban tool — nudging to finish"
                     )
                     # Same finalizer contract as verify-on-stop: clear
                     # final_response while continuing so a later budget

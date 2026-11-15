@@ -1634,29 +1634,68 @@ class GoalManager:
 # Kanban worker goal loop
 # ──────────────────────────────────────────────────────────────────────
 
+# Every lane exit a goal-mode worker may end with (the same set as
+# agent.kanban_stop.KANBAN_LANE_EXIT_TOOLS). Listing only complete/block
+# steers a review-handoff worker into marking unreviewed work done.
+_KANBAN_GOAL_EXITS_TEXT = (
+    "End with the ONE board tool your task's workflow calls for: "
+    "`kanban_submit_for_review` to hand reviewable work to the review lane; "
+    "`kanban_request_changes` if you are the reviewer sending the card back "
+    "to its author; `kanban_complete` only if the work is finished outright "
+    "with nothing left to review or merge; `kanban_block` if you genuinely "
+    "need a human. If your instructions say the run ends after a handoff "
+    "comment, post it and stop — do not mark unreviewed work done."
+)
+
 # Continuation prompt fed back to a kanban goal-mode worker that has not
-# yet completed/blocked its task. The card's own acceptance criteria are
-# the goal — the worker already has the full task body in its first turn,
-# so we keep this short and point it back at the lifecycle contract.
+# yet moved its card out of its lane. The card's own acceptance criteria
+# are the goal — the worker already has the full task body in its first
+# turn, so we keep this short and point it back at the lifecycle contract.
 KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "[Continuing toward this kanban task — judge says it is not done yet]\n"
     "Reason: {reason}\n\n"
-    "Take the next concrete step toward completing the task. When the work "
-    "is genuinely finished, call kanban_complete with a summary. If you are "
-    "blocked and need human input, call kanban_block with a reason. Do not "
-    "stop without calling one of them."
+    "Take the next concrete step toward finishing your part of the task. "
+    + _KANBAN_GOAL_EXITS_TEXT
 )
 
-# Fed when the judge believes the work is done but the worker never called
-# kanban_complete / kanban_block. One explicit nudge to terminate the task
-# the right way before the loop gives up.
+# Fed when the judge believes the work is done but the worker never moved
+# the card out of its lane. One explicit nudge to exit the right way before
+# the loop gives up.
 KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "[The work looks complete, but the task is still open]\n"
     "Reason: {reason}\n\n"
-    "If the task is genuinely done, call kanban_complete now with a short "
-    "summary of what you did. If something still blocks completion, call "
-    "kanban_block with the reason instead."
+    "Finish now. " + _KANBAN_GOAL_EXITS_TEXT
 )
+
+# Status sentinel: the worker's own run has ended (it handed the card to
+# another lane, e.g. request_changes moved it review -> ready for the
+# author) even though the card's raw status still looks open.
+KANBAN_GOAL_HANDED_OFF = "handed_off"
+
+
+def kanban_goal_task_status(task, run_id) -> Optional[str]:
+    """Card status as seen by the goal loop for the worker owning ``run_id``.
+
+    ``ready``/``running`` alone cannot tell "my lane is still open" from "I
+    handed the card off": ``kanban_request_changes`` bounces a reviewed card
+    to ``ready`` for its author, and ``kanban_submit_for_review`` accepts a
+    ``ready`` card. Both end the worker's run, so once the card's
+    ``current_run_id`` is no longer this worker's run the lane is closed for
+    it and ``KANBAN_GOAL_HANDED_OFF`` is returned. Without a ``run_id`` the
+    raw status is returned unchanged.
+    """
+    if task is None:
+        return None
+    status = task.status
+    if run_id in (None, ""):
+        return status
+    try:
+        mine = int(run_id)
+    except (TypeError, ValueError):
+        return status
+    if status in ("running", "ready") and task.current_run_id != mine:
+        return KANBAN_GOAL_HANDED_OFF
+    return status
 
 
 def run_kanban_goal_loop(
@@ -1677,8 +1716,11 @@ def run_kanban_goal_loop(
     first turn has already run by the time this is called; ``first_response``
     is that turn's reply. From here we:
 
-    1. Check whether the worker already terminated the task (called
-       ``kanban_complete`` / ``kanban_block``). If so, stop — nothing to do.
+    1. Check whether the worker already exited its lane (``done`` /
+       ``blocked``, or handed the card off: ``review`` after
+       ``kanban_submit_for_review``, or the ``KANBAN_GOAL_HANDED_OFF``
+       sentinel from :func:`kanban_goal_task_status` after
+       ``kanban_request_changes``). If so, stop — nothing to do.
     2. Otherwise judge the latest response against ``goal_text`` (the card's
        title + body). ``continue`` → feed a continuation prompt and run
        another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
@@ -1695,7 +1737,7 @@ def run_kanban_goal_loop(
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    ``"blocked_by_worker"``, ``"handed_off_by_worker"``, or ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -1728,6 +1770,10 @@ def run_kanban_goal_loop(
         if status == "blocked":
             _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
             return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
+        if status in ("review", KANBAN_GOAL_HANDED_OFF):
+            # submit_for_review / request_changes: the worker exited its lane.
+            _log(f"kanban goal loop: task {task_id} handed off by worker after {turns_used} turn(s)")
+            return {"outcome": "handed_off_by_worker", "turns_used": turns_used, "reason": "worker handed the card to another lane"}
         if status not in ("running", "ready"):
             # Reclaimed / archived / unexpected — let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
@@ -1797,6 +1843,8 @@ __all__ = [
     "DRAFT_CONTRACT_SYSTEM_PROMPT",
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
+    "KANBAN_GOAL_HANDED_OFF",
+    "kanban_goal_task_status",
     "DEFAULT_MAX_TURNS",
     "load_goal",
     "save_goal",

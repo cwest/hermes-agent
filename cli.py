@@ -16056,7 +16056,11 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return
 
     from hermes_cli import kanban_db as _kb
-    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
+    from hermes_cli.goals import (
+        run_kanban_goal_loop as _run_loop,
+        kanban_goal_task_status as _goal_status,
+        DEFAULT_MAX_TURNS as _DEF_TURNS,
+    )
 
     # Resolve goal text from the card (title + body = the acceptance
     # criteria the judge evaluates against).
@@ -16096,11 +16100,15 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             print(resp)
         return resp or ""
 
+    # This worker's run. A lane handoff (request_changes / submit_for_review)
+    # ends it, which is how the loop tells "my lane is still open" from "I
+    # bounced the card to `ready` for its author".
+    run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip() or None
+
     def _task_status() -> "str | None":
         c = _kb.connect()
         try:
-            t = _kb.get_task(c, task_id)
-            return t.status if t is not None else None
+            return _goal_status(_kb.get_task(c, task_id), run_id)
         finally:
             try:
                 c.close()
