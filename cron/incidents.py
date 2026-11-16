@@ -69,12 +69,16 @@ def _connect() -> sqlite3.Connection:
 
     path = _db_path()
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    # Same file as the executions ledger, so the same journal mode (DELETE, never WAL — see
+    # cron.executions._connect); a WAL opener here would flip the file back on every open.
+    return open_db(path, db_label="cron/executions.db", wal=False, synchronous_full=True,
+                   initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     from hermes_cli.sqlite_util import add_column_if_missing
 
+    conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS cron_incidents (
              id            TEXT PRIMARY KEY,

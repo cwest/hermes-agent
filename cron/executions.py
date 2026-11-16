@@ -56,12 +56,17 @@ def _connect() -> sqlite3.Connection:
 
     path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    # DELETE journal, never WAL: every corrupt ledger seen in the field was WAL (torn-WAL /
+    # WAL-reset b-tree damage; the home backup omits the -wal sidecar). Short-lived serialized
+    # connections under ``_lock`` make the one-time downgrade of a legacy WAL file safe here.
+    return open_db(path, db_label="cron/executions.db", wal=False, synchronous_full=True,
+                   initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     from hermes_cli.sqlite_util import add_column_if_missing
 
+    conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute(
         f"""CREATE TABLE IF NOT EXISTS executions (
              id TEXT PRIMARY KEY,
