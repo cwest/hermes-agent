@@ -2087,7 +2087,7 @@ def _dispatch_lane_task(
     if lane == "review":
         # Force-load kanban.review_skill (KANBAN_GUIDANCE already carries the lifecycle).
         from hermes_cli.kanban_review_skill import with_review_skill
-        claimed.skills = with_review_skill(claimed.skills)
+        claimed.skills = with_review_skill(claimed.skills, reviewer=claimed.assignee)
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:

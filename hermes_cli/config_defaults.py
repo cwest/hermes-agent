@@ -1841,7 +1841,7 @@ DEFAULT_CONFIG = {
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
         # Auto-claim review-column tasks (false: manual review) and force-load review_skill on
-        # each review run; "", null or a plugin's per-reviewer mapping force-loads nothing.
+        # each review run; "" or null: none; a {profile: skill, default: skill} map: per reviewer.
         "review_dispatch": True, "review_skill": "sdlc-review",
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
