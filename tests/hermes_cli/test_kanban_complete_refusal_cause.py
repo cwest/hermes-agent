@@ -70,6 +70,19 @@ def test_the_tool_names_a_stale_run_and_the_run_that_owns_the_card(home, monkeyp
     assert "unknown id" not in err and "terminal" not in err
 
 
+def test_the_tool_names_a_stale_run_when_no_run_owns_the_card_yet(home, monkeypatch) -> None:
+    """Reclaimed and back in ready with no current run: still superseded, never 'retry'."""
+    tid, old_run = _claimed()
+    with kbc.connect() as conn:
+        assert kb.reclaim_task(conn, tid)
+
+    err = _tool_complete(monkeypatch, tid, old_run)
+
+    assert f"run {old_run}" in err and "reclaimed" in err
+    assert "superseded" in err
+    assert "changed while completing" not in err
+
+
 def test_the_tool_names_a_lane_completion_does_not_accept(home, monkeypatch) -> None:
     tid, run = _claimed()
     with kbc.connect() as conn, kb.write_txn(conn):
