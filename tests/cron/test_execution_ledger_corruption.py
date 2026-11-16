@@ -136,6 +136,46 @@ def test_provider_recovery_leaves_a_healthy_store_alone(monkeypatch, tmp_path):
     assert executions.latest_execution("healthy")["status"] == "running"
 
 
+def _quarantined(executions):
+    return [p for p in executions.EXECUTIONS_FILE.parent.iterdir() if ".corrupt-" in p.name]
+
+
+def test_locked_healthy_ledger_is_not_quarantined(monkeypatch, tmp_path):
+    """A writer holding the lock past busy_timeout is contention, not corruption. Quarantining
+    would strand the holder's in-flight claims in the renamed inode and drop the
+    ``scheduled_instant`` rows that block a second fire of the same slot."""
+    from cron.executions_recovery import recover_interrupted_executions_resilient
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("held", source="builtin")
+    holder = sqlite3.connect(executions.EXECUTIONS_FILE, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            recover_interrupted_executions_resilient()
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    assert not _quarantined(executions)
+    assert executions.latest_execution("held")["id"] == record["id"]
+
+
+@pytest.mark.parametrize("message", ["disk I/O error", "unable to open database file"])
+def test_non_corruption_database_errors_propagate_untouched(monkeypatch, tmp_path, message):
+    from cron.executions_recovery import recover_interrupted_executions_resilient
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.create_execution("kept", source="builtin")
+    monkeypatch.setattr(executions, "recover_interrupted_executions",
+                        lambda: (_ for _ in ()).throw(sqlite3.OperationalError(message)))
+
+    with pytest.raises(sqlite3.OperationalError, match=message):
+        recover_interrupted_executions_resilient()
+    assert not _quarantined(executions)
+    assert executions.latest_execution("kept")["status"] == "claimed"
+
+
 def test_ticker_start_on_a_corrupt_ledger_leaves_a_usable_store(monkeypatch, tmp_path):
     from cron.scheduler_provider import InProcessCronScheduler
 
