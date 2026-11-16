@@ -279,14 +279,14 @@ def _fire_dispatch_tick_hook(
 # ``heartbeat_claim`` or raise it via HERMES_KANBAN_CLAIM_TTL_SECONDS.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
-# A live PID with a heartbeat older than this is wedged and reclaimed anyway
-# (``_touch_activity`` keeps genuinely active workers fresh).
-# If a worker's PID is still alive but its ``last_heartbeat_at`` is older than this when
-# ``release_stale_claims`` runs, treat the worker as wedged and reclaim regardless of PID liveness (#29747
-# gap 3). This catches the logic-loop case where the process is technically running but not making
-# observable progress. ``_touch_activity`` bridges chunk-level liveness into ``last_heartbeat_at`` via
-# #31752, so any genuinely active worker keeps its heartbeat fresh as a side effect of normal API traffic.
+# Liveness-evidence window for an attempt with no live pid (owner recovery, diagnostics): a heartbeat
+# inside it means the attempt may still be executing. ``_touch_activity`` bridges chunk-level liveness
+# into ``last_heartbeat_at`` (#31752) at most every 60 s, so an active worker keeps it fresh.
 DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
+# A LIVE pid whose heartbeat is older than this is wedged (#29747 gap 3: running, no observable progress)
+# and ``release_stale_claims`` reclaims it anyway. 5 min is 5x the bridge cadence, so a healthy worker,
+# even inside one long tool-free LLM call, never trips it; an hour let a wedged worker hold the lane.
+CLAIM_WEDGED_HEARTBEAT_STALE_SECONDS = 5 * 60
 
 # Grace when a host-local worker survived termination (e.g. parked in D state
 # under memory.high, SIGKILL pending): releasing now would spawn a duplicate.
@@ -2328,14 +2328,14 @@ def release_stale_claims(
     A host-local worker that is still alive gets its claim *extended* instead
     (a slow model can sit longer than the TTL inside one tool-free call, so no
     heartbeat) — unless ``last_heartbeat_at`` is older than
-    ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (wedged; ``_touch_activity``
+    ``CLAIM_WEDGED_HEARTBEAT_STALE_SECONDS`` (wedged; ``_touch_activity``
     keeps any genuinely active worker fresh). Safe to call often.
 
     Reclaiming a live worker mid-flight produces the spawn- then-immediately-reclaim loop seen on slow
     models that spend longer than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM call (#23025):
     no tool calls means no ``kanban_heartbeat``, even though the subprocess is healthy.
     Backstop (#29747 gap 3): if the worker's PID is still alive but its ``last_heartbeat_at`` is stale by
-    more than ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (1h), the worker has been making no observable
+    more than ``CLAIM_WEDGED_HEARTBEAT_STALE_SECONDS`` (5 min), the worker has been making no observable
     progress and we reclaim anyway — even if ``_pid_alive`` is still true. This catches the
     wedged-in-a-logic-loop case where the process is technically running but accomplishing nothing.
     ``_touch_activity`` (run_agent.py) bridges chunk-level liveness into ``last_heartbeat_at`` via #31752,
@@ -2361,7 +2361,7 @@ def release_stale_claims(
         hb = _to_epoch(row["last_heartbeat_at"])
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - hb) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        heartbeat_stale = hb is not None and (now - hb) > CLAIM_WEDGED_HEARTBEAT_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
         if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
                 and not heartbeat_stale):
