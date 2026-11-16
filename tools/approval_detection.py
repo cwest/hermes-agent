@@ -809,7 +809,8 @@ DANGEROUS_PATTERNS = [
     # rule of its own; both were force pushes the old single-token `-f` pattern missed. Quotes are
     # NOT a boundary here: the shell strips them before git sees the command, so `git push
     # "--force"` is still a force push.
-    (rf'{_GIT_PUSH}{_GIT_PUSH_ARGS}{_GIT_PUSH_ARG_START}--forc[a-z]*\b', "git force push (rewrites remote history)"),
+    # `(?!-)` leaves the hyphenated lease forms to the guarded rule below.
+    (rf'{_GIT_PUSH}{_GIT_PUSH_ARGS}{_GIT_PUSH_ARG_START}--forc[a-z]*\b(?!-)', "git force push (rewrites remote history)"),
     # `-o` takes the rest of a short-flag cluster as its value (`-ofoo` is push option "foo").
     (rf'{_GIT_PUSH}{_GIT_PUSH_ARGS}{_GIT_PUSH_ARG_START}-(?!-)[a-np-z]*f[a-z]*\b',
      "git force push short flag (rewrites remote history)"),
@@ -817,6 +818,14 @@ DANGEROUS_PATTERNS = [
     # whole blank run sits between the option and its value (`-o  +foo`).
     (rf'{_GIT_PUSH}{_GIT_PUSH_ARGS}(?<!\s)(?<!\s-o)(?<!\s--push-option)\s+["\']?\+[^\s;&|\n]+',
      "git force push (rewrites remote history)"),
+    # `--force-with-lease` / `--force-if-includes` (and git's prefix abbreviations) refuse to
+    # overwrite a ref that moved since the last fetch, so they get their own key: a profile can
+    # allowlist the guarded push without allowlisting a history rewrite. This rule MUST stay after
+    # the three unconditional rules above. git lets `--force`, `-f` or a `+refspec` defeat the
+    # lease (`set_ref_status_for_push` in remote.c), so a line with an unconditional force in any
+    # push segment has to match one of those first and keep the history-rewriting key.
+    (rf'{_GIT_PUSH}{_GIT_PUSH_ARGS}{_GIT_PUSH_ARG_START}--forc[a-z]*-[wi][a-z-]*',
+     "git force push with lease (guarded; cannot overwrite others' work)"),
     # `hermes config set` can rewrite the agent's own approval policy (approvals.mode, approvals.deny,
     # command_allowlist) — gate it like the file-tool path so a default empty deny list is not an open door.
     # Anchored to a real INVOCATION: the command must BE `hermes config set <policy key>`. The
