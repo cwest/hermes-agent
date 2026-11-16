@@ -474,6 +474,24 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pin_kanban_pr_state(request, monkeypatch):
+    """Pin the ``active_pr`` guard's live PR lookup to ``"unknown"``.
+
+    The lookup shells out to ``gh``; a child process is outside the network
+    fence, so an unpinned test would query GitHub for its fixture URLs.
+    ``"unknown"`` keeps the guard holding, as it did before the lookup existed.
+    Tests of the resolver itself opt out with ``@pytest.mark.real_pr_state``.
+    """
+    if request.node.get_closest_marker("real_pr_state"):
+        return
+    try:
+        from hermes_cli import kanban_pr_state as _kps
+    except ImportError:
+        return
+    monkeypatch.setattr(_kps, "resolve_pr_state", lambda _url: "unknown")
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_git_safe_directory_read(request, monkeypatch):
     """Skip the ``git config --get-all safe.directory`` pre-read in ``noninteractive_git_env()``.
 
@@ -1295,6 +1313,11 @@ def pytest_configure(config):
         "real_memory_guard: bypass the autouse fixture that pins the kanban "
         "dispatcher's memory guard to 'no data' — only for tests that "
         "exercise the guard itself with their own patched samples.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "real_pr_state: bypass the autouse fixture that pins the kanban "
+        "active_pr guard's gh PR-state lookup to 'unknown'.",
     )
     config.addinivalue_line(
         "markers",
