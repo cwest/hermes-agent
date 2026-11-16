@@ -30,8 +30,33 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
+def _clear_dead_claim_off_running(conn: sqlite3.Connection, row) -> None:
+    """Clear a dead worker's claim on a card that left ``running`` without one.
+
+    Lifecycle verbs clear the claim on every handoff; only an out-of-band status
+    write leaves it behind. ``claim_review_task`` needs ``claim_lock IS NULL`` and
+    the TTL sweep scans ``running`` only, so the lane would wedge. The lane is
+    kept and no failure is booked: the card's work did not crash, its claim
+    leaked. Caller holds the write txn and has proven the worker dead."""
+    from hermes_cli import kanban_db as _kb
+
+    cleared = conn.execute(
+        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+        "worker_pid = NULL, worker_started_at = NULL "
+        "WHERE id = ? AND status = ? AND worker_pid = ? AND claim_lock IS ?",
+        (row["id"], row["status"], row["worker_pid"], row["claim_lock"]),
+    )
+    if cleared.rowcount != 1:
+        return
+    _kb._append_event(
+        conn, row["id"], "stale_claim_cleared",
+        {"pid": int(row["worker_pid"]), "claimer": row["claim_lock"], "lane": row["status"]},
+    )
+
+
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
-    """Release every host-local ``running`` task whose worker PID is dead."""
+    """Release every host-local ``running`` task whose worker PID is dead, and
+    clear a dead worker's leaked claim on a card in any other lane."""
     from hermes_cli import kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
     from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
@@ -42,10 +67,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
         # tasks.started_at is pinned to the first-ever claim (COALESCE), and a
         # card re-claimed for its next lane would inherit an expired grace.
         rows = conn.execute(
-            "SELECT t.id, t.worker_pid, t.worker_started_at, t.claim_lock, t.assignee, "
+            "SELECT t.id, t.status, t.worker_pid, t.worker_started_at, t.claim_lock, t.assignee, "
             "       COALESCE(r.started_at, t.started_at) AS started_at "
             "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
-            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
+            "WHERE t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
         for row in rows:
@@ -58,6 +83,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
             if _kbd._worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+                continue
+            if row["status"] != "running":
+                _clear_dead_claim_off_running(conn, row)
                 continue
             # An ambiguous receipt holds the card while the attempt may still run; once nothing
             # can be executing it (a dead bound interpreter, or a run that never bound one): crash.
