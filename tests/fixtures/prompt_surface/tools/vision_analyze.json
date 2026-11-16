@@ -7,6 +7,15 @@
         "description": "Image URL (http/https), local file path, or data: URL to load.",
         "type": "string"
       },
+      "media_resolution": {
+        "description": "Optional image-resolution cost lever (Gemini/Vertex vision backend only; ignored by other providers). Omit to use the configured default. 'low' sends the image at reduced resolution — ~4x fewer image tokens — ideal for coarse questions ('what's in this picture?'). 'high' is the provider default (no token change).",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "type": "string"
+      },
       "question": {
         "description": "Your question or request about the image.",
         "type": "string"
