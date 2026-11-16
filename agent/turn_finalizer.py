@@ -192,6 +192,10 @@ def _resolve_budget_fallback(
     # closed via ``_record_task_failure`` (compare-and-swap receipt path) which is a no-op if another path
     # closed it — the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
     if _kanban_task:
+        # The note goes first so it is on the card when the re-claim reads it.
+        from agent.kanban_resume_note import post_resume_note
+        post_resume_note(_kanban_task, budget_used=api_call_count, budget_max=agent.max_iterations,
+                         messages=messages, logger=logger)
         _record_kanban_budget_exhausted(_kanban_task, api_call_count, agent.max_iterations, logger)
     return final_response, _turn_exit_reason, preserved_verification_fallback, interrupted
 
