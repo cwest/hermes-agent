@@ -33,10 +33,15 @@ def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn)
 
     assert task.project_id == proj.id
     assert task.workspace_kind == "worktree"
-    # Worktree dir anchored under the project's primary repo, keyed on task id.
-    assert task.workspace_path == os.path.join(proj.primary_path, ".worktrees", tid)
-    # Deterministic branch: <slug>/<task-id>-<title-slug>. NOT a random wt/...
-    assert task.branch_name == f"{proj.slug}/{tid}-add-login"
+    # Worktree dir anchored under the project's primary repo, named after the
+    # branch's DESCRIPTIVE leaf (not the bare task id) — the id->path mapping
+    # lives in this persisted column, not the directory name.
+    assert task.workspace_path == os.path.join(proj.primary_path, ".worktrees", "add-login")
+    assert tid not in task.workspace_path
+    # Deterministic DESCRIPTIVE branch: <slug>/<title-slug>, no task id, no wt/.
+    assert task.branch_name == f"{proj.slug}/add-login"
+    assert tid not in task.branch_name
+    assert "_" not in task.branch_name
     assert not task.branch_name.startswith("wt/")
 
 

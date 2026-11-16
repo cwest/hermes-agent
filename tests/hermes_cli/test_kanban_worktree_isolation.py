@@ -184,7 +184,7 @@ def test_declared_branch_that_does_not_exist_fails_loudly(kanban_home, tmp_path)
 
 
 def test_no_declared_branch_still_cuts_fresh_worktree(kanban_home, tmp_path):
-    """Default (no branch_name) behavior is unchanged: fresh wt/<task-id>."""
+    """Default (no caller branch) behavior: a fresh descriptive per-task worktree."""
     repo = _make_repo(tmp_path)
 
     with kb.connect() as conn:
@@ -200,7 +200,10 @@ def test_no_declared_branch_still_cuts_fresh_worktree(kanban_home, tmp_path):
     workspace, branch = kb._resolve_worktree_workspace(task)
     expected_branch = kb._derive_worktree_branch_name(tid, "ordinary standalone task")
     assert branch == expected_branch
-    assert workspace == (repo / ".worktrees" / tid).resolve()
+    assert workspace == (
+        repo / ".worktrees" / kb._worktree_dir_leaf(expected_branch, tid)
+    ).resolve()
+    assert tid not in workspace.name
     head = subprocess.run(
         ["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
         capture_output=True, text=True, check=True,
@@ -286,9 +289,10 @@ def test_dir_pinned_at_linked_worktree_stays_on_its_branch_no_wt_branch(
     assert head == "topic/obtainability-series"
     # The declared branch's content is present (not a fresh cut from main).
     assert (workspace / "hero.md").exists()
-    # No auto-derived wt/<task-id> branch was ever created anywhere in the repo.
+    # No auto-derived per-task branch was ever created anywhere in the repo.
+    auto_branch = kb._derive_worktree_branch_name(tid, task.title)
     branches = subprocess.run(
-        ["git", "-C", str(wt), "branch", "--list", f"wt/{tid}*"],
+        ["git", "-C", str(wt), "branch", "--list", f"{auto_branch}*", f"wt/{tid}*"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert branches == ""
@@ -317,7 +321,10 @@ def test_dir_repo_root_shared_clone_still_redirects_to_fresh_worktree(
     expected_branch = kb._derive_worktree_branch_name(
         tid, "ops sweep on the deploy clone"
     )
-    assert workspace == (clone / ".worktrees" / tid).resolve()
+    assert workspace == (
+        clone / ".worktrees" / kb._worktree_dir_leaf(expected_branch, tid)
+    ).resolve()
+    assert tid not in workspace.name
     head = subprocess.run(
         ["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
         capture_output=True, text=True, check=True,
@@ -404,8 +411,12 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         task = kb.get_task(conn, tid)
 
     workspace, branch = kb._resolve_worktree_workspace(task)
-    assert workspace == (repo / ".worktrees" / tid).resolve()
-    assert branch == f"wt/{tid}-second-sibling"
+    # The occupied path is another task's checkout — this task falls back to its
+    # OWN fresh worktree, now named after the DESCRIPTIVE branch leaf (not the
+    # bare task id). "second sibling" -> topic/second-sibling -> second-sibling.
+    assert workspace == (repo / ".worktrees" / "second-sibling").resolve()
+    assert branch == "topic/second-sibling"
+    assert tid not in workspace.name
     # The sibling's checkout is untouched, still on its own branch.
     assert (occupied / "README.md").exists()
     head = subprocess.run(
@@ -456,8 +467,9 @@ def test_resolve_worktree_own_path_on_foreign_branch_keeps_legacy_reuse(
         conn.commit()
         task = kb.get_task(conn, tid)
 
-    # The fallback target would be the occupied path itself, so the
-    # legacy reuse applies rather than failing dispatch.
+    # No explicit branch is set on the task, so an existing checkout is reused
+    # as-is on whatever branch it already carries — the descriptive rename only
+    # applies to NEWLY materialized worktrees, never disrupting one in flight.
     workspace, branch = kb._resolve_worktree_workspace(task)
     assert workspace == own.resolve()
     assert branch == "wt/foreign"

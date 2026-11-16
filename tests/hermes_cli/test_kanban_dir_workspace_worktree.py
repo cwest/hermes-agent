@@ -130,8 +130,12 @@ def test_dir_repo_root_resolves_to_worktree_not_in_place(kanban_home, tmp_path):
 
     # The worker must NOT be handed the shared deploy clone itself.
     assert workspace.resolve() != repo.resolve()
-    # It gets a per-task linked worktree under the repo's .worktrees/.
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    # It gets a per-task linked worktree under the repo's .worktrees/, named
+    # after the DESCRIPTIVE branch leaf ("office feature" -> office-feature),
+    # not the opaque task id.
+    assert workspace.resolve() == (repo / ".worktrees" / "office-feature").resolve()
+    assert workspace.name == "office-feature"
+    assert tid not in workspace.name
     assert kb._is_linked_worktree_checkout(workspace)
     # The shared clone is untouched — still on main, still clean.
     assert _current_branch(repo) == "main"
@@ -158,8 +162,10 @@ def test_dir_repo_root_concurrent_tasks_get_distinct_worktrees(kanban_home, tmp_
     ws2 = kb.resolve_workspace(task2)
 
     assert ws1.resolve() != ws2.resolve()
-    assert ws1.resolve() == (repo / ".worktrees" / t1).resolve()
-    assert ws2.resolve() == (repo / ".worktrees" / t2).resolve()
+    # Descriptive dir leaves from the titles, distinct per task — no bare id.
+    assert ws1.resolve() == (repo / ".worktrees" / "card-one").resolve()
+    assert ws2.resolve() == (repo / ".worktrees" / "card-two").resolve()
+    assert t1 not in ws1.name and t2 not in ws2.name
     # The shared clone stays on main regardless of concurrent resolution.
     assert _current_branch(repo) == "main"
 
@@ -264,7 +270,7 @@ def test_dir_deploy_clone_branch_with_no_unique_content_self_heals(
         task = kb.get_task(conn, tid)
 
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    assert workspace.resolve() == (repo / ".worktrees" / "office-feature").resolve()
     # Switched onto main tracking origin/main at the upstream tip.
     assert _current_branch(repo) == "main"
     assert (
@@ -322,7 +328,8 @@ def test_dir_fork_clone_on_tracked_non_main_branch_dispatches(kanban_home, tmp_p
 
     # Must NOT raise, and must redirect to a per-task worktree (not the clone).
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    assert workspace.resolve() == (repo / ".worktrees" / "fork-feature").resolve()
+    assert tid not in workspace.name
     # The fork clone is untouched — still on its integration branch.
     assert _current_branch(repo) == "cwest/integration"
 
@@ -352,7 +359,7 @@ def test_dir_clone_detached_at_ancestor_of_upstream_self_heals(kanban_home, tmp_
 
     # Must NOT raise — the recoverable detach self-heals.
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    assert workspace.resolve() == (repo / ".worktrees" / "office-feature").resolve()
     # The shared clone is reattached to its deploy branch at the upstream SHA.
     assert _current_branch(repo) == "main"
     assert (
@@ -389,7 +396,7 @@ def test_dir_clone_detached_at_ancestor_ff_advances_to_upstream(kanban_home, tmp
         task = kb.get_task(conn, tid)
 
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    assert workspace.resolve() == (repo / ".worktrees" / "office-feature").resolve()
     # Reattached to main AND fast-forwarded to the upstream tip.
     assert _current_branch(repo) == "main"
     assert _git(repo, "rev-parse", "HEAD").strip() == upstream_sha
@@ -532,7 +539,7 @@ def test_dir_clone_named_branch_content_all_on_main_self_heals(
 
     # Must NOT raise — the merged named branch self-heals onto main.
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    assert workspace.resolve() == (repo / ".worktrees" / "office-feature").resolve()
     # The shared clone is now on main tracking origin/main at the upstream SHA —
     # exactly what ``git checkout main && git pull --ff-only`` produces.
     assert _current_branch(repo) == "main"
@@ -614,7 +621,7 @@ def test_dir_clone_detached_no_local_branch_self_heals_from_origin_head(
 
     # Must NOT raise — the no-local-branch detach self-heals via origin/HEAD.
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    assert workspace.resolve() == (repo / ".worktrees" / "office-feature").resolve()
     # The shared clone is now on a local ``main`` tracking ``origin/main`` at the
     # upstream SHA — the exact state ``git checkout main`` would produce.
     assert _current_branch(repo) == "main"
@@ -663,7 +670,7 @@ def test_dir_clone_detached_no_local_branch_ff_advances_to_upstream(
         task = kb.get_task(conn, tid)
 
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    assert workspace.resolve() == (repo / ".worktrees" / "office-feature").resolve()
     # Created ``main`` from ``origin/main`` AND fast-forwarded to the tip.
     assert _current_branch(repo) == "main"
     assert (
