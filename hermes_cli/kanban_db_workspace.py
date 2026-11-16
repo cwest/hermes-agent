@@ -691,10 +691,13 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
 
 
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree under ``repo_root``; an
+    existing one is brought up to its base first (``kanban_db_worktree_base``)."""
+    from hermes_cli import kanban_db_worktree_base as _base
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
+        _base.ensure_fresh(target, repo_root, task_id=target.name)
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
@@ -758,6 +761,10 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            repo_root = _repo_root_for_worktree_target(requested.parent)
+            if repo_root is not None:
+                from hermes_cli import kanban_db_worktree_base as _base
+                _base.ensure_fresh(requested_resolved, repo_root, task_id=task.id)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
