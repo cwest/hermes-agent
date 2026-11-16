@@ -1901,6 +1901,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    max_spawn_per_tick: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1924,6 +1925,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            max_spawn_per_tick=max_spawn_per_tick,
         )
 
     try:
@@ -2118,6 +2120,7 @@ def _tick_spawn_budget(
     max_spawn: Optional[int],
     max_in_progress: Optional[int],
     board: Optional[str],
+    max_spawn_per_tick: Optional[int] = None,
 ) -> tuple[bool, Optional[int]]:
     """``(may_spawn, spawn_budget)`` for this tick; ``budget None`` = uncapped.
 
@@ -2126,6 +2129,8 @@ def _tick_spawn_budget(
     by N every tick. ``max_in_progress`` is a HOST-level cap: running workers on
     every other board count against the same budget, else N boards multiply the
     cap by N — exactly the fan-out the memory-derived default exists to prevent.
+    ``max_spawn_per_tick`` IS a per-tick bound: after a stall every live slot is
+    free, and it spreads that burst over ticks (< 1 = unbounded).
     """
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
@@ -2149,6 +2154,9 @@ def _tick_spawn_budget(
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
 
+    per_tick = _positive_int(max_spawn_per_tick, 0)
+    if per_tick and (spawn_budget is None or spawn_budget > per_tick):
+        spawn_budget = per_tick
     # Memory-pressure guard: a static cap can't see the host's actual state.
     # critical -> spawn nothing this tick; elevated -> at most one new worker.
     # Reclaim/promotion already ran, so bookkeeping stays live; deferred tasks
@@ -2245,6 +2253,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    max_spawn_per_tick: Optional[int] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2258,6 +2267,7 @@ def _dispatch_once_locked(
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
+        max_spawn_per_tick=max_spawn_per_tick,
     )
     if not may_spawn:
         return result
@@ -2790,12 +2800,15 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            from hermes_cli.config import load_config_readonly
+            per_tick = (load_config_readonly() or {}).get("kanban", {}).get("max_spawn_per_tick")
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    max_spawn_per_tick=_positive_int(per_tick, 0) or None,
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):
