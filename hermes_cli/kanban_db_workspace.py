@@ -428,12 +428,15 @@ def _cleanup_worktree_workspace(
 ) -> None:
     """Remove a finished task's linked git worktree when it holds no work.
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
-    requires a clean tree AND every commit reachable from a remote-tracking
-    ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
-    it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
-    branches are kept. Best-effort."""
+    requires a clean tree AND every commit either reachable from a
+    remote-tracking ref or patch-equivalent to upstream (a squash-merged PR
+    whose branch was deleted); any doubt (dirty, unpushed, unresolvable repo,
+    failing git) preserves it. The auto-generated ``wt/<task-id>`` branch is
+    deleted with it; custom branches are kept. Best-effort."""
     try:
-        from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+        from hermes_cli.worktree_ops import (
+            _worktree_commits_all_merged_upstream, _worktree_has_unpushed_commits, _worktree_is_dirty,
+        )
     except Exception:
         return  # CLI safety predicates unavailable — preserve
     try:
@@ -446,7 +449,8 @@ def _cleanup_worktree_workspace(
         repo_root = common.parent
         if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
             return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
+        unpushed = _worktree_has_unpushed_commits(str(wp)) and not _worktree_commits_all_merged_upstream(str(wp))
+        if _worktree_is_dirty(str(wp), str(repo_root)) or unpushed:
             _kb._log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
                 task_id, wp,
