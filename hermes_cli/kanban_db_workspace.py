@@ -690,15 +690,19 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str, *, declared: bool = False) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``; an
-    existing one is brought up to its base first (``kanban_db_worktree_base``)."""
+    existing one is brought up to its base first, and a ``declared`` branch is
+    fetched rather than cut fresh (``kanban_db_worktree_base``)."""
     from hermes_cli import kanban_db_worktree_base as _base
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
-        _base.ensure_fresh(target, repo_root, task_id=target.name)
+        if not declared:  # a declared branch is its own base; never move it to the root's
+            _base.ensure_fresh(target, repo_root, task_id=target.name)
         return
+    if declared:
+        _base.ensure_declared_branch(repo_root, branch_name)
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
@@ -712,10 +716,10 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
-def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
+def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str, *, declared: bool = False) -> tuple[Path, str]:
     """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
     target = repo_root / ".worktrees" / task_id
-    _ensure_git_worktree(repo_root, target, branch_name)
+    _ensure_git_worktree(repo_root, target, branch_name, declared=declared)
     return target, branch_name
 
 
@@ -725,7 +729,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
     instead of the dispatcher's incidental CWD (whatever dir the gateway was
     launched from); with no anchor configured we fail loudly rather than guess."""
+    from hermes_cli import kanban_db_worktree_base as _base
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    declared = _base.is_declared_branch(task, branch_name)
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
@@ -748,7 +754,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        return _anchored_worktree(repo_root, task.id, branch_name, declared=declared)
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():
@@ -762,8 +768,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
             repo_root = _repo_root_for_worktree_target(requested.parent)
-            if repo_root is not None:
-                from hermes_cli import kanban_db_worktree_base as _base
+            if repo_root is not None and not declared:
                 _base.ensure_fresh(requested_resolved, repo_root, task_id=task.id)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT task's
@@ -775,7 +780,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(fallback_root, fallback, branch_name, declared=declared)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
@@ -783,7 +788,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        return _anchored_worktree(repo_root, task.id, branch_name, declared=declared)
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
@@ -791,7 +796,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(repo_root, requested, branch_name, declared=declared)
     return requested, branch_name
 
 

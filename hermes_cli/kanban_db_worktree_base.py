@@ -36,6 +36,36 @@ def base_commit(repo_root: Path) -> Optional[str]:
     return _rev(repo_root, "HEAD")
 
 
+def is_declared_branch(task, branch_name: str) -> bool:
+    """A card-chosen branch (``create --branch``): not project-derived and not the
+    ``wt/<id>`` fallback the dispatcher persists after the first spawn."""
+    return bool((task.branch_name or "").strip()) and not task.project_id and branch_name != f"wt/{task.id}"
+
+
+def ensure_declared_branch(repo_root: Path, branch_name: str) -> None:
+    """Fetch a declared ``branch_name`` from ``origin`` when only the remote has it,
+    so the worktree starts on the branch's commits rather than a fresh cut from the
+    base. A branch origin definitively lacks (or a repo with no origin) is left for
+    the caller to create, as ``--branch`` documents. When origin cannot be asked,
+    raise: a fresh cut would split the work off a branch that may exist."""
+    if _kbw._git_branch_exists(repo_root, branch_name):
+        return
+    if _kbw._git(repo_root, "remote", "get-url", "origin", timeout=30).returncode != 0:
+        return
+    probe = _kbw._git(repo_root, "ls-remote", "--exit-code", "--heads", "origin",
+                      f"refs/heads/{branch_name}", timeout=60)
+    if probe.returncode == 2:
+        return
+    fetch = probe if probe.returncode != 0 else _kbw._git(
+        repo_root, "fetch", "--quiet", "origin",
+        f"refs/heads/{branch_name}:refs/heads/{branch_name}", timeout=120)
+    if fetch.returncode != 0 or not _kbw._git_branch_exists(repo_root, branch_name):
+        detail = (fetch.stderr or fetch.stdout or "").strip() or f"exit {fetch.returncode}"
+        raise RuntimeError(
+            f"declared branch {branch_name!r} is not local and could not be fetched from origin"
+            f" in {repo_root} ({detail}); refusing to cut it fresh from the base")
+
+
 def ensure_fresh(worktree: Path, repo_root: Path, *, task_id: str) -> None:
     """Fast-forward a reused worktree that is behind its base and has no work of
     its own. One carrying its own commits is never touched. One that is behind
