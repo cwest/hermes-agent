@@ -270,7 +270,7 @@ def test_dir_deploy_clone_branch_with_no_unique_content_self_heals(
         task = kb.get_task(conn, tid)
 
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    assert workspace.resolve() == (repo / ".worktrees" / "office-feature").resolve()
     # Switched onto main tracking origin/main at the upstream tip.
     assert _current_branch(repo) == "main"
     assert (
@@ -539,7 +539,7 @@ def test_dir_clone_named_branch_content_all_on_main_self_heals(
 
     # Must NOT raise — the merged named branch self-heals onto main.
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    assert workspace.resolve() == (repo / ".worktrees" / "office-feature").resolve()
     # The shared clone is now on main tracking origin/main at the upstream SHA —
     # exactly what ``git checkout main && git pull --ff-only`` produces.
     assert _current_branch(repo) == "main"
@@ -621,7 +621,7 @@ def test_dir_clone_detached_no_local_branch_self_heals_from_origin_head(
 
     # Must NOT raise — the no-local-branch detach self-heals via origin/HEAD.
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    assert workspace.resolve() == (repo / ".worktrees" / "office-feature").resolve()
     # The shared clone is now on a local ``main`` tracking ``origin/main`` at the
     # upstream SHA — the exact state ``git checkout main`` would produce.
     assert _current_branch(repo) == "main"
@@ -670,7 +670,7 @@ def test_dir_clone_detached_no_local_branch_ff_advances_to_upstream(
         task = kb.get_task(conn, tid)
 
     workspace = kb.resolve_workspace(task)
-    assert workspace.resolve() == (repo / ".worktrees" / tid).resolve()
+    assert workspace.resolve() == (repo / ".worktrees" / "office-feature").resolve()
     # Created ``main`` from ``origin/main`` AND fast-forwarded to the tip.
     assert _current_branch(repo) == "main"
     assert (

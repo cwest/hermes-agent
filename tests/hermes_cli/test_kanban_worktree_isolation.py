@@ -184,7 +184,7 @@ def test_declared_branch_that_does_not_exist_fails_loudly(kanban_home, tmp_path)
 
 
 def test_no_declared_branch_still_cuts_fresh_worktree(kanban_home, tmp_path):
-    """Default (no branch_name) behavior is unchanged: fresh wt/<task-id>."""
+    """Default (no caller branch) behavior: a fresh descriptive per-task worktree."""
     repo = _make_repo(tmp_path)
 
     with kb.connect() as conn:
@@ -200,7 +200,10 @@ def test_no_declared_branch_still_cuts_fresh_worktree(kanban_home, tmp_path):
     workspace, branch = kb._resolve_worktree_workspace(task)
     expected_branch = kb._derive_worktree_branch_name(tid, "ordinary standalone task")
     assert branch == expected_branch
-    assert workspace == (repo / ".worktrees" / tid).resolve()
+    assert workspace == (
+        repo / ".worktrees" / kb._worktree_dir_leaf(expected_branch, tid)
+    ).resolve()
+    assert tid not in workspace.name
     head = subprocess.run(
         ["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
         capture_output=True, text=True, check=True,
@@ -318,7 +321,10 @@ def test_dir_repo_root_shared_clone_still_redirects_to_fresh_worktree(
     expected_branch = kb._derive_worktree_branch_name(
         tid, "ops sweep on the deploy clone"
     )
-    assert workspace == (clone / ".worktrees" / tid).resolve()
+    assert workspace == (
+        clone / ".worktrees" / kb._worktree_dir_leaf(expected_branch, tid)
+    ).resolve()
+    assert tid not in workspace.name
     head = subprocess.run(
         ["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
         capture_output=True, text=True, check=True,

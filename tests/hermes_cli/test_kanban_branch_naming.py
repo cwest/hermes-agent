@@ -209,6 +209,7 @@ def test_worktree_directory_is_descriptive_not_bare_id(kanban_home, repo, monkey
             conn,
             title="fix: post cut the false claim",
             workspace_kind="worktree",
+            detached=True,
         )
         # Anchor the worktree on the repo (board default_workdir path).
         conn.execute(
@@ -244,7 +245,8 @@ def test_two_tasks_same_title_get_distinct_directories(kanban_home, repo, monkey
     with kb.connect() as conn:
         for _ in range(2):
             tid = kb.create_task(
-                conn, title="fix: same exact title", workspace_kind="worktree"
+                conn, title="fix: same exact title", workspace_kind="worktree",
+                detached=True,
             )
             conn.execute(
                 "UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(repo), tid)
