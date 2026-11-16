@@ -27,6 +27,23 @@ _DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 _DISCORD_REPLY_FILE_MAX_BYTES = 7 * 1024 * 1024
 
 
+class InvalidDiscordTargetId(ValueError):
+    """A target id that is not a Discord snowflake (e.g. a subscription's ``thread_id='NEW'``).
+    It can never become valid, so senders return a failed ``SendResult`` naming it instead of
+    logging a traceback on every retry."""
+
+    def __init__(self, value: Any) -> None:
+        super().__init__(f"Invalid Discord target id {value!r}: not a numeric Discord ID")
+
+
+def discord_snowflake(value: Any) -> int:
+    """``int(value)`` for a channel/thread id; ``InvalidDiscordTargetId`` when it is not one."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise InvalidDiscordTargetId(value) from None
+
+
 _OPUS_GRANULE_RATE = 48000  # Ogg/Opus granule positions always count 48 kHz samples (RFC 7845 §4)
 
 
@@ -484,6 +501,9 @@ class DiscordMediaMixin:
                                                     fit_image=fit_image)
         except FileNotFoundError:
             return SendResult(success=False, error=f"{not_found}: {path}")
+        except InvalidDiscordTargetId as e:
+            logger.warning("[%s] Not sending %s: %s", self.name, kind, e)
+            return SendResult(success=False, error=str(e))
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send %s: %s", self.name, kind, e, exc_info=True)
             return SendResult(success=False, error=str(e))
