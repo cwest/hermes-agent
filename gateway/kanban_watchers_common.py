@@ -8,8 +8,10 @@ them from one place.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import logging
+import threading
 from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -21,7 +23,7 @@ logger = logging.getLogger("gateway.run")
 def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
     """Run *func* in an empty ``Context`` so request-local ContextVars stay behind.
 
-    ``asyncio.to_thread`` copies the caller's context; a lingering
+    A thread offload would otherwise carry the caller's context; a lingering
     ``delegate_task`` child marker would make ``write_txn`` false-trip for
     these process-owned writers. An empty Context keeps the DB guard intact
     for real children without exempting dispatcher writes.
@@ -30,8 +32,30 @@ def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
 
 
 async def _to_thread_process_service(func: Callable[..., Any], /, *args: Any) -> Any:
-    """Offload blocking process-service work without inheriting request ContextVars."""
-    return await asyncio.to_thread(_run_in_fresh_context, func, *args)
+    """Offload blocking process-service work without inheriting request ContextVars.
+
+    Runs on this module's own pool, not the loop's default executor: anything
+    that saturates the default pool (plain ``to_thread`` callers, libraries that
+    offload to ``run_in_executor(None, ...)``) would otherwise queue every
+    dispatcher tick behind it, and ready cards would wait minutes, not a tick.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_process_service_pool(), _run_in_fresh_context, func, *args)
+
+
+_PROCESS_SERVICE_POOL: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_PROCESS_SERVICE_POOL_LOCK = threading.Lock()
+# The dispatcher, the notifier and the zombie reaper each await one call at a time.
+_PROCESS_SERVICE_WORKERS = 4
+
+
+def _process_service_pool() -> concurrent.futures.ThreadPoolExecutor:
+    global _PROCESS_SERVICE_POOL
+    with _PROCESS_SERVICE_POOL_LOCK:
+        if _PROCESS_SERVICE_POOL is None:
+            _PROCESS_SERVICE_POOL = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_PROCESS_SERVICE_WORKERS, thread_name_prefix="hermes-kanban-service")
+        return _PROCESS_SERVICE_POOL
 
 
 def _list_boards(kb: Any) -> list:
