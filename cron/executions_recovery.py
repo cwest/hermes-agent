@@ -55,12 +55,20 @@ def quarantine_corrupt_ledger() -> Optional[Path]:
 
 def recover_interrupted_executions_resilient() -> int:
     """``recover_interrupted_executions``, except a corrupt ledger is quarantined and recreated
-    (returning 0) instead of raising, so the scheduler keeps firing jobs."""
+    (returning 0) instead of raising, so the scheduler keeps firing jobs.
+
+    Only file damage (malformed / not-a-database) quarantines. Lock contention, I/O and open
+    errors re-raise into the ticker's fail-closed startup handling: renaming a healthy ledger
+    another process holds open strands that holder's claims in the renamed inode and drops the
+    ``scheduled_instant`` rows that stop a slot firing twice."""
     from cron import executions
+    from hermes_state_errors import classify_persistence_error
 
     try:
         return executions.recover_interrupted_executions()
     except sqlite3.DatabaseError as exc:
+        if classify_persistence_error(exc) != "corrupt":
+            raise
         quarantined = quarantine_corrupt_ledger()
         logger.error(
             "Cron execution ledger %s is corrupt (%s); moved it to %s and started an empty one. "
