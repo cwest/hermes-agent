@@ -43,8 +43,9 @@ def build_kanban_policy(connection, params, config):
             context = kb.build_worker_context(conn, task.id)
             skills = list(task.skills or ())
             if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
-                # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
-                skills = list(dict.fromkeys([*skills, 'sdlc-review']))
+                # Same rule as the dispatcher's review lane: force-load kanban.review_skill.
+                from hermes_cli.kanban_review_skill import with_review_skill
+                skills = with_review_skill(skills, config)
     except (ValueError, OSError, sqlite3.Error) as exc:
         raise AuthorityRefusal('invalid_kanban_claim') from exc
     cwd = task.workspace_path
