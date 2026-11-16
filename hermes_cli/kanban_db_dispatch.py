@@ -1555,22 +1555,41 @@ def check_respawn_guard(
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
-    pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-                                          cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
-    if pr_times:
+    #    explicit unblock, reviewer changes_requested, review reopen) names the
+    #    profile that must now work on THAT PR — a closer or the implementer
+    #    finishing it, not a duplicate implementation (#111910). A crash/reclaim
+    #    is not a handoff, so the worker that opened the PR is still not
+    #    re-spawned against it. A PR that is no longer live (closed, merged,
+    #    never existed) cannot be duplicated, so it does not guard either.
+    pr_comments = [(t, _RESPAWN_GUARD_PR_URL_RE.findall(_kb._lossy_text(c["body"]) or ""))
+                   for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+                                           cols=", body", unreadable=now)]  # duplicate-PR risk: fail closed
+    pr_comments = [(t, urls) for t, urls in pr_comments if urls]
+    if pr_comments:
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
-                conn, "task_events", task_id, max(pr_times),
-                "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
+                conn, "task_events", task_id, max(t for t, _ in pr_comments),
+                "AND kind IN ('assigned', 'unblocked', 'changes_requested', 'review_reopened')",
+                cols=", kind, payload", strict=True)):
             return None
-        return "active_pr"
+        if _any_live_pr(url for _, urls in pr_comments for url in urls):
+            return "active_pr"
 
     return None
+
+
+def _any_live_pr(urls: Iterable[str]) -> bool:
+    """True once any URL resolves to a PR that may still be worked (open, or
+    unresolvable). Each distinct URL is looked up at most once."""
+    from hermes_cli import kanban_pr_state as _kps
+    seen: set[str] = set()
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        if _kps.resolve_pr_state(url) not in _kps.INACTIVE_PR_STATES:
+            return True
+    return False
 
 
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}
