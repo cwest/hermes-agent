@@ -325,6 +325,12 @@ kanban:
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+  review_skill: sdlc-review        # default: skill force-loaded on every review
+                                   # run. Another name replaces it; "" or null
+                                   # loads only the card's own skills. A mapping
+                                   # (a plugin's per-reviewer table) also
+                                   # force-loads nothing; the plugin writes the
+                                   # chosen skill onto the card.
   # dispatch_profiles: [sage]       # unset (key omitted): this home may claim
                                    # cards for any existing profile. Set to a
                                    # list (or comma-separated string) of profile
