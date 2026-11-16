@@ -20,7 +20,7 @@ import weakref
 from abc import ABC, abstractmethod
 from hermes_dir_acl import make_user_dir, unusable_dir_remedy
 from gateway.platforms.base_log_safety import _log_safe_path, describe_proxy_error, env_proxy_for_redaction, safe_proxy_url_for_log, safe_url_for_log
-from gateway.platforms.base_image_sniff import _looks_like_image
+from gateway.platforms.base_image_sniff import _looks_like_image, fit_image_under
 from gateway.platforms.base_media_flags import pad_inline_flags
 from gateway.platforms.base_kanban_media import _kanban_attachment_roots, _kanban_board_db_paths
 from gateway.runtime_footer import footer_onto_photo_caption, send_footer_unless_captioned
