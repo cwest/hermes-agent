@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.i18n import t
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import SendResult, fit_image_under
 
 logger = logging.getLogger("plugins.platforms.discord.adapter")
 
@@ -111,6 +111,24 @@ class DiscordMediaMixin:
                 return max(limit, _DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES)
         return _DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES
 
+    async def _fit_oversized_image(
+        self, channel: Any, file_path: str, filename: str, size: int,
+    ) -> tuple[str, str, int]:
+        """``(path, filename, size)`` to upload for a local image of ``size`` bytes: a JPEG
+        preview under the channel's cap when the original is over it (a 4K render otherwise
+        never reaches the user), else the original. A file that is not an image, or that no
+        preview fits, comes back unchanged so the oversized-upload preflight still rejects it
+        with its notice."""
+        limit = self._discord_upload_limit_bytes(channel)
+        if size <= limit:
+            return file_path, filename, size
+        preview = await asyncio.to_thread(fit_image_under, file_path, limit)
+        if preview is None:
+            return file_path, filename, size
+        logger.info("[%s] Image %s is over the %d-byte upload cap; sending a downscaled preview",
+                    self.name, filename, limit)
+        return preview, f"{os.path.splitext(filename)[0]}.jpg", await asyncio.to_thread(os.path.getsize, preview)
+
     async def _reject_oversized_upload(
         self, channel: Any, file_path: str, filename: str, *, caption: Optional[str] = None,
     ) -> Optional[SendResult]:
@@ -149,11 +167,12 @@ class DiscordMediaMixin:
 
     async def _send_file_attachment(
         self, chat_id: str, file_path: str, caption: Optional[str] = None,
-        file_name: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+        file_name: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, fit_image: bool = False,
     ) -> SendResult:
         """Send a local file as a Discord attachment (forum channels get a new thread). Path-based
         ``discord.File`` only: the open-handle form can race the multipart encoder after an image
         batch and yield zero attachments — a silent drop for video/document MEDIA tags.
+        ``fit_image``: an image over the upload cap goes out as a preview that fits.
 
         See #66797.
         """
@@ -167,6 +186,9 @@ class DiscordMediaMixin:
         if not channel:
             return SendResult(success=False, error=f"Channel {chat_id} not found")
         filename = file_name or os.path.basename(file_path)
+        if fit_image:
+            file_path, filename, _ = await self._fit_oversized_image(
+                channel, file_path, filename, await asyncio.to_thread(os.path.getsize, file_path))
         rejected = await self._reject_oversized_upload(channel, file_path, filename, caption=caption)
         if rejected is not None:
             return rejected
@@ -256,19 +278,21 @@ class DiscordMediaMixin:
                             )
                             continue
                         _img_limit = self._discord_upload_limit_bytes(channel)
+                        local_path, _img_name, _img_size = await self._fit_oversized_image(
+                            channel, local_path, os.path.basename(local_path), _img_size)
                         if _img_size > _img_limit:
                             logger.warning(
                                 "[%s] Skipping oversized image in batch: %s is %.1f MB (limit %.0f MB)",
-                                self.name, os.path.basename(local_path),
+                                self.name, _img_name,
                                 _img_size / (1024 * 1024), _img_limit / (1024 * 1024),
                             )
                             skip_notices.append(t(
                                 "platform.discord.media.image_skipped_too_large",
-                                filename=os.path.basename(local_path),
+                                filename=_img_name,
                                 size_mb=f"{_img_size / (1024 * 1024):.1f}",
                                 limit_mb=f"{_img_limit / (1024 * 1024):.0f}"))
                             continue
-                        files.append(_discord_mod.File(local_path, filename=os.path.basename(local_path)))
+                        files.append(_discord_mod.File(local_path, filename=_img_name))
                     else:
                         if not is_safe_url(image_url):
                             logger.warning("[%s] Blocked unsafe image URL in batch", self.name)
@@ -452,10 +476,12 @@ class DiscordMediaMixin:
         return SendResult(success=True, message_id=str(msg_data["id"]))
 
 
-    async def _send_local_file(self, chat_id, path, caption, *, file_name=None, not_found: str, kind: str, metadata=None):
+    async def _send_local_file(self, chat_id, path, caption, *, file_name=None, not_found: str, kind: str,
+                               metadata=None, fit_image: bool = False):
         """A failed attachment is a failed delivery, never a successful text notice."""
         try:
-            return await self._send_file_attachment(chat_id, path, caption, file_name=file_name, metadata=metadata)
+            return await self._send_file_attachment(chat_id, path, caption, file_name=file_name, metadata=metadata,
+                                                    fit_image=fit_image)
         except FileNotFoundError:
             return SendResult(success=False, error=f"{not_found}: {path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -470,7 +496,7 @@ class DiscordMediaMixin:
         """Send a local image file natively as a Discord file attachment."""
         return await self._send_local_file(
             chat_id, image_path, caption, not_found="Image file not found", kind="local image",
-            metadata=metadata,
+            metadata=metadata, fit_image=True,
         )
 
 
