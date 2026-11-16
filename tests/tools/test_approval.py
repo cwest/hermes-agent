@@ -1519,13 +1519,14 @@ class TestEtcPatternsUnaffectedByRefactor:
 # @angry-programmer on Telegram. Silence is not consent.
 #
 # These tests pin:
-#   1. Gateway timeout → approved=False, with a message strong enough that
-#      a downstream agent reading "BLOCKED: ... Silence is not consent."
-#      treats it as a hard halt, not an invitation to rephrase.
+#   1. Gateway timeout → approved=False: nothing runs and silence is not
+#      consent. The message is recoverable rather than a hard halt (report
+#      the block, carry on with other work); see
+#      test_approval_timeout_recoverable.py.
 #   2. The structured outcome / user_consent fields are present so
 #      plugins, hooks, and audit pipelines can act on the timeout without
 #      string-parsing the message.
-#   3. Explicit /deny carries the same shape (treat-as-not-consented).
+#   3. Explicit /deny is the terminal one: it keeps the do-not-retry wording.
 # =========================================================================
 
 
@@ -1602,16 +1603,14 @@ class TestApprovalTimeoutIsNotConsent:
         # The notify_cb DID fire — we did try to ask the user.
         assert len(notified) == 1
 
-        # The BLOCKED message must explicitly tell the agent not to rephrase;
-        # without it the agent treats "Do NOT retry this command" as permission
-        # to try a different command achieving the same outcome.
+        # A timeout is not a refusal: still BLOCKED and not consent, but it must not forbid
+        # every way forward the way a deny does (that wedged sessions on a read-only command).
         msg = result["message"]
         assert "BLOCKED" in msg
-        assert "NOT consented" in msg
         assert "Silence is not consent" in msg
-        assert "retry" in msg.lower()
-        assert "rephrase" in msg.lower()
-        assert "different command" in msg.lower()
+        assert "different command" not in msg.lower()
+        assert "stop the current workflow" not in msg.lower()
+        assert "report" in msg.lower() and "other work" in msg.lower()
 
         posts = [c for c in hook_calls if c[0] == "post_approval_response"]
         assert posts, "post_approval_response hook did not fire"
@@ -2062,7 +2061,7 @@ class TestCliApprovalTimeoutClassifiedSeparately:
         assert result.get("outcome") == "timeout"
         assert result.get("user_consent") is False
         msg = result["message"]
-        assert "timed out without user response" in msg
+        assert "did not respond to the approval prompt in time" in msg
         assert "Silence is not consent" in msg
         assert "denied" not in msg.lower()
 
@@ -2108,5 +2107,5 @@ class TestCliApprovalTimeoutClassifiedSeparately:
         assert result["approved"] is False
         assert result.get("outcome") == "timeout"
         assert result.get("user_consent") is False
-        assert "timed out without user response" in result["message"]
+        assert "did not respond to the approval prompt in time" in result["message"]
         assert "Silence is not consent" in result["message"]

@@ -346,7 +346,7 @@ class TestBlockingApprovalE2E:
             assert result["approved"] is False
             assert result["user_consent"] is False
             assert result["outcome"] == "timeout"
-            assert "timed out" in result["message"]
+            assert "did not respond to the approval prompt in time" in result["message"]
             assert approval_module.list_gateway_approvals(session_key) == []
         finally:
             reset_current_session_key(token)

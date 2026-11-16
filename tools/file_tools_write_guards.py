@@ -282,7 +282,6 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
         "attempt the same edit via another path (terminal, execute_code, "
         "etc.).")
-    timed_out = blocked.format(why="approval prompt timed out without a user response. Silence is not consent.")
     denied = blocked.format(why="was denied by the user.")
 
     try:
@@ -292,6 +291,8 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         from tools.approval_prompt import prompt_dangerous_approval
     except Exception:
         return blocked.format(why=_APPROVAL_UNAVAILABLE)
+    timed_out = _approval.recoverable_timeout_message(
+        f"The write to protected agent-instruction file(s) ({targets})", "write")
 
     # Gateway surface: block on the button round-trip when a notify callback
     # is registered for this session, or a background child's lease carries one
