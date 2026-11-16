@@ -37,7 +37,8 @@ def _clear_dead_claim_off_running(conn: sqlite3.Connection, row) -> None:
     write leaves it behind. ``claim_review_task`` needs ``claim_lock IS NULL`` and
     the TTL sweep scans ``running`` only, so the lane would wedge. The lane is
     kept and no failure is booked: the card's work did not crash, its claim
-    leaked. Caller holds the write txn and has proven the worker dead."""
+    leaked. The dead worker's open run is closed as ``superseded``. Caller holds
+    the write txn and has proven the worker dead."""
     from hermes_cli import kanban_db as _kb
 
     cleared = conn.execute(
@@ -48,9 +49,16 @@ def _clear_dead_claim_off_running(conn: sqlite3.Connection, row) -> None:
     )
     if cleared.rowcount != 1:
         return
+    # The worker is dead, so its run cannot still be live; left open it reads as
+    # a phantom active attempt beside the next lane's run.
+    run_id = _kb._end_run(
+        conn, row["id"], outcome="superseded", status="superseded",
+        error="dead worker's claim cleared outside running",
+    )
     _kb._append_event(
         conn, row["id"], "stale_claim_cleared",
         {"pid": int(row["worker_pid"]), "claimer": row["claim_lock"], "lane": row["status"]},
+        run_id=run_id,
     )
 
 

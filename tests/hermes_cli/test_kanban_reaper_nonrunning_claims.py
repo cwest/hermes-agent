@@ -4,8 +4,9 @@ Lifecycle verbs clear the claim on every lane handoff, but an out-of-band move
 (a raw ``UPDATE tasks SET status=...``) can leave a card in ``review`` (or any
 other lane) still carrying the author's ``claim_lock`` and ``worker_pid``.
 ``claim_review_task`` requires ``claim_lock IS NULL`` and ``release_stale_claims``
-scans ``running`` only, so the lane wedges. Once the worker is dead the claim is
-cleared in place: no lane change, no failure booked.
+scans ``running`` only, so the lane wedges, and the author's run row stays open
+beside the next lane's run. Once the worker is dead the claim is cleared in
+place and its run closed as ``superseded``: no lane change, no failure booked.
 """
 
 from __future__ import annotations
@@ -72,6 +73,30 @@ def test_dead_worker_claim_on_review_card_is_cleared_in_place(kanban_home):
         assert "stale_claim_cleared" in kinds
         assert "crashed" not in kinds
         assert kb.claim_review_task(conn, tid, claimer=f"{host}:reviewer") is not None
+
+
+def test_dead_worker_run_is_closed_when_its_card_left_running(kanban_home):
+    """The raw move leaves the author's run open; a run must not outlive its lane."""
+    with kbc.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = _raw_move_to_review(conn, claimer=f"{host}:dead", pid=_dead_pid())
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert run_id is not None
+
+        kbd.detect_crashed_workers(conn)
+
+        run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+        assert (run["status"], run["outcome"]) == ("superseded", "superseded")
+        assert run["ended_at"] is not None
+        assert kb.get_task(conn, tid).current_run_id is None
+        cleared = [e for e in kb.list_events(conn, tid) if e.kind == "stale_claim_cleared"]
+        assert [e.run_id for e in cleared] == [run_id]
+        open_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND ended_at IS NULL", (tid,),
+        ).fetchone()[0]
+        assert open_runs == 0
 
 
 def test_live_worker_claim_on_review_card_is_kept(kanban_home):
