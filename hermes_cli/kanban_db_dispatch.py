@@ -31,6 +31,7 @@ from hermes_cli._startup_fast import project_root_str
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
+    from hermes_cli.kanban_db_inplace import OccupiedRoots
 
 
 # After this many consecutive non-success attempts on a task/profile the
@@ -127,6 +128,9 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_workspace_busy: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, workspace_root)`` ``dir`` cards deferred because another card
+    is running in place on the same root; claimed once that card leaves running."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -1975,6 +1979,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    occupied_roots: OccupiedRoots,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2009,6 +2014,9 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    # Two dir cards on one root would edit the same files in place (kanban_db_inplace).
+    if occupied_roots.defer_if_busy(conn, task_id, result.skipped_workspace_busy):
+        return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2038,6 +2046,7 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee)
     if claimed is None:
         return False
+    occupied_roots.take(claimed.workspace_kind, claimed.workspace_path)
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -2221,6 +2230,11 @@ def _any_spawnable_review(
     return False
 
 
+def _inplace_roots(conn: sqlite3.Connection):
+    from hermes_cli.kanban_db_inplace import OccupiedRoots
+    return OccupiedRoots(conn)
+
+
 def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     """``kanban.default_assignee`` when it names a real profile this home may
     claim (``kanban.dispatch_profiles`` gated, same predicate as the spawn
@@ -2310,6 +2324,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        occupied_roots=_inplace_roots(conn),
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
