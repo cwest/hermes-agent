@@ -1,6 +1,6 @@
 """Which commit a per-task worktree starts from, and keeping a reused one in step.
 
-``_ensure_git_worktree`` cuts a new per-task branch from the repo root's HEAD.
+``_ensure_git_worktree`` cuts a new per-task branch from :func:`base_commit`.
 When that base moves on, a reused worktree with no commits of its own still
 sits on the old tip; from inside it the base looks ahead, so a worker can take
 the work as already done and complete with no commits. :func:`ensure_fresh`
@@ -32,8 +32,12 @@ def _is_clean(path: Path) -> bool:
 
 
 def base_commit(repo_root: Path) -> Optional[str]:
-    """The commit a new per-task branch in ``repo_root`` is cut from."""
-    return _rev(repo_root, "HEAD")
+    """The commit a new per-task branch in ``repo_root`` is cut from: the ref named
+    by ``git config kanban.integrationBase`` when it resolves, else the root's HEAD.
+    A fork's deploy clone keeps its root on ``main`` while the work targets a
+    diverging integration branch; cutting from HEAD would drop the fork's patches."""
+    configured = _kb._git_out(repo_root, "config", "--get", "kanban.integrationBase")
+    return (_rev(repo_root, configured) if configured else None) or _rev(repo_root, "HEAD")
 
 
 def is_declared_branch(task, branch_name: str) -> bool:
