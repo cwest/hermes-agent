@@ -993,13 +993,9 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         raise sqlite3.DatabaseError("file is not a database")
 
     async def _to_thread(fn, *args, **kwargs):
-        # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
-        # the top of each tick via ``asyncio.to_thread(_kbd.reap_worker_zombies)``
-        # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
-        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
-        # so this counter must reach 6 to allow the same 2 dispatch ticks the
-        # pre-reaper test expected at 4. Connect counts in the assertion below
-        # are unchanged.
+        # Each tick offloads 3 calls through the dispatcher's process-service
+        # seam (zombie reaper + ``tick_once`` + ``ready_nonempty``), so the
+        # counter reaches 6 after the 2 dispatch ticks this test expects.
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
         if calls["to_thread"] >= 6:
@@ -1010,7 +1006,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         return None
 
     monkeypatch.setattr(_kbc, "connect", _connect)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.kanban_watchers._to_thread_process_service", _to_thread)
     monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
 
     with caplog.at_level(logging.ERROR, logger="gateway.run"):
