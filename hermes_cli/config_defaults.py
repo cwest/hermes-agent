@@ -742,8 +742,10 @@ DEFAULT_CONFIG = {
         # Per-task blocks share one shape (_aux): provider "auto" = inherit the main model; base_url
         # overrides provider; api_key falls back to OPENAI_API_KEY (OpenAI hosts only); reasoning_effort:
         # none|minimal|low|medium|high|xhigh|max|ultra ("" = provider default); extra_body =
-        # OpenAI-compatible request fields. Vision: download_timeout = image HTTP download (s).
-        "vision": _aux(120, download_timeout=30),
+        # OpenAI-compatible request fields. Vision: download_timeout = image HTTP download (s);
+        # media_resolution = Gemini/Vertex image-token lever ("" provider default | low | medium | high;
+        # low ≈ 4x fewer image tokens, ignored by non-Gemini routes).
+        "vision": _aux(120, download_timeout=30, media_resolution=""),
         # web_extract, session_search, skills_hub: no aux LLM any more, leftover blocks are ignored.
         # Compression: raise timeout for local models. no_progress_timeout: seconds a streamed call
         # goes without a substantive chunk before it fails fast into retry/fallback; None = built-in

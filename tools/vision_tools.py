@@ -892,9 +892,11 @@ async def _run_analysis(
 
 async def vision_analyze_tool(
     image_url: str, user_prompt: str, model: str | None = None,
-    task_id: Optional[str] = None, region: Optional[list] = None) -> str:
+    task_id: Optional[str] = None, region: Optional[list] = None,
+    media_resolution: Optional[str] = None) -> str:
     """Describe an image (URL, local path, data: URL) with the auxiliary vision LLM. ``user_prompt``
-    is pre-formatted by the caller. Temp images live under $HERMES_HOME/cache/vision/."""
+    is pre-formatted by the caller. Temp images live under $HERMES_HOME/cache/vision/.
+    ``media_resolution`` (else ``auxiliary.vision.media_resolution``): Gemini image-token lever."""
     async def stage(prompt: str, debug_call_data: dict, temp_paths: list) -> tuple:
         prepared = await _prepare_image(image_url, task_id, region, validate_decode=False)
         temp_paths.append(prepared.path)
@@ -913,6 +915,9 @@ async def vision_analyze_tool(
         messages = _media_messages(prompt, "image_url", image_data_url)
         logger.info("Processing image with vision model...")
         call_kwargs = _aux_call_kwargs(messages, model, 120.0)
+        from tools.vision_tools_media_resolution import extra_body_for
+        if mr_extra := extra_body_for(media_resolution, _cfg_auxiliary("vision", "media_resolution"), model):
+            call_kwargs["extra_body"] = mr_extra
         _load_auxiliary_client()
         try:
             response = await async_call_llm(**call_kwargs)
@@ -996,6 +1001,18 @@ VISION_ANALYZE_SCHEMA = {
                     "re-call with a region to zoom into small text or fine "
                     "detail."
                 )
+            },
+            "media_resolution": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": (
+                    "Optional image-resolution cost lever (Gemini/Vertex vision "
+                    "backend only; ignored by other providers). Omit to use the "
+                    "configured default. 'low' sends the image at reduced "
+                    "resolution — ~4x fewer image tokens — ideal for coarse "
+                    "questions ('what's in this picture?'). 'high' is the "
+                    "provider default (no token change)."
+                )
             }
         },
         "required": ["image_url", "question"]
@@ -1029,7 +1046,9 @@ async def _handle_vision_analyze(args: dict[str, Any], **kw: Any) -> str:
         "Fully describe and explain everything about this image, then answer the "
         f"following question:\n\n{question}")
     model = _configured_aux_model(("vision",), ("AUXILIARY_VISION_MODEL",))
-    return await vision_analyze_tool(image_url, full_prompt, model, task_id=task_id, region=region)
+    # media_resolution shapes the AUX call only; the native path above makes no aux call.
+    return await vision_analyze_tool(image_url, full_prompt, model, task_id=task_id, region=region,
+                                     media_resolution=args.get("media_resolution"))
 
 
 registry.register(

@@ -1765,6 +1765,9 @@ auxiliary:
     api_key: ""                # API key for base_url (OPENAI_API_KEY fallback: OpenAI hosts only)
     timeout: 120               # seconds — LLM API call timeout; vision payloads need generous timeout
     download_timeout: 30       # seconds — image HTTP download; increase for slow connections
+    media_resolution: ""       # Gemini/Vertex only: "" (provider default) | low | medium | high.
+                               # "low" cuts image tokens ~4x for coarse questions; other providers
+                               # ignore it. vision_analyze's media_resolution argument overrides it.
     max_concurrency: 8         # max concurrent image encode/resize bursts across the process
                                # (default: host CPU core count, no ceiling) — bounds only the
                                # CPU-bound encode step so a video-frame fan-out can't saturate
