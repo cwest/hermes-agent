@@ -707,7 +707,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str, *, dec
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
     else:
-        args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
+        args = ["worktree", "add", "-b", branch_name, str(target), _base.base_commit(repo_root) or "HEAD"]
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
