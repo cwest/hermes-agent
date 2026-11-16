@@ -33,8 +33,10 @@ def explain_completion_refusal(
         detail = ", ".join(f"{pid} ({state})" for pid, state in blockers)
         return f"{task_id} has unsatisfied parent dependencies: {detail}; complete the parents first"
     current = row["current_run_id"]
-    if expected_run_id is not None and current is not None and int(current) != int(expected_run_id):
-        return (f"{task_id} was reclaimed: your run {expected_run_id} no longer owns it, run {current} does."
+    # A reclaimed card waiting in ready has no current run at all; that is still superseded.
+    if expected_run_id is not None and (current is None or int(current) != int(expected_run_id)):
+        owner = f"run {current} does" if current is not None else "no run owns it until the next claim"
+        return (f"{task_id} was reclaimed: your run {expected_run_id} no longer owns it, {owner}."
                 " This completion is superseded; do not retry with the old run.")
     error = row["last_failure_error"] or ""
     if error.startswith(_ACCEPTANCE_PREFIX):  # written by record_acceptance on this refusal
