@@ -170,10 +170,11 @@ class CronScheduler(ABC):
         return
 
     def recover_interrupted(self) -> int:
-        """Run profile-local attempt recovery for every provider lifecycle."""
-        from cron.executions import recover_interrupted_executions
+        """Run profile-local attempt recovery for every provider lifecycle. A corrupt ledger is
+        quarantined and recreated (``cron.executions_recovery``) so jobs can still fire."""
+        from cron.executions_recovery import recover_interrupted_executions_resilient
 
-        return recover_interrupted_executions()
+        return recover_interrupted_executions_resilient()
 
     @property
     def supports_force_fire(self) -> bool:
