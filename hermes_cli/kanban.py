@@ -932,13 +932,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                                  f"describing what was done (an empty completion is not evidence).")
                 return False
             if not done:
-                # complete_task returns bare False for a dependency refusal too;
-                # name the open parents instead of claiming the id is unknown.
-                blockers = kb.unsatisfied_parents(conn, tid)
-                if blockers:
-                    detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
-                    fail_msg[tid] = (f"cannot complete {tid}: unsatisfied parent dependencies: {detail}; "
-                                     f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
+                from hermes_cli.kanban_db_completion_refusal import explain_completion_refusal
+                fail_msg[tid] = "cannot complete " + explain_completion_refusal(
+                    conn, tid, expected_run_id=_worker_run_id_for(tid))
             return done
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)

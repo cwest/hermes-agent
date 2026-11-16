@@ -804,17 +804,10 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"what was done.")
         task = kb.get_task(conn, tid)
         if not ok:
-            # complete_task reports every refusal as bare False; a reopened or
-            # never-finished parent is the actionable one. Name the blockers so
-            # the worker/operator completes the parents instead of re-running.
-            blockers = kb.unsatisfied_parents(conn, tid)
-            if blockers:
-                detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
-                raise _Reject(
-                    f"could not complete {tid}: unsatisfied parent dependencies: "
-                    f"{detail}; complete the parents first (done or archived)")
-            _check(False, (task.last_failure_error if task else None) or
-                   f"could not complete {tid} (unknown id, stale run, or already terminal)")
+            # complete_task reports every refusal as bare False; name the real cause.
+            from hermes_cli.kanban_db_completion_refusal import explain_completion_refusal
+            raise _Reject("could not complete " + explain_completion_refusal(
+                conn, tid, expected_run_id=_worker_run_id(tid)))
         run = kb.latest_run(conn, tid)
         # Artifact staging is atomic with the completion write, so a worker that
         # read `kanban_attachments` before completing saw an empty list and has
