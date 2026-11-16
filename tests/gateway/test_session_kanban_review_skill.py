@@ -2,7 +2,7 @@
 
 The session rebuilds the review run's skills from the card, so it must apply the same
 forced-skill rule as the dispatcher claim: unset keeps ``sdlc-review``, a string replaces
-it, and a plugin's per-reviewer mapping force-loads nothing.
+it, and a mapping is resolved by the reviewer's profile (the task's assignee).
 """
 
 from __future__ import annotations
@@ -11,14 +11,17 @@ import json
 from contextlib import closing
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 
-PLUGIN_MAPPING = {"perkins": "editorial-review", "default": "sdlc-review"}
+ROUTING = {"editor": "editorial-review", "default": "sdlc-review"}
 
 
-def _review_policy_skills(tmp_path, monkeypatch, config: dict) -> list[str]:
-    """Claim a card for review and return the skills its reviewer session starts with."""
+def _review_policy_skills(tmp_path, monkeypatch, config: dict, *, reviewer: str = "default",
+                          skills: list[str] | None = None) -> list[str]:
+    """Claim a card for ``reviewer``'s review and return the skills its session starts with."""
     from gateway.session_contract import SessionActor
     from gateway.session_kanban import build_kanban_policy
 
@@ -28,13 +31,13 @@ def _review_policy_skills(tmp_path, monkeypatch, config: dict) -> list[str]:
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_DELEGATED_CHILD", raising=False)
     monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env",
-                        lambda name: str(tmp_path) if name == "default" else str(tmp_path / name))
+                        lambda name: str(tmp_path) if name == reviewer else str(tmp_path / name))
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     kb.create_board("owned")
     with closing(kbc.connect(board="owned")) as conn:
-        tid = kb.create_task(conn, title="review the post", assignee="default", workspace_kind="dir",
-                             workspace_path=str(workspace), skills=["editorial-review"])
+        tid = kb.create_task(conn, title="review the post", assignee=reviewer, workspace_kind="dir",
+                             workspace_path=str(workspace), skills=skills)
         kb.recompute_ready(conn)
         run = kb.claim_task(conn, tid)
         assert run is not None
@@ -50,19 +53,26 @@ def _review_policy_skills(tmp_path, monkeypatch, config: dict) -> list[str]:
 
 
 def test_a_reviewer_session_without_the_key_loads_sdlc_review(tmp_path, monkeypatch):
-    assert _review_policy_skills(tmp_path, monkeypatch, {}) == ["editorial-review", "sdlc-review"]
+    assert _review_policy_skills(tmp_path, monkeypatch, {}, skills=["editorial-review"]) == [
+        "editorial-review", "sdlc-review"]
 
 
-def test_a_reviewer_session_honours_a_plugin_mapping(tmp_path, monkeypatch):
-    skills = _review_policy_skills(tmp_path, monkeypatch, {"kanban": {"review_skill": PLUGIN_MAPPING}})
-    assert skills == ["editorial-review"]
+@pytest.mark.parametrize(("reviewer", "expected"), [
+    ("editor", ["editorial-review"]),
+    ("coder", ["sdlc-review"]),
+])
+def test_a_reviewer_session_resolves_a_mapping_by_its_profile(tmp_path, monkeypatch, reviewer, expected):
+    config = {"kanban": {"review_skill": ROUTING}}
+    assert _review_policy_skills(tmp_path, monkeypatch, config, reviewer=reviewer) == expected
 
 
 def test_a_reviewer_session_honours_a_string_review_skill(tmp_path, monkeypatch):
-    skills = _review_policy_skills(tmp_path, monkeypatch, {"kanban": {"review_skill": "house-review"}})
+    skills = _review_policy_skills(tmp_path, monkeypatch, {"kanban": {"review_skill": "house-review"}},
+                                   skills=["editorial-review"])
     assert skills == ["editorial-review", "house-review"]
 
 
 def test_a_reviewer_session_with_an_empty_review_skill_force_loads_nothing(tmp_path, monkeypatch):
-    skills = _review_policy_skills(tmp_path, monkeypatch, {"kanban": {"review_skill": ""}})
+    skills = _review_policy_skills(tmp_path, monkeypatch, {"kanban": {"review_skill": ""}},
+                                   skills=["editorial-review"])
     assert skills == ["editorial-review"]
