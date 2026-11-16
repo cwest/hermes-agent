@@ -790,7 +790,7 @@ def _served_by_running_multiplexer(profile_name: str) -> bool:
 # the TTL (deep edits). Polled callers never walk: ``lazy_skill_count`` serves the last known
 # value and refreshes stale entries on a background thread, at most once per recheck window
 # per profile — the TTL is decoupled from the poll rate (#114041).
-_SKILL_COUNT_CACHE: dict[str, tuple[float, float, int]] = {}
+_SKILL_COUNT_CACHE: dict[str, tuple[tuple, float, int]] = {}
 _SKILL_COUNT_TTL_SECONDS = 600.0
 _SKILL_COUNT_RECHECK_SECONDS = 60.0
 _SKILL_COUNT_NEXT_CHECK: dict[str, float] = {}
@@ -800,42 +800,26 @@ _SKILL_COUNT_LOCK = threading.Lock()
 _SKILL_COUNT_SCAN_LOCKS: dict[str, threading.Lock] = {}
 
 
-def _skills_dir_signature(skills_dir: Path) -> float:
-    """Max mtime of ``skills_dir`` and its immediate children (adding/removing a category
-    bumps the root, a skill bumps its category). One scandir: O(#categories), not O(#files)."""
-    try:
-        sig = skills_dir.stat().st_mtime
-    except OSError:
-        return 0.0
-    try:
-        with os.scandir(skills_dir) as it:
-            for entry in it:
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        sig = max(sig, entry.stat(follow_symlinks=False).st_mtime)
-                except OSError:
-                    continue
-    except OSError:
-        pass
-    return sig
+def _skills_dir_signature(skills_dir: Path) -> tuple:
+    """Cache signature of the profile owning ``skills_dir``: its local tree, its config.yaml and
+    every ``skills.external_dirs`` tree it grants (``profiles_skill_count``)."""
+    from hermes_cli.profiles_skill_count import profile_skills_signature
+    return profile_skills_signature(skills_dir.parent)
 
 
 def _walk_skill_count(skills_dir: Path) -> int:
-    """One ``os.walk`` over the skills tree (prunes ``.git``/``node_modules``/support dirs
-    instead of statting them). Best-effort: a subtree that vanishes mid-walk (a concurrent
-    skill install/update) is skipped, never raised — ``os.walk`` (``onerror=None``) swallows
-    scandir errors itself, so one profile's churn cannot abort the whole enumeration."""
-    from agent.skill_utils import iter_skill_index_files
-    return sum(1 for _ in iter_skill_index_files(skills_dir, "SKILL.md"))
+    """Skills of the profile owning ``skills_dir``: local tree plus its external_dirs grant, deduped
+    the way ``skills list`` dedups. Best-effort: ``os.walk`` swallows scandir errors, so a subtree
+    vanishing mid-walk (a concurrent install) degrades the count instead of aborting enumeration."""
+    from hermes_cli.profiles_skill_count import count_profile_skills
+    return count_profile_skills(skills_dir.parent)
 
 
 def _count_skills(profile_dir: Path) -> int:
-    """Count installed skills in a profile (cached by skills-dir signature + TTL). Walks
+    """Count a profile's skills (cached by signature + TTL). Walks
     synchronously when stale — detail surfaces (``hermes profile info``, ``profiles.describe``)
     want the fresh number; polled lists go through :func:`_cached_skill_count`."""
     skills_dir = profile_dir / "skills"
-    if not skills_dir.is_dir():
-        return 0
     key = str(skills_dir)
     signature = _skills_dir_signature(skills_dir)
     cached = _SKILL_COUNT_CACHE.get(key)
