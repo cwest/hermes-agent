@@ -1169,7 +1169,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in {"true", "1", "yes", "on"}
 
 
-from plugins.platforms.discord.adapter_media import DiscordMediaMixin
+from plugins.platforms.discord.adapter_media import DiscordMediaMixin, InvalidDiscordTargetId, discord_snowflake
 from plugins.platforms.discord.standalone_rest import api_url as _rest_url, post_paced as _post_paced
 from plugins.platforms.discord.adapter_opus import load_opus_codec
 from plugins.platforms.discord.adapter_authorization import DiscordAuthorizationMixin, is_automated_message
@@ -3075,6 +3075,10 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                 raw_response={"message_ids": message_ids}
             )
             return await self._record_response_async(reply_to, result, content, final_delivery, metadata)
+        except InvalidDiscordTargetId as e:
+            logger.warning("[%s] Not sending Discord message: %s", self.name, e)
+            result = SendResult(success=False, error=str(e))
+            return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             if _is_discord_transport_error(e):
@@ -5106,9 +5110,10 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
         dying in ``int()`` as a generic send failure."""
         if isinstance(channel_id, str):
             channel_id = discord_channel_id_from_link(channel_id.strip()) or channel_id
-        channel = self._client.get_channel(int(channel_id))
+        snowflake = discord_snowflake(channel_id)
+        channel = self._client.get_channel(snowflake)
         if not channel:
-            channel = await self._client.fetch_channel(int(channel_id))
+            channel = await self._client.fetch_channel(snowflake)
         return channel
 
     def _thread_parent_channel(self, channel: Any) -> Any:
