@@ -38,10 +38,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
+        # The grace below is per spawn, so it reads the current run's start:
+        # tasks.started_at is pinned to the first-ever claim (COALESCE), and a
+        # card re-claimed for its next lane would inherit an expired grace.
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.worker_pid, t.worker_started_at, t.claim_lock, t.assignee, "
+            "       COALESCE(r.started_at, t.started_at) AS started_at "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
         for row in rows:
