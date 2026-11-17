@@ -138,6 +138,7 @@ class TestCreateRouting:
     def test_create_lands_in_create_dir(self, isolated_home, tmp_path):
         from tools.skill_manager_tool import skill_manage
         brain = tmp_path / "brain-skills"
+        brain.mkdir()
         _write_config(isolated_home, f"skills:\n  create_dir: {brain}\n")
         res = json.loads(skill_manage("", "", operations=[{
             "action": "create", "name": "routed-skill",
@@ -157,6 +158,7 @@ class TestCreateRouting:
     def test_create_with_category(self, isolated_home, tmp_path):
         from tools.skill_manager_tool import skill_manage
         brain = tmp_path / "brain-skills"
+        brain.mkdir()
         _write_config(isolated_home, f"skills:\n  create_dir: {brain}\n")
         res = json.loads(skill_manage("", "", operations=[{
             "action": "create", "name": "cat-skill", "category": "devops",
@@ -178,6 +180,7 @@ class TestCreateRouting:
     def test_created_skill_is_findable_and_patchable(self, isolated_home, tmp_path):
         from tools.skill_manager_tool import skill_manage, _find_skill
         brain = tmp_path / "brain-skills"
+        brain.mkdir()
         _write_config(isolated_home, f"skills:\n  create_dir: {brain}\n")
         json.loads(skill_manage("", "", operations=[{
             "action": "create", "name": "patchable-skill",

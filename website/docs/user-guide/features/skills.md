@@ -457,7 +457,7 @@ skills:
 
 What this changes:
 
-- **`skill_manage` create writes there.** New skills (including category subdirectories) are created under `create_dir` instead of the local skills dir. The directory is created on first write if it doesn't exist.
+- **`skill_manage` create writes there.** New skills (including category subdirectories) are created under `create_dir` instead of the local skills dir. The directory must already exist: if `create_dir` is missing or is not a directory, `create` fails with an error naming `skills.create_dir` and writes nothing. It never falls back to the profile-local dir.
 - **The agent's instructions follow the config.** Every agent-facing instruction that names the skill-creation path — the `skill_manage` tool description and related prompt text — dynamically renders the configured directory, so the agent is told to create skills there. No system-prompt overrides or filesystem tricks needed.
 - **The directory is fully integrated.** Skills under `create_dir` are scanned alongside the local dir: they appear in the skill index, `skills_list`, `skill_view`, slash commands, and can be patched or deleted like any local skill.
 - **Everything else stays local.** Existing skills are still modified in place wherever they live; bundled skill sync, the hub, and the curator keep operating on the profile-local dir.

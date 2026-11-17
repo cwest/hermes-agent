@@ -219,6 +219,18 @@ def _resolve_skill_dir(name: str, category: str | None = None) -> Path:
     return base / (category or "") / name
 
 
+def _create_dir_error() -> Optional[str]:
+    """Error when a configured ``skills.create_dir`` is not an existing directory, else None.
+    Fail closed: a bad value must never create the dir or fall back to the profile dir."""
+    from agent.skill_utils import get_skill_create_dir
+    create_dir = get_skill_create_dir()
+    if create_dir is None or create_dir.is_dir():
+        return None
+    problem = "is not a directory" if create_dir.exists() else "does not exist"
+    return (f"skills.create_dir ({create_dir}) {problem}; no skill was created. Create that "
+            "directory or fix skills.create_dir in config.yaml.")
+
+
 def _iter_skill_dirs(root: Path):
     from agent.skill_utils import is_excluded_skill_path
     for skill_md in root.rglob("SKILL.md"):
@@ -470,7 +482,8 @@ def _clip(text: str, n: int, ellipsis: str) -> str:
 
 def _create_skill(name: str, content: str, category: str | None = None) -> dict[str, Any]:
     if err := (_validate_name(name) or _validate_category(category)
-               or _validate_frontmatter(content) or _validate_content_size(content)):
+               or _validate_frontmatter(content) or _validate_content_size(content)
+               or _create_dir_error()):
         return _err(err)
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")

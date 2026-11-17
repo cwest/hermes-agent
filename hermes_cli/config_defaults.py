@@ -1402,6 +1402,7 @@ DEFAULT_CONFIG = {
         "index_desc_limit": 60,  # skill-index description chars (60..1024); wider routes better, costs tokens
         # Where skill_manage-created skills go (empty = profile-local dir). When set, new skills land here
         # AND agent-facing instructions name this path; expanded (~, ${VAR}), relative to HERMES_HOME.
+        # Must be an existing dir, or create fails.
         "create_dir": "",
         # In a git checkout, <root>/.hermes/skills/ and <root>/.agents/skills/ load as the highest-precedence
         # tier — ONLY if the root is in trusted_project_dirs. false = no scan, no untrusted-skills notice.
