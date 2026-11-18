@@ -9,6 +9,7 @@ follow-up in the same chat keys into the same session."""
 from __future__ import annotations
 
 import asyncio
+import collections
 import concurrent.futures
 import contextlib
 import contextvars
@@ -26,6 +27,9 @@ logger = logging.getLogger("gateway.run")
 
 # First element of the identity a plugin's FIFO admission carries (``_admit_plugin_injection``).
 _PLUGIN_PRODUCER = "plugin"
+# ``ctx.wake_chat`` waits this long for its admission receipt; admitted wake ids it remembers.
+_PLUGIN_WAKE_RECEIPT_TIMEOUT = 30.0
+_PLUGIN_WAKES_REMEMBERED = 4096
 
 
 def _plugin_admission(row) -> bool:
@@ -154,18 +158,23 @@ class GatewayPluginInjectionMixin:
     def _schedule_plugin_message_injection(
         self, *, content: str, plugin_id: str, session_key: Optional[str] = None,
         origin: Optional[Mapping[str, Any]] = None, plugin_home: Optional[Path] = None,
-        keyless: bool = False, calling_session_key: str = "",
+        keyless: bool = False, calling_session_key: str = "", wake_id: Optional[str] = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
 
         With ``origin`` the profile, origin and adapter checks run here, synchronously, so the plugin
         gets ``False`` for a chat it may not start; authorization is rechecked at dispatch. ``keyless``
-        (neither given) picks the target here too (``gateway/plugin_keyless_inject.py``)."""
+        (neither given) picks the target here too (``gateway/plugin_keyless_inject.py``). ``wake_id``
+        (with ``origin``) is ``ctx.wake_chat``: a producer wake, answered with its admission receipt
+        (``_plugin_wake_chat``)."""
         from gateway.run import safe_schedule_threadsafe
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
             return False
 
+        if wake_id is not None:
+            return self._plugin_wake_chat(origin, content=content, plugin_id=plugin_id,
+                                          plugin_home=plugin_home, wake_id=wake_id, loop=loop)
         if keyless:
             from gateway import plugin_keyless_inject
             resolved = plugin_keyless_inject.resolve(self, plugin_home=plugin_home, plugin_id=plugin_id,
@@ -484,6 +493,118 @@ class GatewayPluginInjectionMixin:
                 },
             ))
         logger.info("Plugin message injection dispatched: plugin=%s %s session=%s", plugin_id, target, session_key)
+        return True
+
+    def _plugin_wake_chat(self, origin: Optional[Mapping[str, Any]], *, content: str, plugin_id: str,
+                          plugin_home: Optional[Path], wake_id: str, loop) -> bool:
+        """``ctx.wake_chat``: the same origin checks as ``inject_message(origin=...)`` (served profile,
+        the plugin's own profile only, a live adapter, the gateway's own routing), plus a named
+        ``user_id``, then the admission the Kanban notifier's wake uses (``_dispatch_plugin_wake``).
+        Unlike an injection it does not need a committed human turn in the chat. Blocks the calling
+        thread for the admission receipt, so it refuses a call made on the gateway loop itself."""
+        if not isinstance(origin, Mapping):
+            return False
+        source = self._plugin_origin_source(origin, plugin_home=plugin_home, plugin_id=plugin_id)
+        if source is None:
+            return False
+        where = f"{source.platform.value}/{source.chat_id}"
+        if not source.user_id:
+            # The wake runs as this user; with none there is nobody to authorize it for.
+            logger.warning("Plugin wake refused: plugin=%s origin=%s names no user_id", plugin_id, where)
+            return False
+        try:
+            on_loop = asyncio.get_running_loop() is loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            logger.warning("Plugin wake refused: plugin=%s origin=%s called wake_chat on the gateway loop; "
+                           "call it from a worker thread", plugin_id, where)
+            return False
+        from gateway.run import safe_schedule_threadsafe
+        context = getattr(self, "_plugin_injection_context", None)
+        context = contextvars.Context() if context is None else context.copy()
+        coro = self._dispatch_plugin_wake(source, content=content, plugin_id=plugin_id, wake_id=wake_id)
+        future = context.run(safe_schedule_threadsafe, coro, loop, logger=logger,
+                             log_message="Plugin wake scheduling failed", log_level=logging.WARNING)
+        if future is None:
+            return False
+        try:
+            return bool(future.result(timeout=_PLUGIN_WAKE_RECEIPT_TIMEOUT))
+        except concurrent.futures.TimeoutError:
+            # Left running and still owning its wake id (_dispatch_plugin_wake): a retry while it is
+            # in flight waits for its result rather than delivering again.
+            logger.warning("Plugin wake receipt timed out: plugin=%s origin=%s wake=%s", plugin_id, where, wake_id)
+            return False
+        except Exception:
+            logger.warning("Plugin wake failed: plugin=%s origin=%s wake=%s", plugin_id, where, wake_id,
+                           exc_info=True)
+            return False
+
+    async def _dispatch_plugin_wake(self, source: SessionSource, *, content: str, plugin_id: str,
+                                    wake_id: str) -> bool:
+        """Admit a plugin's wake through ``gateway.wake.deliver_wake``, the Kanban notifier's own
+        path: into the chat's FIFO when it holds a committed human turn, else the adapter's
+        internal-event admission (``admit_internal_event``), whose receipt is required. Current
+        authorization is checked first, as for every plugin turn. Per plugin, chat and ``wake_id``,
+        the first dispatch owns the delivery: its future is installed before any await, a duplicate
+        awaits it instead of delivering, an admitted id is remembered, a refused one is freed."""
+        from gateway.wake import WakeNotAccepted, adapter_supports_push, deliver_wake
+        target = f"origin={source.platform.value}/{source.chat_id}"
+        if not self._plugin_injection_accepting():
+            return False
+        adapter = self._delivery_adapter_for(source)
+        if adapter is None:
+            logger.warning("Plugin wake: adapter for %s went away before dispatch", target)
+            return False
+        if not adapter_supports_push(adapter):
+            logger.warning("Plugin wake refused: plugin=%s %s is not a push platform", plugin_id, target)
+            return False
+        if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=target):
+            return False
+        session_key = self._session_key_for_source(source)
+        seen = getattr(self, "_plugin_wakes_admitted", None)
+        if seen is None:
+            seen = self._plugin_wakes_admitted = collections.OrderedDict()
+        in_flight = getattr(self, "_plugin_wakes_in_flight", None)
+        if in_flight is None:
+            in_flight = self._plugin_wakes_in_flight = {}
+        key = (plugin_id, session_key, wake_id)
+        if key in seen:
+            logger.info("Plugin wake already admitted: plugin=%s session=%s wake=%s", plugin_id, session_key,
+                        wake_id)
+            return True
+        pending = in_flight.get(key)
+        if pending is not None:
+            # Another dispatch of this wake owns its delivery (a concurrent call, or a retry after
+            # a receipt timeout while the first is still running): answer with its result.
+            logger.info("Plugin wake already in flight: plugin=%s session=%s wake=%s", plugin_id, session_key,
+                        wake_id)
+            try:
+                return await asyncio.wait_for(asyncio.shield(pending), timeout=_PLUGIN_WAKE_RECEIPT_TIMEOUT)
+            except asyncio.TimeoutError:
+                return False
+        # Installed before the first await, so no second dispatch of this key can start a delivery.
+        owned = in_flight[key] = asyncio.get_running_loop().create_future()
+        admitted = False
+        try:
+            async with self._plugin_injection_scope(source):
+                await deliver_wake(adapter, text=content, source=source)
+            admitted = True
+        except WakeNotAccepted as exc:
+            logger.warning("Plugin wake not admitted: plugin=%s session=%s wake=%s (%s)", plugin_id, session_key,
+                           wake_id, exc.reason or exc)
+            return False
+        finally:
+            if admitted:
+                seen[key] = None
+                while len(seen) > _PLUGIN_WAKES_REMEMBERED:
+                    seen.popitem(last=False)
+            # A refusal or failure clears the key, so a later retry delivers.
+            if in_flight.get(key) is owned:
+                del in_flight[key]
+            if not owned.done():
+                owned.set_result(admitted)
+        logger.info("Plugin wake admitted: plugin=%s session=%s wake=%s", plugin_id, session_key, wake_id)
         return True
 
     async def _admit_plugin_injection(
