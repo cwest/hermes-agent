@@ -68,3 +68,37 @@ def inject_plugin_message(
     except Exception:
         logger.warning("inject_message: gateway scheduling failed for plugin %s", ctx.plugin_id, exc_info=True)
         return False
+
+
+def wake_plugin_chat(ctx: Any, content: str, *, origin: Mapping[str, Any], wake_id: str) -> bool:
+    """``PluginContext.wake_chat``: a producer wake to a known messaging chat (gateway only).
+
+    The gateway admits it like the Kanban notifier's own wake (``gateway.wake.deliver_wake``):
+    into the chat's FIFO when it holds a committed human turn, else through the adapter's internal
+    event path, so a chat with no human message yet is reachable. Everything else stays as on
+    ``inject_message(origin=...)``: the ``allow_gateway_injection`` grant, the plugin's own
+    profile only, an origin ``user_id`` that passes current authorization, and no slash commands,
+    approvals or prompt answers. Blocks for the admission receipt, so call it off the gateway loop."""
+    manager = ctx._manager
+    if not isinstance(origin, Mapping):
+        logger.warning("wake_chat: origin must be a mapping in the SessionSource.to_dict() shape")
+        return False
+    if not isinstance(wake_id, str) or not wake_id.strip():
+        logger.warning("wake_chat: plugin %s gave no wake_id; a wake must be named to be retried safely",
+                       ctx.plugin_id)
+        return False
+    if not manager.has_gateway_message_injector:
+        logger.warning("wake_chat: no live gateway is available")
+        return False
+    if not ctx._gateway_injection_allowed():
+        logger.warning("wake_chat: gateway injection denied for plugin %s; set "
+                       "plugins.entries.%s.allow_gateway_injection: true to allow it",
+                       ctx.plugin_id, ctx.plugin_id)
+        return False
+    try:
+        return bool(manager.inject_gateway_message(origin=dict(origin), plugin_home=manager.home_path,
+                                                   content=content, plugin_id=ctx.plugin_id,
+                                                   wake_id=wake_id.strip()))
+    except Exception:
+        logger.warning("wake_chat: gateway wake failed for plugin %s", ctx.plugin_id, exc_info=True)
+        return False
