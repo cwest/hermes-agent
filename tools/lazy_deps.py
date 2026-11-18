@@ -217,7 +217,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Tools ─────────────────────────────────────────────────────────────
     # ACP adapter (VS Code / Zed / JetBrains integration)
-    "tool.acp": ("agent-client-protocol==0.9.0",),
+    "tool.acp": ("agent-client-protocol==0.10.1",),
     # Dashboard (`hermes dashboard`)
     "tool.dashboard": (
         "fastapi==0.133.1",
