@@ -9,8 +9,10 @@ import logging
 import os
 import re
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from hermes_constants import get_config_path, get_skills_dir, is_termux
 
@@ -489,6 +491,47 @@ def get_external_skills_dirs_for(profile_dir: Path) -> List[Path]:
 
 
 def get_external_skills_dirs() -> List[Path]:
+    """Return the read-only external skill dirs for the current context.
+
+    These are the ``skills.external_dirs`` from config.yaml (see
+    :func:`_configured_external_skills_dirs`) followed by any skill dirs a
+    session pinned with :func:`session_skill_dirs_scope` — e.g. skill roots an
+    ACP client supplied via ``additionalDirectories``. Duplicates and the local
+    ``~/.hermes/skills/`` are skipped; configured dirs keep precedence.
+    """
+    result = _configured_external_skills_dirs()
+    scoped = _SESSION_SKILL_DIRS.get()
+    if not scoped:
+        return result
+    seen: Set[Path] = set(result)
+    seen.add(get_skills_dir().resolve())
+    for p in scoped:
+        if p not in seen and p.is_dir():
+            seen.add(p)
+            result.append(p)
+    return result
+
+
+# Extra skill dirs pinned for the current context (one ACP session, one turn).
+# A ContextVar rather than process state so concurrent sessions on a shared
+# executor never see each other's roots; worker threads inherit it through
+# ``contextvars.copy_context()`` like the other per-session context.
+_SESSION_SKILL_DIRS: ContextVar[Tuple[Path, ...]] = ContextVar(
+    "HERMES_SESSION_SKILL_DIRS", default=()
+)
+
+
+@contextmanager
+def session_skill_dirs_scope(dirs: Iterable[Path]) -> Iterator[None]:
+    """Expose *dirs* as additional read-only skill dirs for this context."""
+    token = _SESSION_SKILL_DIRS.set(tuple(Path(d).resolve() for d in dirs))
+    try:
+        yield
+    finally:
+        _SESSION_SKILL_DIRS.reset(token)
+
+
+def _configured_external_skills_dirs() -> List[Path]:
     """Read ``skills.external_dirs`` from config.yaml and return validated paths.
 
     Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute

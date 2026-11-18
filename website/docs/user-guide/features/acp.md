@@ -189,12 +189,27 @@ Each session stores:
 - selected model
 - current conversation history
 - cancel event
+- client-provided `systemPrompt` text and `additionalDirectories`, if the host sent them
 
 The underlying `AIAgent` still uses Hermes' normal persistence/logging paths, but ACP `list/load/resume/fork` are scoped to the currently running ACP server process.
 
 ## Working directory behavior
 
 ACP sessions bind the editor's cwd to the Hermes task ID so file and terminal tools run relative to the editor workspace, not the server process cwd.
+
+## Client-provided session setup
+
+Hermes advertises two optional ACP session capabilities, so a host can scope a session without stuffing instructions into the user's prompt:
+
+- **`systemPrompt`** (append mode only) on `session/new`, `session/load` and `session/resume`. The text blocks are appended after Hermes' own system prompt, so the host's instructions run at system level while Hermes keeps its tool guidance and safety rules. The text stays fixed for the whole session, so prompt caching is unaffected. It is not written into the transcript. A `session/load` or `session/resume` that leaves `systemPrompt` out keeps the stored prompt. `override` mode is not supported: Hermes returns `-32602` and does not create the session. Empty content and non-text blocks get the same error.
+- **`additionalDirectories`** on the same three requests. Each entry must be an absolute path. `cwd` stays the base for relative paths. The extra roots are:
+  - listed to the model as part of the session's workspace;
+  - covered by the workspace edit auto-approve policy (`Accept Edits`), so edits inside them don't prompt any more than edits inside `cwd`;
+  - searched for skills. A root that directly holds skills (`<root>/<name>/SKILL.md`) counts as a skills directory. So do its `.agents/skills`, `.hermes/skills`, `.claude/skills` and `skills` subdirectories, flat or grouped by category (`<skills>/<category>/<name>/SKILL.md`). Hermes sees these skills only in that session, read-only, next to `skills.external_dirs`.
+
+  The spec says roots are never restored implicitly, so a `session/load` or `session/resume` that leaves the field out or sends an empty array activates no extra roots.
+
+Hosts that send neither field get exactly the previous behavior.
 
 ## Approvals
 

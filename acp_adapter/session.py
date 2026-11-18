@@ -20,6 +20,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
@@ -170,6 +171,88 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    # Client-provided session setup (ACP ``systemPrompt`` append text and
+    # ``additionalDirectories``). Empty means the client sent neither, and the
+    # session behaves exactly like one created before these fields existed.
+    client_system_prompt: str = ""
+    additional_directories: List[str] = field(default_factory=list)
+
+    @property
+    def skill_dirs(self) -> List[Path]:
+        """Skill dirs contributed by the session's additional roots."""
+        return skill_dirs_for_roots(self.additional_directories)
+
+    @property
+    def workspace_roots(self) -> List[str]:
+        """The session's effective root set: ``[cwd, *additionalDirectories]``."""
+        return [self.cwd, *self.additional_directories]
+
+
+# Conventional per-repo skill locations. A client-supplied root counts as a
+# skill dir itself when it directly contains skills (``<root>/<name>/SKILL.md``).
+# These subdirectories of it count when they hold a skill at any depth, so the
+# categorized ``<skills>/<category>/<name>/SKILL.md`` layout is found too.
+_ROOT_SKILL_SUBDIRS = (
+    Path(".agents") / "skills",
+    Path(".hermes") / "skills",
+    Path(".claude") / "skills",
+    Path("skills"),
+)
+
+
+def _directly_contains_skills(path: Path) -> bool:
+    try:
+        return any((child / "SKILL.md").is_file() for child in path.iterdir() if child.is_dir())
+    except OSError:
+        return False
+
+
+def _contains_skills_at_any_depth(path: Path) -> bool:
+    # The bare root is only checked one level deep: walking a whole code
+    # checkout would be slow and would promote stray nested SKILL.md files.
+    from agent.skill_utils import iter_skill_index_files
+
+    return next(iter_skill_index_files(path, "SKILL.md"), None) is not None
+
+
+def skill_dirs_for_roots(roots: List[str]) -> List[Path]:
+    """Return the skill dirs a list of workspace roots contributes, in order."""
+    found: List[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        base = Path(root)
+        candidates = [(base, _directly_contains_skills)]
+        candidates += [(base / sub, _contains_skills_at_any_depth) for sub in _ROOT_SKILL_SUBDIRS]
+        for candidate, has_skills in candidates:
+            if candidate.is_dir() and has_skills(candidate):
+                resolved = candidate.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    found.append(resolved)
+    return found
+
+
+def _client_setup_prompt(system_prompt: str, additional_directories: List[str], cwd: str) -> str | None:
+    """Render the client's session setup as text appended to the system prompt.
+
+    Returned text is installed as the agent's ``ephemeral_system_prompt``,
+    which Hermes appends to the cached system prompt on every API call and
+    never persists — so it reaches the model at system level, is byte-stable
+    for the session (prompt cache intact), and stays out of the transcript.
+    """
+    parts: List[str] = []
+    if additional_directories:
+        roots = "\n".join(f"- {d}" for d in additional_directories)
+        parts.append(
+            "## Workspace roots\n"
+            "This session's workspace spans these directories. The working "
+            f"directory {cwd} remains the base for relative paths; the others "
+            "are additional roots you may read and edit:\n"
+            f"- {cwd} (working directory)\n{roots}"
+        )
+    if system_prompt:
+        parts.append(system_prompt)
+    return "\n\n".join(parts) or None
 
 
 class SessionManager:
@@ -261,7 +344,10 @@ class SessionManager:
             model=getattr(agent, "model", original.model) or original.model,
             history=copy.deepcopy(original.history),
             cancel_event=threading.Event(),
+            client_system_prompt=original.client_system_prompt,
+            additional_directories=list(original.additional_directories),
         )
+        self.apply_client_setup(state)
         with self._lock:
             self._sessions[new_id] = state
         _register_task_cwd(new_id, cwd)
@@ -311,6 +397,7 @@ class SessionManager:
                         "updated_at": _format_updated_at(
                             persisted.get("last_active") or persisted.get("started_at") or time.time()
                         ),
+                        "additional_directories": list(s.additional_directories),
                     }
                 )
 
@@ -323,11 +410,15 @@ class SessionManager:
                 continue
             # Extract cwd from model_config JSON.
             session_cwd = "."
+            session_roots: List[str] = []
             mc = row.get("model_config")
             if mc:
                 try:
-                    session_cwd = json.loads(mc).get("cwd", ".")
-                except (json.JSONDecodeError, TypeError):
+                    meta = json.loads(mc)
+                    session_cwd = meta.get("cwd", ".")
+                    if isinstance(meta.get("additional_directories"), list):
+                        session_roots = [str(d) for d in meta["additional_directories"]]
+                except (json.JSONDecodeError, TypeError, AttributeError):
                     pass
             if normalized_cwd and _normalize_cwd_for_compare(session_cwd) != normalized_cwd:
                 continue
@@ -338,6 +429,7 @@ class SessionManager:
                 "history_len": message_count,
                 "title": _build_session_title(row.get("title"), row.get("preview"), session_cwd),
                 "updated_at": _format_updated_at(row.get("last_active") or row.get("started_at")),
+                "additional_directories": session_roots,
             })
 
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
@@ -353,6 +445,45 @@ class SessionManager:
         _register_task_cwd(session_id, cwd)
         self._persist(state)
         return state
+
+    def set_client_setup(
+        self,
+        state: SessionState,
+        *,
+        system_prompt: str | None = None,
+        additional_directories: List[str] | None = None,
+    ) -> None:
+        """Record client-provided setup on *state* and apply it to its agent.
+
+        ``None`` leaves that part unchanged (a ``session/load`` that omits
+        ``systemPrompt`` keeps the stored prompt); callers pass ``[]`` to clear
+        the roots, which the spec requires when ``additionalDirectories`` is
+        omitted on load/resume.
+        """
+        if system_prompt is not None:
+            state.client_system_prompt = system_prompt
+        if additional_directories is not None:
+            state.additional_directories = list(additional_directories)
+        self.apply_client_setup(state, force=True)
+        self._persist(state)
+
+    @staticmethod
+    def apply_client_setup(state: SessionState, *, force: bool = False) -> None:
+        """(Re)install the session's client setup on its current agent.
+
+        Call after every agent (re)creation — model switch, restore — so the
+        client's instructions and roots outlive the agent object. A session
+        with no client setup leaves ``ephemeral_system_prompt`` untouched
+        unless *force* is set (setup was just cleared and must be removed).
+        """
+        if not force and not state.client_system_prompt and not state.additional_directories:
+            return
+        try:
+            state.agent.ephemeral_system_prompt = _client_setup_prompt(
+                state.client_system_prompt, state.additional_directories, state.cwd
+            )
+        except Exception:
+            logger.debug("Could not apply ACP client setup to agent", exc_info=True)
 
     def cleanup(self) -> None:
         """Remove all sessions (memory and database) and clear task-specific cwd overrides."""
@@ -421,7 +552,7 @@ class SessionManager:
 
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
-        session_meta = {"cwd": state.cwd}
+        session_meta: Dict[str, Any] = {"cwd": state.cwd}
         provider = getattr(state.agent, "provider", None)
         base_url = getattr(state.agent, "base_url", None)
         api_mode = getattr(state.agent, "api_mode", None)
@@ -431,6 +562,10 @@ class SessionManager:
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
             session_meta["api_mode"] = api_mode.strip()
+        if state.client_system_prompt:
+            session_meta["client_system_prompt"] = state.client_system_prompt
+        if state.additional_directories:
+            session_meta["additional_directories"] = list(state.additional_directories)
         cwd_json = json.dumps(session_meta)
 
         try:
@@ -441,7 +576,11 @@ class SessionManager:
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config={"cwd": state.cwd},
+                    model_config={
+                        k: v
+                        for k, v in session_meta.items()
+                        if k in ("cwd", "client_system_prompt", "additional_directories")
+                    },
                 )
             else:
                 # Update model_config (contains cwd) if changed.
@@ -520,6 +659,8 @@ class SessionManager:
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
+        restored_prompt = ""
+        restored_roots: List[str] = []
         mc = row.get("model_config")
         if mc:
             try:
@@ -529,6 +670,10 @@ class SessionManager:
                     requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
+                    if isinstance(meta.get("client_system_prompt"), str):
+                        restored_prompt = meta["client_system_prompt"]
+                    if isinstance(meta.get("additional_directories"), list):
+                        restored_roots = [str(d) for d in meta["additional_directories"]]
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -567,7 +712,10 @@ class SessionManager:
             model=model or getattr(agent, "model", "") or "",
             history=history,
             cancel_event=threading.Event(),
+            client_system_prompt=restored_prompt,
+            additional_directories=restored_roots,
         )
+        self.apply_client_setup(state)
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
