@@ -205,7 +205,7 @@ Hermes advertises two optional ACP session capabilities, so a host can scope a s
 - **`additionalDirectories`** on the same three requests. Each entry must be an absolute path. `cwd` stays the base for relative paths. The extra roots are:
   - listed to the model as part of the session's workspace;
   - covered by the workspace edit auto-approve policy (`Accept Edits`), so edits inside them don't prompt any more than edits inside `cwd`;
-  - searched for skills. A root that directly holds skills (`<root>/<name>/SKILL.md`) counts as a skills directory, and so do its `.agents/skills`, `.hermes/skills`, `.claude/skills` and `skills` subdirectories. Hermes sees these skills only in that session, read-only, next to `skills.external_dirs`.
+  - searched for skills. A root that directly holds skills (`<root>/<name>/SKILL.md`) counts as a skills directory. So do its `.agents/skills`, `.hermes/skills`, `.claude/skills` and `skills` subdirectories, flat or grouped by category (`<skills>/<category>/<name>/SKILL.md`). Hermes sees these skills only in that session, read-only, next to `skills.external_dirs`.
 
   The spec says roots are never restored implicitly, so a `session/load` or `session/resume` that leaves the field out or sends an empty array activates no extra roots.
 

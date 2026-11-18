@@ -189,8 +189,9 @@ class SessionState:
 
 
 # Conventional per-repo skill locations. A client-supplied root counts as a
-# skill dir itself when it directly contains skills (``<root>/<name>/SKILL.md``),
-# and these subdirectories of it are picked up as well.
+# skill dir itself when it directly contains skills (``<root>/<name>/SKILL.md``).
+# These subdirectories of it count when they hold a skill at any depth, so the
+# categorized ``<skills>/<category>/<name>/SKILL.md`` layout is found too.
 _ROOT_SKILL_SUBDIRS = (
     Path(".agents") / "skills",
     Path(".hermes") / "skills",
@@ -206,14 +207,24 @@ def _directly_contains_skills(path: Path) -> bool:
         return False
 
 
+def _contains_skills_at_any_depth(path: Path) -> bool:
+    # The bare root is only checked one level deep: walking a whole code
+    # checkout would be slow and would promote stray nested SKILL.md files.
+    from agent.skill_utils import iter_skill_index_files
+
+    return next(iter_skill_index_files(path, "SKILL.md"), None) is not None
+
+
 def skill_dirs_for_roots(roots: List[str]) -> List[Path]:
     """Return the skill dirs a list of workspace roots contributes, in order."""
     found: List[Path] = []
     seen: set[Path] = set()
     for root in roots:
         base = Path(root)
-        for candidate in (base, *(base / sub for sub in _ROOT_SKILL_SUBDIRS)):
-            if candidate.is_dir() and _directly_contains_skills(candidate):
+        candidates = [(base, _directly_contains_skills)]
+        candidates += [(base / sub, _contains_skills_at_any_depth) for sub in _ROOT_SKILL_SUBDIRS]
+        for candidate, has_skills in candidates:
+            if candidate.is_dir() and has_skills(candidate):
                 resolved = candidate.resolve()
                 if resolved not in seen:
                     seen.add(resolved)

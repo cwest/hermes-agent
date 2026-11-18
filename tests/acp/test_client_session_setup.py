@@ -353,6 +353,34 @@ class TestAdditionalDirectories:
         state = agent.session_manager.get_session(resp.session_id)
         assert (workspace / ".agents" / "skills").resolve() in state.skill_dirs
 
+    @pytest.mark.parametrize("subdir", [".hermes/skills", ".agents/skills", ".claude/skills", "skills"])
+    def test_categorized_skill_subdirs_of_a_root_are_discovered(self, tmp_path, subdir):
+        """``<skills>/<category>/<name>/SKILL.md`` is the standard layout."""
+        from acp_adapter.session import skill_dirs_for_roots
+
+        workspace = tmp_path / "other-repo"
+        _skill(workspace / subdir / "devops", "categorized-skill")
+        assert skill_dirs_for_roots([str(workspace)]) == [(workspace / subdir).resolve()]
+
+    def test_skill_md_only_in_excluded_dirs_does_not_count(self, tmp_path):
+        from acp_adapter.session import skill_dirs_for_roots
+
+        workspace = tmp_path / "other-repo"
+        _skill(workspace / "skills" / "node_modules" / "pkg", "vendored")
+        _skill(workspace / "skills" / ".git" / "x", "vcs")
+        assert skill_dirs_for_roots([str(workspace)]) == []
+
+    def test_bare_root_needs_skills_one_level_down(self, tmp_path):
+        """A bare root is not walked recursively: a code checkout with a stray
+        nested SKILL.md must not turn the whole repo into a skills dir."""
+        from acp_adapter.session import skill_dirs_for_roots
+
+        flat = tmp_path / "flat"
+        _skill(flat, "x")
+        deep = tmp_path / "code-repo"
+        _skill(deep / "docs" / "examples", "x")
+        assert skill_dirs_for_roots([str(flat), str(deep)]) == [flat.resolve()]
+
     @pytest.mark.asyncio
     async def test_root_skills_reach_the_skills_index_inside_a_turn(self, agent, tmp_path):
         """The skills index the model sees is built inside the turn's context."""
@@ -377,6 +405,29 @@ class TestAdditionalDirectories:
         )
         assert "only-in-acp-root" in seen["index"]
         assert "only-in-acp-root" not in build_skills_system_prompt()
+
+    @pytest.mark.asyncio
+    async def test_categorized_root_skills_reach_the_skills_index(self, agent, tmp_path):
+        from agent.prompt_builder import build_skills_system_prompt
+
+        workspace = tmp_path / "categorized-repo"
+        _skill(workspace / "skills" / "devops", "categorized-acp-skill")
+        resp = await agent.new_session(cwd="/tmp", additional_directories=[str(workspace)])
+        state = agent.session_manager.get_session(resp.session_id)
+
+        seen = {}
+
+        def _run_conversation(**_kwargs):
+            seen["index"] = build_skills_system_prompt()
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run_conversation
+        state.agent.interrupt = lambda: None
+        await agent.prompt(
+            prompt=[acp.schema.TextContentBlock(type="text", text="hi")],
+            session_id=resp.session_id,
+        )
+        assert "categorized-acp-skill" in seen["index"]
 
     @pytest.mark.asyncio
     async def test_extra_roots_widen_the_workspace_edit_boundary(self, agent, tmp_path, monkeypatch):
