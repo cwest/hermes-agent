@@ -17,7 +17,6 @@ from urllib.parse import unquote, urlparse
 
 import acp
 from acp.schema import (
-    AgentCapabilities,
     AgentMessageChunk,
     AgentThoughtChunk,
     AuthenticateResponse,
@@ -45,7 +44,6 @@ from acp.schema import (
     SetSessionModelResponse,
     SetSessionModeResponse,
     ResourceContentBlock,
-    SessionCapabilities,
     SessionForkCapabilities,
     SessionInfoUpdate,
     SessionListCapabilities,
@@ -53,6 +51,7 @@ from acp.schema import (
     SessionModeState,
     SessionModelState,
     SessionResumeCapabilities,
+    SessionAdditionalDirectoriesCapabilities,
     SessionInfo,
     TextContentBlock,
     TextResourceContents,
@@ -63,6 +62,17 @@ from acp.schema import (
 )
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
+from acp_adapter.client_setup import (
+    HermesAgentCapabilities,
+    HermesInitializeResponse,
+    HermesLoadSessionRequest,
+    HermesNewSessionRequest,
+    HermesResumeSessionRequest,
+    HermesSessionCapabilities,
+    SessionSystemPromptCapabilities,
+    parse_additional_directories,
+    parse_system_prompt,
+)
 from acp_adapter.events import (
     _build_plan_update_from_todo_result,
     make_message_cb,
@@ -78,6 +88,7 @@ from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
 )
+from agent.skill_utils import session_skill_dirs_scope
 from tools.approval import (
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
@@ -643,7 +654,42 @@ class HermesACPAgent(acp.Agent):
     def on_connect(self, conn: acp.Client) -> None:
         """Store the client connection for sending session updates."""
         self._conn = conn
+        self._route_session_setup_requests(conn)
         logger.info("ACP client connected")
+
+    def _route_session_setup_requests(self, conn: Any) -> None:
+        """Validate session/new|load|resume against models that keep ``systemPrompt``.
+
+        The SDK routes these methods through its own request models, which
+        predate the stabilized ``systemPrompt`` field and would drop it before
+        the handler runs. Re-registering the same routes with field-complete
+        models (same handlers, same result adapters) lets the field through.
+        """
+        router = getattr(getattr(conn, "_conn", None), "_handler", None)
+        route_request = getattr(router, "route_request", None)
+        if not callable(route_request):
+            # Never advertise a field the transport would drop on the floor.
+            self._system_prompt_routable = False
+            logger.warning("ACP router not reachable; not advertising systemPrompt")
+            return
+        from acp.meta import AGENT_METHODS
+        from acp.utils import normalize_result
+
+        route_request(AGENT_METHODS["session_new"], HermesNewSessionRequest, self, "new_session")
+        route_request(
+            AGENT_METHODS["session_load"],
+            HermesLoadSessionRequest,
+            self,
+            "load_session",
+            adapt_result=normalize_result,
+        )
+        route_request(
+            AGENT_METHODS["session_resume"],
+            HermesResumeSessionRequest,
+            self,
+            "resume_session",
+            unstable=True,
+        )
 
 
     def _session_modes(self, state: SessionState) -> SessionModeState:
@@ -679,9 +725,15 @@ class HermesACPAgent(acp.Agent):
             ],
         )
 
-    def _edit_approval_policy_for_state(self, state: SessionState) -> tuple[str, str | None]:
+    def _edit_approval_policy_for_state(
+        self, state: SessionState
+    ) -> tuple[str, str | list[str] | None]:
         mode = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
         policy = self._MODE_TO_EDIT_APPROVAL_POLICY.get(mode, self._EDIT_APPROVAL_POLICY_DEFAULT)
+        # Client-supplied additionalDirectories join cwd in the session's root
+        # set, so the workspace auto-approve boundary covers them too.
+        if state.additional_directories:
+            return policy, state.workspace_roots
         return policy, state.cwd
 
     @staticmethod
@@ -1058,16 +1110,22 @@ class HermesACPAgent(acp.Agent):
             resolved_protocol_version,
         )
 
-        return InitializeResponse(
+        return HermesInitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
-            agent_capabilities=AgentCapabilities(
+            agent_capabilities=HermesAgentCapabilities(
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
-                session_capabilities=SessionCapabilities(
+                session_capabilities=HermesSessionCapabilities(
                     fork=SessionForkCapabilities(),
                     list=SessionListCapabilities(),
                     resume=SessionResumeCapabilities(),
+                    additional_directories=SessionAdditionalDirectoriesCapabilities(),
+                    system_prompt=(
+                        SessionSystemPromptCapabilities()
+                        if getattr(self, "_system_prompt_routable", True)
+                        else None
+                    ),
                 ),
             ),
             auth_methods=auth_methods,
@@ -1339,9 +1397,19 @@ class HermesACPAgent(acp.Agent):
         self,
         cwd: str,
         mcp_servers: list | None = None,
+        additional_directories: list[str] | None = None,
+        system_prompt: Any = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
+        # Validate client setup before anything is created: the spec requires
+        # an unsupported value to fail without creating the session.
+        client_prompt = parse_system_prompt(system_prompt)
+        roots = parse_additional_directories(additional_directories)
         state = self.session_manager.create_session(cwd=cwd)
+        if client_prompt is not None or roots:
+            self.session_manager.set_client_setup(
+                state, system_prompt=client_prompt, additional_directories=roots or []
+            )
         await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("New session %s (cwd=%s)", state.session_id, cwd)
         self._schedule_available_commands_update(state.session_id)
@@ -1355,17 +1423,37 @@ class HermesACPAgent(acp.Agent):
             ),
         )
 
+    def _apply_reopen_setup(
+        self, state: SessionState, client_prompt: str | None, roots: list[str] | None
+    ) -> None:
+        """Apply client setup on session/load|resume.
+
+        A supplied ``systemPrompt`` replaces the stored one; omitted keeps it.
+        ``additionalDirectories`` is never restored implicitly: omitted or
+        empty activates no extra roots for the reopened session.
+        """
+        if client_prompt is None and not roots and not state.additional_directories:
+            return
+        self.session_manager.set_client_setup(
+            state, system_prompt=client_prompt, additional_directories=roots or []
+        )
+
     async def load_session(
         self,
         cwd: str,
         session_id: str,
         mcp_servers: list | None = None,
+        additional_directories: list[str] | None = None,
+        system_prompt: Any = None,
         **kwargs: Any,
     ) -> LoadSessionResponse | None:
+        client_prompt = parse_system_prompt(system_prompt)
+        roots = parse_additional_directories(additional_directories)
         state = self.session_manager.update_cwd(session_id, cwd)
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
             return None
+        self._apply_reopen_setup(state, client_prompt, roots)
         await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("Loaded session %s", session_id)
         # Per ACP spec, `session/load` must stream the prior conversation back
@@ -1407,12 +1495,17 @@ class HermesACPAgent(acp.Agent):
         cwd: str,
         session_id: str,
         mcp_servers: list | None = None,
+        additional_directories: list[str] | None = None,
+        system_prompt: Any = None,
         **kwargs: Any,
     ) -> ResumeSessionResponse:
+        client_prompt = parse_system_prompt(system_prompt)
+        roots = parse_additional_directories(additional_directories)
         state = self.session_manager.update_cwd(session_id, cwd)
         if state is None:
             logger.warning("resume_session: session %s not found, creating new", session_id)
             state = self.session_manager.create_session(cwd=cwd)
+        self._apply_reopen_setup(state, client_prompt, roots)
         await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("Resumed session %s", state.session_id)
         # See `load_session` above for the spec rationale — replay must
@@ -1517,6 +1610,7 @@ class HermesACPAgent(acp.Agent):
                     cwd=s["cwd"],
                     title=s.get("title"),
                     updated_at=updated_at,
+                    additional_directories=s.get("additional_directories") or None,
                 )
             )
 
@@ -1792,6 +1886,16 @@ class HermesACPAgent(acp.Agent):
             # never leaks one session's id into the next session's tools.
             previous_session_id = os.environ.get("HERMES_SESSION_ID")
             os.environ["HERMES_SESSION_ID"] = session_id
+            # Skill roots from the client's additionalDirectories, visible to
+            # the skills index and skill tools for this turn only. The turn runs
+            # in its own copied context, so other sessions never see them.
+            try:
+                turn_skill_dirs = state.skill_dirs
+            except Exception:
+                logger.debug("Could not resolve ACP session skill dirs", exc_info=True)
+                turn_skill_dirs = []
+            skill_scope = session_skill_dirs_scope(turn_skill_dirs)
+            skill_scope.__enter__()
             try:
                 result = agent.run_conversation(
                     user_message=user_content,
@@ -1804,6 +1908,7 @@ class HermesACPAgent(acp.Agent):
                 logger.exception("Agent error in session %s", session_id)
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
+                skill_scope.__exit__(None, None, None)
                 # Restore the interactive contextvar for this context.
                 if interactive_token is not None:
                     reset_hermes_interactive_context(interactive_token)
@@ -2078,6 +2183,7 @@ class HermesACPAgent(acp.Agent):
             model=new_model,
             requested_provider=target_provider,
         )
+        self.session_manager.apply_client_setup(state)
         self.session_manager.save_session(state.session_id)
         provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
         logger.info("Session %s: model switched to %s", state.session_id, new_model)
@@ -2330,6 +2436,7 @@ class HermesACPAgent(acp.Agent):
                 base_url=current_base_url,
                 api_mode=current_api_mode,
             )
+            self.session_manager.apply_client_setup(state)
             self.session_manager.save_session(session_id)
             logger.info(
                 "Session %s: model switched to %s via provider %s",

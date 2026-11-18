@@ -117,7 +117,7 @@ def make_tool_progress_cb(
     loop: asyncio.AbstractEventLoop,
     tool_call_ids: Dict[str, Deque[str]],
     tool_call_meta: Dict[str, Dict[str, Any]],
-    edit_approval_policy_getter: Callable[[], tuple[str, str | None]] | None = None,
+    edit_approval_policy_getter: Callable[[], tuple[str, str | list[str] | None]] | None = None,
 ) -> Callable:
     """Create a ``tool_progress_callback`` for AIAgent.
 
