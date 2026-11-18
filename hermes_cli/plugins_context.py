@@ -413,6 +413,15 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
         from hermes_cli.plugins_injection import inject_plugin_message
         return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
 
+    def wake_chat(self, content: str, *, origin: Mapping[str, Any], wake_id: str) -> bool:
+        """Wake a known chat in this plugin's own profile the way the Kanban notifier wakes a
+        subscriber: the turn needs no human message admitted there first. ``wake_id`` names the
+        wake (an event id); repeating it for the same chat, even while the first is in flight, never
+        starts a second delivery. ``True`` is the gateway's admission receipt, not a scheduling
+        promise. Contract: plugins_injection.py."""
+        from hermes_cli.plugins_injection import wake_plugin_chat
+        return wake_plugin_chat(self, content, origin=origin, wake_id=wake_id)
+
     def session_cwd(self) -> str:
         """The calling session's recorded cwd, never the gateway's own (``plugin_session``)."""
         from hermes_cli.plugin_session import context_cwd

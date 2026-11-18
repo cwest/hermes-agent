@@ -112,6 +112,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Dispatch tools from commands | `ctx.dispatch_tool(name, args)` — invokes a registered tool with parent-agent context auto-wired |
 | Add CLI commands | `ctx.register_cli_command(name, help, setup_fn, handler_fn)` — adds `hermes <plugin> <subcommand>` |
 | Inject messages | `ctx.inject_message(content, role="user", session_key=... \| origin=...)` - see [Injecting Messages](#injecting-messages) |
+| Wake a known chat | `ctx.wake_chat(content, origin=..., wake_id=...)` - see [Waking a known chat](#waking-a-known-chat-wake_chat) |
 | Post and edit a status message | `handle = ctx.post_message(text)`, then `handle.edit(text)` — see [Posting a live message](#posting-a-live-message) |
 | Post a card with no model turn | `ctx.post_card({"text": ..., "directive": ...}, session_key=...)` — see [Posting a card](#posting-a-card) |
 | Ship data files | `Path(__file__).parent / "data" / "file.yaml"` |
@@ -1220,6 +1221,27 @@ Starting a session with `origin` (gateway mode only):
 - A plugin can never target another profile. `False` is returned (with the reason in the gateway log) when the origin names a different `profile`, when the gateway's own profile routing sends that chat to a different profile, when the plugin's profile is not served by this gateway, or when that profile has no connected adapter for `platform` — another profile's bot is never borrowed. On a multiplexed gateway the turn runs under the plugin's profile home and secrets.
 - Authorisation is not bypassed: the origin's user must pass the gateway's current allowlists, pairing, or allow-all configuration for that profile, the same check as the `session_key` path. Choose a `user_id` that is authorised, or the request is dropped at dispatch and logged.
 - The same text rules apply: no slash commands, approvals, or prompt resolution. The permission below is read from the plugin's own profile `config.yaml`.
+
+### Waking a known chat (`wake_chat`)
+
+A plugin that produces status notices for a chat it already knows (for example, a task board telling the thread that filed a task that the task changed lane) uses `ctx.wake_chat()`. The gateway admits it the same way it admits its own Kanban notifier's wakes, so the chat does **not** need a human message admitted there first:
+
+```python
+ok = ctx.wake_chat(
+    "Task t_123 moved to review.",
+    origin={"platform": "discord", "chat_id": "1290000000000000000", "chat_type": "thread",
+            "thread_id": "1290000000000000000", "user_id": "123456789012345678"},
+    wake_id="t_123:evt-42",
+)
+```
+
+**Signature:** `ctx.wake_chat(content: str, *, origin: Mapping[str, Any], wake_id: str) -> bool`
+
+- If the chat holds a committed human turn, the wake joins its durable FIFO. Otherwise it goes through the gateway's internal-event admission, which the adapter must actually accept.
+- `True` is the gateway's admission receipt (the turn is queued or started), not just a scheduling promise. `False` means the wake was not admitted: retry it later or report it. Because the call waits for the receipt, call it from a worker thread or a hook, never from code running on the gateway's event loop (that call returns `False`).
+- `wake_id` names the wake (an event id is a good choice) and is required. The first call for a wake id owns its delivery. A call with the same id for the same plugin and chat never starts a second delivery: while the first is still in flight (a concurrent call, or a retry after its receipt timed out) it waits for the first call's result and returns it, and once the wake is admitted it answers `True` from memory. A refused wake frees its id, so a later retry delivers. The gateway keeps wake ids in memory, so the guarantee does not survive a gateway restart.
+- Every `origin` rule of `inject_message` applies: the plugin's own profile only, a live adapter for the platform, the gateway's own routing, and the `allow_gateway_injection` permission. The origin must also name a `user_id`, and that user must pass the gateway's current authorisation; a wake with no user, or an unauthorised one, gets `False`.
+- Messaging platforms that push replies only (not the stateless API server).
 
 Ink TUI (`hermes --tui`) and the desktop / dashboard chat are a third host. They do not set the classic CLI reference and they do not register on the messaging-gateway injector — those two hosts stay separate so a live gateway cannot clobber the TUI (or the reverse). Pass the session's durable `session_key` (the `ses_…` id), not the ephemeral UI session id. Hermes queues the text on that session's prompt queue: a busy session keeps the message for the next turn, an idle session starts one. A key that is not a live TUI session is left for the messaging gateway when one is running, and is never rerouted to a different chat.
 
