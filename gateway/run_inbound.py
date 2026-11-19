@@ -1423,6 +1423,11 @@ class GatewayInboundMixin(
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.event = event
+        # Claimed as this session's turn: that is its admission receipt. A busy adapter's dispatch
+        # can run an internal wake here inline (the runner's last turn ended while its reply still
+        # holds the adapter guard); unstamped, admit_internal_event reports a turn that ran as
+        # refused and the producer's retry runs it again.
+        event._gateway_accepted = True
         _claim_state.turn.started_ts = time.time()
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
