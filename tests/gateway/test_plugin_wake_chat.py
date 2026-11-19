@@ -108,7 +108,7 @@ def _counting_deliver(monkeypatch, *, delay=0.0, hold=None, refuse=0):
     first *refuse* calls. A call whose text is in *hold* (text -> asyncio.Event) parks until
     released and then counts as admitted without a real admission (a second wake into a session
     whose turn is still running may be refused as busy, which is not what that test measures)."""
-    import gateway.wake as wake
+    from gateway import wake
     real = wake.deliver_wake
     calls = []
 
@@ -184,7 +184,7 @@ async def test_a_retry_after_a_receipt_timeout_does_not_deliver_again(monkeypatc
 @pytest.mark.asyncio
 async def test_different_wake_ids_do_not_wait_on_each_other(monkeypatch):
     from hermes_constants import get_hermes_home
-    runner, _adapter, _authority, executed = await _gateway(monkeypatch)
+    runner, _adapter, _authority, _executed = await _gateway(monkeypatch)
     ctx, manager = _context(get_hermes_home())
     manager.set_gateway_message_injector(runner, runner._schedule_plugin_message_injection)
     release = asyncio.Event()
@@ -255,3 +255,32 @@ async def test_a_wake_called_on_the_gateway_loop_is_refused_instead_of_deadlocki
 def test_no_live_gateway_refuses_a_wake(tmp_path):
     ctx, _manager = _context(tmp_path)
     assert ctx.wake_chat("x", origin=ORIGIN, wake_id="evt-1") is False
+
+
+@pytest.mark.asyncio
+async def test_a_wake_that_runs_while_the_last_reply_is_sending_is_admitted_once(monkeypatch):
+    from hermes_constants import get_hermes_home
+    from gateway.platforms.base import SendResult
+    runner, adapter, _authority, executed = await _gateway(monkeypatch)
+    ctx, manager = _context(get_hermes_home())
+    manager.set_gateway_message_injector(runner, runner._schedule_plugin_message_injection)
+    release, sends = asyncio.Event(), []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        sends.append(content)
+        if len(sends) == 1:
+            await release.wait()  # the first turn is over in the runner; its reply still holds the chat
+        return SendResult(success=True, message_id="sent")
+    monkeypatch.setattr(adapter, "send", send)
+    calls = _counting_deliver(monkeypatch)
+
+    assert await asyncio.to_thread(ctx.wake_chat, "first", origin=ORIGIN, wake_id="evt-1") is True
+    await async_wait_until(lambda: sends, timeout=10, what="the first reply to start sending")
+    # The second wake runs as soon as it arrives, so its receipt must say so ...
+    assert await asyncio.to_thread(ctx.wake_chat, "second", origin=ORIGIN, wake_id="evt-2") is True
+    release.set()
+    await async_wait_until(lambda: not adapter._active_sessions, timeout=10, what="the chat to go idle")
+    # ... and a retry of it is answered from memory, never run again.
+    assert await asyncio.to_thread(ctx.wake_chat, "second", origin=ORIGIN, wake_id="evt-2") is True
+    assert calls == ["first", "second"]
+    assert executed.count("second") == 1
