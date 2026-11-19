@@ -23,7 +23,8 @@ def home(tmp_path, monkeypatch):
     import tools.skill_manager_tool as smt
     su._external_dirs_cache_clear()
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", home / "skills")
-    monkeypatch.setattr(smt, "SKILLS_DIR", home / "skills")
+    # Upstream resolves the skills dir only through skills_tool; older bases also read smt's copy.
+    monkeypatch.setattr(smt, "SKILLS_DIR", home / "skills", raising=False)
     yield home
     su._external_dirs_cache_clear()
 
