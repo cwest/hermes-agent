@@ -62,7 +62,10 @@ def recover_interrupted_executions_resilient() -> int:
     another process holds open strands that holder's claims in the renamed inode and drops the
     ``scheduled_instant`` rows that stop a slot firing twice."""
     from cron import executions
-    from hermes_state_errors import classify_persistence_error
+    try:
+        from storage_errors import classify_persistence_error
+    except ImportError:  # base without the storage_errors move
+        from hermes_state_errors import classify_persistence_error
 
     try:
         return executions.recover_interrupted_executions()
