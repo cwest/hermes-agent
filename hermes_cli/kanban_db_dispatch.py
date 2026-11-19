@@ -1543,13 +1543,14 @@ def check_respawn_guard(
         return None
 
     # 3. Completed run within guard window. Exception: an explicit re-queue
-    #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim) is
-    #    a deliberate "run it again" — otherwise a manual done→ready would sit
-    #    silently held until the window elapses.
+    #    AFTER that success (done→ready drag, promotion, unblock, reclaim, a
+    #    review bounce, a handoff to another profile) is a deliberate "run it
+    #    again" — otherwise a rework bounce would sit silently held until the
+    #    window elapses.
     success = max((t for t, _ in _rows_since(
         conn, "task_runs", task_id, now - _RESPAWN_GUARD_SUCCESS_WINDOW, "AND outcome = 'completed'")), default=None)
-    if success is not None and not any(_rows_since(
-            conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")):
+    if success is not None and not any(_is_requeue_event(e["kind"], e["payload"]) for _, e in _rows_since(
+            conn, "task_events", task_id, success, f"AND kind IN ({_REQUEUE_KINDS_SQL})", cols=", kind, payload")):
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
@@ -1607,6 +1608,25 @@ def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int, 
         t = unreadable if t is None else t
         if t is not None and (t > since if strict else t >= since):
             yield t, row
+
+
+_REQUEUE_KINDS = (
+    "status", "promoted", "promoted_manual", "unblocked", "reclaimed",
+    "changes_requested", "review_reopened", "assigned", "status_changed",
+)
+_REQUEUE_KINDS_SQL = ", ".join(f"'{k}'" for k in _REQUEUE_KINDS)
+
+
+def _is_requeue_event(kind: str, payload: Optional[str]) -> bool:
+    """A deliberate move that lifts ``recent_success``. ``assigned`` counts only
+    as a real handoff to another profile; ``status_changed`` (written by
+    out-of-tree board tooling) only when it lands the card in ``ready``."""
+    if kind == "assigned":
+        return _is_handoff_event(kind, payload)
+    if kind == "status_changed":
+        data = _kb._json_or(payload, {})
+        return isinstance(data, dict) and data.get("to") == "ready"
+    return True
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
