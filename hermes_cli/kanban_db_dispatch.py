@@ -1549,8 +1549,8 @@ def check_respawn_guard(
     #    window elapses.
     success = max((t for t, _ in _rows_since(
         conn, "task_runs", task_id, now - _RESPAWN_GUARD_SUCCESS_WINDOW, "AND outcome = 'completed'")), default=None)
-    if success is not None and not any(_is_requeue_event(e["kind"], e["payload"]) for _, e in _rows_since(
-            conn, "task_events", task_id, success, f"AND kind IN ({_REQUEUE_KINDS_SQL})", cols=", kind, payload")):
+    if success is not None and not any(_kbr.is_requeue_event(e["kind"], e["payload"]) for _, e in _rows_since(
+            conn, "task_events", task_id, success, f"AND kind IN ({_kbr.REQUEUE_KINDS_SQL})", cols=", kind, payload")):
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
@@ -1567,7 +1567,7 @@ def check_respawn_guard(
     pr_comments = [(t, urls) for t, urls in pr_comments if urls]
     if pr_comments:
         # Strictly after: a same-second tie stays guarded (fail closed).
-        if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
+        if any(_kbr.is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
                 conn, "task_events", task_id, max(t for t, _ in pr_comments),
                 "AND kind IN ('assigned', 'unblocked', 'changes_requested', 'review_reopened')",
                 cols=", kind, payload", strict=True)):
@@ -1608,41 +1608,6 @@ def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int, 
         t = unreadable if t is None else t
         if t is not None and (t > since if strict else t >= since):
             yield t, row
-
-
-_REQUEUE_KINDS = (
-    "status", "promoted", "promoted_manual", "unblocked", "reclaimed",
-    "changes_requested", "review_reopened", "assigned", "status_changed",
-)
-_REQUEUE_KINDS_SQL = ", ".join(f"'{k}'" for k in _REQUEUE_KINDS)
-
-
-def _is_requeue_event(kind: str, payload: Optional[str]) -> bool:
-    """A deliberate move that lifts ``recent_success``. ``assigned`` counts only
-    as a real handoff to another profile; ``status_changed`` (written by
-    out-of-tree board tooling) only when it lands the card in ``ready``."""
-    if kind == "assigned":
-        return _is_handoff_event(kind, payload)
-    if kind == "status_changed":
-        data = _kb._json_or(payload, {})
-        return isinstance(data, dict) and data.get("to") == "ready"
-    return True
-
-
-def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
-    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
-    a handoff. A no-op re-assign (dev→dev via CLI/dashboard/``reassign
-    --reclaim``), an unassign, or the dispatcher's own
-    ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
-    the very implementer that opened the PR. Events without ``from`` (written
-    before it was recorded) are not trusted as handoffs — fail closed."""
-    if kind != "assigned":
-        return True
-    data = _kb._json_or(payload, {})
-    if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
-        return False
-    to = data.get("assignee")
-    return bool(to) and "from" in data and data["from"] != to
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
@@ -2879,4 +2844,5 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_default_assignee as _kbda
+from hermes_cli import kanban_db_dispatch_requeue as _kbr
 from hermes_cli import kanban_db_workspace as _kbw
