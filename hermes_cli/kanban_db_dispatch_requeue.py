@@ -1,11 +1,13 @@
-"""Which ``task_events`` lift a respawn guard in ``check_respawn_guard``.
+"""The ``recent_success`` respawn guard and which ``task_events`` count as a
+deliberate re-queue that lifts it (plus the handoff predicate ``active_pr`` shares).
 
-Split out of ``hermes_cli.kanban_db_dispatch``; ``_json_or`` is reached
-late-bound from ``hermes_cli.kanban_db`` (import-cycle breaking).
+Split out of ``hermes_cli.kanban_db_dispatch``; ``_json_or`` and ``_rows_since``
+are reached late-bound (import-cycle breaking).
 """
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Optional
 
 REQUEUE_KINDS = (
@@ -13,6 +15,19 @@ REQUEUE_KINDS = (
     "changes_requested", "review_reopened", "assigned", "status_changed",
 )
 REQUEUE_KINDS_SQL = ", ".join(f"'{k}'" for k in REQUEUE_KINDS)
+
+
+def held_by_recent_success(conn: sqlite3.Connection, task_id: str, now: int, window: int) -> bool:
+    """A completed run within ``window`` with no deliberate re-queue after it.
+    A re-queue (done→ready drag, promotion, unblock, reclaim, a review bounce,
+    a handoff to another profile) means "run it again"; without the exemption
+    a rework bounce would sit silently held until the window elapses."""
+    from hermes_cli.kanban_db_dispatch import _rows_since
+
+    success = max((t for t, _ in _rows_since(
+        conn, "task_runs", task_id, now - window, "AND outcome = 'completed'")), default=None)
+    return success is not None and not any(is_requeue_event(e["kind"], e["payload"]) for _, e in _rows_since(
+        conn, "task_events", task_id, success, f"AND kind IN ({REQUEUE_KINDS_SQL})", cols=", kind, payload"))
 
 
 def is_requeue_event(kind: str, payload: Optional[str]) -> bool:

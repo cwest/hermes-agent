@@ -1513,15 +1513,9 @@ def check_respawn_guard(
     if lane == "review":
         return None
 
-    # 3. Completed run within guard window. Exception: an explicit re-queue
-    #    AFTER that success (done→ready drag, promotion, unblock, reclaim, a
-    #    review bounce, a handoff to another profile) is a deliberate "run it
-    #    again" — otherwise a rework bounce would sit silently held until the
-    #    window elapses.
-    success = max((t for t, _ in _rows_since(
-        conn, "task_runs", task_id, now - _RESPAWN_GUARD_SUCCESS_WINDOW, "AND outcome = 'completed'")), default=None)
-    if success is not None and not any(_kbr.is_requeue_event(e["kind"], e["payload"]) for _, e in _rows_since(
-            conn, "task_events", task_id, success, f"AND kind IN ({_kbr.REQUEUE_KINDS_SQL})", cols=", kind, payload")):
+    # 3. Completed run within guard window, unless a deliberate re-queue
+    #    follows it (re-queue rules: kanban_db_dispatch_requeue).
+    if _kbr.held_by_recent_success(conn, task_id, now, _RESPAWN_GUARD_SUCCESS_WINDOW):
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR
