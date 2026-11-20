@@ -207,6 +207,15 @@ def _selected_test_files(node: dict, name: str, *, windows_only: bool = False) -
     if windows_only:
         cells = [cell for cell in cells if cell.get("marker") == "windows"]
     assert cells, f"{name}: empty matrix"
+    # Slices of one lane select the same files unless the step's command (not its env, which
+    # only the runner reads) names the slice: replay one cell per lane.
+    command = json.dumps({k: v for k, v in steps[0].items() if k != "env"})
+    if "matrix.slice" not in command and "matrix.name" not in command:
+        lanes = {}
+        for cell in cells:
+            lanes.setdefault(json.dumps({k: v for k, v in cell.items() if k not in ("slice", "name")},
+                                        sort_keys=True), cell)
+        cells = list(lanes.values())
     selected = set()
     for cell in cells:
         runner = gha.render(body["runs-on"], {**ctx, "matrix": cell})
