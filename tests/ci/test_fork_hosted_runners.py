@@ -466,6 +466,64 @@ def test_the_crash_cell_journey_lands_in_the_slice_that_checks_its_manifest():
     assert "test_crash_cells.py" in {f.name for f in held}
 
 
+def test_timing_bound_guards_leave_the_sliced_suite_for_one_single_worker_job():
+    """The sliced suite deselects tests/timing_bound.txt; one job runs exactly those tests with
+    one worker, so a wall-clock bound never shares the runner's cores with another test file."""
+    mod = _load()
+    out = _rewrite(SLICED)
+    jobs = _yaml(out)["jobs"]
+    sliced = jobs["test"]["steps"][0]
+    assert sliced["run"] == "scripts/run_tests.sh -- --timing-bound=exclude"
+    assert f"# {mod.TIMEOUT_MARK} just test-all" in out
+    lone = jobs["test-timing-bound"]
+    assert lone["runs-on"] == "ubuntu-latest"
+    assert "strategy" not in lone and "matrix.slice" not in str(lone)
+    step = lone["steps"][0]
+    assert step["run"] == ("scripts/run_tests.sh $(grep -o '^tests/[^:]*' tests/timing_bound.txt"
+                           " | sort -u) -- --timing-bound=only")
+    assert step["env"]["HERMES_TEST_WORKERS"] == 1
+    assert step["env"]["KEEP"] == 3
+    assert "HERMES_TEST_SLICE" not in step["env"]
+    assert list(jobs) == ["test", "test-timing-bound"]
+    assert _rewrite(out) == out
+
+
+def test_the_timing_bound_job_drops_steps_keyed_by_slice():
+    """A step that names its slice (the per-slice duration cache key) has no slice to name."""
+    job = SLICED + """\
+      - name: Save per-file duration cache (main only)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: test-durations-${{ github.run_id }}-${{ matrix.slice }}
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
+"""
+    lone = _yaml(_rewrite(job))["jobs"]["test-timing-bound"]
+    assert [s["name"] for s in lone["steps"]] == ["Run tests", "Check the checkout is clean"]
+
+
+def test_timing_bound_guards_stay_in_a_suite_on_a_small_runner():
+    out = _rewrite(SLICED.replace("blacksmith-32vcpu", "blacksmith-4vcpu"))
+    assert "timing-bound" not in out
+    assert "run: just test-all\n" in out
+
+
+def test_the_committed_timing_bound_job_runs_every_listed_file(tmp_path):
+    """The job's file selection, run as the runner's shell runs it, is the list's set of files."""
+    sys.path.insert(0, str(ROOT))
+    from tests._fixtures import timing_bound
+
+    tests = _yaml((ROOT / ".github" / "workflows" / "tests.yml").read_text())
+    step = next(s for s in tests["jobs"]["test-timing-bound"]["steps"] if s.get("name") == "Run tests")
+    assert step["env"]["HERMES_TEST_WORKERS"] == 1
+    pick = re.search(r"\$\((.*)\)", step["run"])
+    assert pick and step["run"].endswith("-- --timing-bound=only")
+    ran = subprocess.run(["bash", "-c", pick[1]], cwd=ROOT, capture_output=True, text=True, check=True)
+    assert ran.stdout.split() == sorted({i.split("::", 1)[0] for i in timing_bound.listed()})
+    run = next(s for s in tests["jobs"]["test"]["steps"] if s.get("name") == "Run tests")["run"]
+    assert run == "scripts/run_tests.sh -- --timing-bound=exclude"
+
+
 def test_the_committed_tree_is_the_rewrite_of_upstreams_workflows(tmp_path):
     """--check over the committed tree is clean, so a resync regenerates the same files."""
     ran = subprocess.run([sys.executable, str(SCRIPT), "--root", str(ROOT), "--check"],
