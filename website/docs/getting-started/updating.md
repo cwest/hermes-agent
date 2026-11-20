@@ -224,11 +224,11 @@ Sessions and messages created after the update are not in that snapshot.
 
 ### Why the gateway restart can take a while
 
-The restart happens when the gateway is idle: the running gateway keeps serving normally (new turns, background-process notices and background-subagent completions all still run) and exits at the first moment no work is in flight (chat turns, cron jobs, API runs, background subagents, notify-watched background processes). Live work is never interrupted on a timer: every `agent.restart_after_turn_timeout` seconds (30 minutes by default) the gateway logs a warning naming what it is still waiting on and keeps waiting; only a forced restart stops it. While that wait is in progress the updater prints, every 30 seconds, what the gateway is still holding for — for example:
+The restart happens when the gateway is idle: the running gateway keeps serving normally (new turns, background-process notices and background-subagent completions all still run) and exits at the first moment no work is in flight (chat turns, cron jobs, API runs, background subagents, notify-watched background processes). Every `agent.restart_after_turn_timeout` seconds (30 minutes by default) the gateway logs a warning naming what it is still waiting on and keeps waiting. The wait is bounded by `agent.restart_max_wait` (600 seconds by default): when it passes with work still live, the gateway forces the restart, interrupts that work and logs every unit it cut. Set it to `0` to wait for idle with no bound. A forced restart (`/restart now`, `hermes update --force`) stops live work at once. While that wait is in progress the updater prints, every 30 seconds, what the gateway is still holding for — for example:
 
 ```
   → hermes-gateway: draining (up to 1875s)...
-  ⏳ still waiting for idle — 1560s left of this wait (live work is never interrupted; past it the gateway keeps its restart pending)
+  ⏳ still waiting for idle — 1560s left of this wait (past it the gateway keeps its restart pending until idle or agent.restart_max_wait)
      waiting on 1 active work unit(s):
        • cron job 6ba19dab68df (nightly-scout) in external worker pid 573597, running 6m40s
      finish or kill the work above to restart now, or `hermes update --force` to stop it now

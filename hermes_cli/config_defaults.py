@@ -106,9 +106,10 @@ DEFAULT_CONFIG = {
         "cron_drain_timeout": 30,
         # In-band restart (/restart, SIGUSR1, `hermes update`) is "restart when idle": the gateway
         # keeps serving (new turns, notices, delegation completions) and restarts at the first moment
-        # no work is in flight. Live work is never interrupted on a timer: each time this many seconds
-        # pass with work still running, a WARNING names every unit and the wait continues. Only a
-        # forced restart (`pause-for-update` with force) or SIGTERM stops live work.
+        # no work is in flight. This is a warning interval, not a deadline: each time this many
+        # seconds pass with work still running, a WARNING names every unit and the wait continues.
+        # Live work is stopped only by restart_max_wait below, a forced restart (`/restart now`,
+        # `pause-for-update` with force) or SIGTERM.
         "restart_after_turn_timeout": 1800,
         # Upper bound (seconds) on that wait. When it passes with work still live, the restart is
         # forced: live work is interrupted and every unit cut is logged. A busy board (kanban

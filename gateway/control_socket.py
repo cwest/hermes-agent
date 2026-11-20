@@ -548,7 +548,8 @@ def pause_gateway_for_update(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIM
     answers (old gateway without the verb, no/dead socket) — the caller then uses the legacy
     signal/tree-kill pause path.
 
-    Default: restart when idle (the gateway keeps serving and never interrupts live work). ``force``
+    Default: restart when idle (the gateway keeps serving; live work is interrupted only once
+    ``agent.restart_max_wait`` passes, 0 = never). ``force``
     stops live work now; a gateway that predates it answers without ``"force": true``.
     Step 2 of the socket migration (#92091).
     """

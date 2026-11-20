@@ -95,7 +95,7 @@ def _tui_command(home: Optional[Path]) -> str:
 def format_drain_report(work: Optional[list], *, remaining_s: float, home: Optional[Path] = None) -> str:
     """Multi-line progress block: what the gateway is waiting on plus how to stop waiting."""
     lines = [f"  ⏳ still waiting for idle — {max(remaining_s, 0):.0f}s left of this wait "
-             "(live work is never interrupted; past it the gateway keeps its restart pending)"]
+             "(past it the gateway keeps its restart pending until idle or agent.restart_max_wait)"]
     if work is None:
         lines.append("     (gateway did not report what it is waiting on — pre-update gateway or unreadable state file)")
     elif not work:
