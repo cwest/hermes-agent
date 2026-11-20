@@ -1514,14 +1514,9 @@ def check_respawn_guard(
     if lane == "review":
         return None
 
-    # 3. Completed run within guard window. Exception: an explicit re-queue
-    #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim) is
-    #    a deliberate "run it again" — otherwise a manual done→ready would sit
-    #    silently held until the window elapses.
-    success = max((t for t, _ in _rows_since(
-        conn, "task_runs", task_id, now - _RESPAWN_GUARD_SUCCESS_WINDOW, "AND outcome = 'completed'")), default=None)
-    if success is not None and not any(_rows_since(
-            conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")):
+    # 3. Completed run within guard window, unless a deliberate re-queue
+    #    follows it (re-queue rules: kanban_db_dispatch_requeue).
+    if _kbr.held_by_recent_success(conn, task_id, now, _RESPAWN_GUARD_SUCCESS_WINDOW):
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR
@@ -2773,4 +2768,5 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_default_assignee as _kbda
+from hermes_cli import kanban_db_dispatch_requeue as _kbr
 from hermes_cli import kanban_db_workspace as _kbw
