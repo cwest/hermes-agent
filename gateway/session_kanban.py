@@ -303,7 +303,17 @@ def _run_worker_turns(agent, frame, history):
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
         raise
     finally:
-        _record_worker_result(context, code, last_output)
+        _record_worker_result(context, _owner_side_exit(agent, code), last_output)
+
+
+def _owner_side_exit(agent, code):
+    """A plain failure whose store lost its owner (receipt timeout, no endpoint) is the owner's,
+    not the card's: book EX_UNAVAILABLE so the dispatcher requeues it without spending a retry."""
+    from agent.runtime_session_store import owner_side_failure
+    if code == 1 and owner_side_failure(getattr(agent, '_session_db', None)):
+        from hermes_cli.turn_exit import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+        return KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+    return code
 
 
 def record_start_failure(frame, exc):

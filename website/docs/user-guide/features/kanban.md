@@ -601,7 +601,15 @@ is spent. Both lanes get the same booking: a reviewer worker that dies on a
 revoked key parks the card exactly like an implementer. `hermes kanban show`
 surfaces it as *Provider rejected this profile's credential or model — blocked
 after one attempt*; fix the assignee profile's provider (`hermes -p <profile>
-auth` / `setup`), then `hermes kanban unblock <id>`. The worker also writes its exit code as the
+auth` / `setup`), then `hermes kanban unblock <id>`. A managed worker whose
+profile owner (the gateway) stopped answering its session writes — a
+`worker.persist` receipt timed out, or no owner endpoint answered — exits `69`
+(`EX_UNAVAILABLE`), and the submitter exits `69` too when the owner settles that
+attempt `unknown`. The card did not fail, its host did: the dispatcher records
+the run as `crashed` with `exit_kind: owner_unavailable` and requeues it
+without counting a failure, so one stalled gateway turn cannot park every card
+in flight at once. Only `3` consecutive owner-unavailable runs park the card
+(`gave_up` with `owner_unavailable: true`, sticky). The worker also writes its exit code as the
 last line of its own log (`[kanban-worker-exit] rc=<code>`), so a per-tick
 `hermes kanban dispatch` process — which never reaped the worker and cannot
 read its exit status — books the same death the same way the gateway-embedded
@@ -1493,7 +1501,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `skipped_nonspawnable` | `{assignee}` | Dispatcher refused to spawn because the assignee profile does not exist in this home (or is not in `kanban.dispatch_profiles`, or a plugin runs it elsewhere). Written once per card — repeated only when another event landed in between — so `show`/`tail` name the missing profile without a row per tick. The card stays in `ready`; reassign it or install the profile. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation, worker_output?}` | Worker exited successfully while the task was still `running`, usually because it answered without a terminal board call (`kanban_complete`, `kanban_request_review` or `kanban_block`). Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. `worker_output` carries the worker's own last printed text (usually its explanation of why it stopped), also folded into `last_failure_error` and shown to the retry worker as the prior-attempt error. |
-| `gave_up` | `{failures, effective_limit, limit_source, error, terminal_provider?}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. `terminal_provider: true` means the worker exited `78` on a provider error a retry cannot fix (credential revoked, model gone) — including a startup credential failure that explicitly requires re-login (`hermes auth` / `setup`), which exits `78` before the first turn; other startup failures exit `1` — and the breaker fired on that first attempt, sticky, regardless of the limit. |
+| `gave_up` | `{failures, effective_limit, limit_source, error, terminal_provider?, owner_unavailable?}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. `terminal_provider: true` means the worker exited `78` on a provider error a retry cannot fix (credential revoked, model gone) — including a startup credential failure that explicitly requires re-login (`hermes auth` / `setup`), which exits `78` before the first turn; other startup failures exit `1` — and the breaker fired on that first attempt, sticky, regardless of the limit. `owner_unavailable: true` (with `owner_unavailable_runs`) means the last 3 runs all exited `69` because the profile owner stopped answering their session writes; those runs never counted toward the limit, and the block is sticky. |
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
 

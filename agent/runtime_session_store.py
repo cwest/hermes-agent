@@ -47,6 +47,16 @@ class WorkerPersistenceError(RuntimeError):
     pass
 
 
+# Sticky store failures that mean the OWNER stopped answering (no receipt in time, no endpoint),
+# not that this worker's writes were refused: the turn failed for a reason outside the card.
+OWNER_SIDE_FAILURES = frozenset({'worker_receipt_timeout', 'owner_unavailable'})
+
+
+def owner_side_failure(store) -> bool:
+    """True when ``store`` (a worker's session store) holds an owner-side sticky failure."""
+    return getattr(store, 'failure', None) in OWNER_SIDE_FAILURES
+
+
 def _caller_summary(limit=8):
     """module:function:line of the frames above this store (its own frames skipped), never
     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""

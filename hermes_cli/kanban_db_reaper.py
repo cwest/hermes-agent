@@ -30,6 +30,31 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class _DeadWorker:
+    """How ``detect_crashed_workers`` should book one dead worker."""
+
+    kind: str
+    code: Optional[int]
+    error_text: str
+    event_kind: str
+    event_payload: dict
+    protocol_violation: bool = False
+    rate_limited: bool = False
+    terminal_provider: bool = False
+    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
+    credential/model — trips the breaker on this first occurrence."""
+    owner_unavailable: bool = False
+    """``KANBAN_OWNER_UNAVAILABLE_EXIT_CODE``: the profile owner stopped answering —
+    requeued uncharged, bounded by its own streak (``kanban_db_owner_unavailable``)."""
+
+    @property
+    def run_outcome(self) -> str:
+        # A rate-limited requeue is recorded as ``rate_limited`` so board history
+        # doesn't show a phantom crash for a quota wall.
+        return "rate_limited" if self.rate_limited else "crashed"
+
+
 def _clear_dead_claim_off_running(conn: sqlite3.Connection, row) -> None:
     """Clear a dead worker's claim on a card that left ``running`` without one.
 
@@ -133,12 +158,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.owner_unavailable:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
-                # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
+                # blocker; a below-budget protocol violation or owner-unavailable run
+                # never reaches ``_record_task_failure`` (which stamps this column),
+                # yet the board UI and retry worker need the corrective message.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
