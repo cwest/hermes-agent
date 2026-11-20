@@ -555,9 +555,15 @@ class GatewaySlashCommandsMixin(
                         src.platform.value if src and src.platform else "?",
                         event.platform_update_id)
             return ""
-        if self._restart_requested or self._draining:
-            count = self._running_agent_count()
-            return t("gateway.draining", count=count) if count else EphemeralReply(t("gateway.restart.in_progress"))
+        from gateway.restart_command_status import pending_reply, wants_force
+        force = wants_force(event.get_command_args())
+        if (self._restart_requested or self._draining) and not force:
+            return pending_reply(self)
+        if force and getattr(self, "_restart_task_started", False):
+            from gateway.restart_when_idle import force_restart
+            accepted = force_restart(self, detached=self._restart_detached, via_service=self._restart_via_service)
+            logger.warning("/restart now: forcing the pending restart%s", "" if accepted else " (stop already begun)")
+            return EphemeralReply(t("gateway.restart.forcing" if accepted else "gateway.restart.in_progress"))
 
         async def _write_marker(name: str, build, label: str) -> None:
             try:
@@ -597,15 +603,24 @@ class GatewaySlashCommandsMixin(
         active_agents = self._running_agent_count()
         # Idle: teardown is immediate and a RETURNED ack raced the adapter disconnect (lost on a real
         # Bot API round trip, #65057), so deliver it first. Draining: the drain waits, the reply lands.
+        # Forced: teardown is immediate too, whatever is live.
         from gateway.restart_ack import send_restart_ack
-        ack = t("gateway.draining", count=active_agents) if active_agents else EphemeralReply(t("gateway.restart.restarting"))
-        sent = not active_agents and await send_restart_ack(self, self._delivery_adapter_for(event.source), event, ack)
+        if force:
+            ack = EphemeralReply(t("gateway.restart.forcing"))
+        else:
+            ack = t("gateway.draining", count=active_agents) if active_agents else EphemeralReply(t("gateway.restart.restarting"))
+        sent = (force or not active_agents) and await send_restart_ack(self, self._delivery_adapter_for(event.source), event, ack)
         # Under a service manager (systemd/launchd) or Docker/Podman, exit 75 so the supervisor /
         # restart policy restarts us — detached setsid+bash fails there (systemd KillMode=mixed kills
         # the cgroup; tini exits with the gateway). The explicit marker covers ``sudo env -i`` wrappers.
         from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
         via_service = is_gateway_supervisor_process() or is_container_restart_context()
-        self.request_restart(detached=not via_service, via_service=via_service)
+        if force:
+            from gateway.restart_when_idle import force_restart
+            logger.warning("/restart now: forcing a restart; live work is interrupted")
+            force_restart(self, detached=not via_service, via_service=via_service)
+        else:
+            self.request_restart(detached=not via_service, via_service=via_service)
         return None if sent else ack
 
     async def _handle_autoprune_command(self, event: MessageEvent) -> str:

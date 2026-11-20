@@ -308,7 +308,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/approve [session\|always]` | Approve and execute a pending dangerous command. `session` approves for this session only; `always` adds to permanent allowlist. |
 | `/deny` | Reject a pending dangerous command. |
 | `/update` | Update Hermes Agent to the latest version. |
-| `/restart` | Gracefully restart the gateway after draining active runs. When the gateway comes back online, it sends a confirmation to the requester's chat/thread. |
+| `/restart [now]` | Gracefully restart the gateway after draining active runs. When the gateway comes back online, it sends a confirmation to the requester's chat/thread. The wait is bounded by `agent.restart_max_wait` (default 600 s), and the embedded kanban dispatcher spawns no new workers while it runs. Sending `/restart` again while one is waiting replies with what it is waiting on and for how long. `/restart now` forces the restart at once and interrupts live work (the same path as `hermes update --force`). |
 | `/debug [upload]` | Bare `/debug` shows the privacy notice and uploads nothing; `/debug upload` uploads an allowlisted summary (versions, config key names, error counts; no log or message text) to a public paste and returns a shareable link; full logs go only to private storage via `hermes debug share --nous`. |
 | `/help` | Show messaging help. |
 | `/<skill-name>` | Invoke any installed skill by name. |
