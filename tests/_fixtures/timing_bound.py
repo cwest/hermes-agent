@@ -12,6 +12,8 @@ them. Both modes use one predicate, so across the two runs every test runs exact
 
 from __future__ import annotations
 
+import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,43 @@ def listed(path: Path = LIST) -> frozenset[str]:
     """Node ids in the list, without parametrize ids; ``#`` starts a comment."""
     ids = (line.split("#", 1)[0].strip() for line in path.read_text(encoding="utf-8").splitlines())
     return frozenset(i for i in ids if i)
+
+
+_RULE_NAME = re.compile(r"linear|quadratic|backtrack|redos|fast", re.IGNORECASE)
+_RULE_CLOCKS = ("perf_counter", "monotonic")
+# The sliced suite's discovery skips these parts (scripts/run_tests_parallel.py _SKIP_PARTS); their
+# tests run in their own workflows, which never pass --timing-bound.
+_SUITE_SKIP_PARTS = {"integration", "e2e", "docker"}
+
+
+def rule_matches(source: str, relpath: str) -> list[str]:
+    """Node ids (without parametrize ids) of the tests in ``source`` whose name says linear,
+    quadratic, backtrack, ReDoS or fast and whose body reads ``perf_counter``/``monotonic``:
+    a wall-clock bound that CPU contention on a small runner can trip."""
+    found: list[str] = []
+
+    def visit(node: ast.AST, prefix: list[str]) -> None:
+        for child in getattr(node, "body", []):
+            if isinstance(child, ast.ClassDef):
+                visit(child, [*prefix, child.name])
+            elif (isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and child.name.startswith("test") and _RULE_NAME.search(child.name)
+                  and any(clock in ast.unparse(child) for clock in _RULE_CLOCKS)):
+                found.append("::".join([relpath, *prefix, child.name]))
+
+    visit(ast.parse(source), [])
+    return found
+
+
+def rule_matches_under(root: Path) -> list[str]:
+    """``rule_matches`` over every test file the sliced suite discovers under ``root/tests``."""
+    found: list[str] = []
+    for path in sorted((root / "tests").rglob("test_*.py")):
+        rel = path.relative_to(root)
+        if _SUITE_SKIP_PARTS.intersection(rel.parts):
+            continue
+        found += rule_matches(path.read_text(encoding="utf-8"), rel.as_posix())
+    return found
 
 
 def is_listed(nodeid: str, ids: frozenset[str]) -> bool:
