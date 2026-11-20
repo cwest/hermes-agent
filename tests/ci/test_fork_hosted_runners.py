@@ -377,7 +377,9 @@ jobs:
           HERMES_TEST_WORKERS: '6'
       - name: Every crash cell ran
         shell: pwsh
-        run: Get-Content crash-cells-ran.txt
+        run: |
+          if (-not (Test-Path crash-cells-ran.txt)) { throw 'no crash cells ran' }
+          Get-Content crash-cells-ran.txt
       - name: Upload transcripts, logs and receipts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -411,7 +413,12 @@ def test_a_sliced_suites_per_job_steps_follow_the_slice():
     job = _yaml(_rewrite(UNSLICED_E2E))["jobs"]["install-update"]
     assert job["name"] == "Windows install.ps1 + hermes update E2E (${{ matrix.slice }}/8)"
     crash = next(s for s in job["steps"] if s["name"] == "Every crash cell ran")
-    assert crash["if"] == "matrix.slice == 1"
+    assert "if" not in crash  # stays required in every slice
+    assert crash["env"]["HERMES_TEST_SLICE"] == "${{ matrix.slice }}/8"
+    guard = crash["run"].split("\n")
+    assert guard[0] == "if ($env:HERMES_TEST_SLICE -ne '1/8') {"
+    assert "throw" not in guard[2] and guard[2].strip() == "exit 0"
+    assert "throw" in crash["run"] and crash["run"].endswith("Get-Content crash-cells-ran.txt\n")
     upload = next(s for s in job["steps"] if s["name"].startswith("Upload"))
     assert upload["with"]["name"] == ("windows-install-update-e2e-${{ github.run_attempt }}"
                                       "-${{ matrix.slice }}")
@@ -451,7 +458,9 @@ def test_the_crash_cell_journey_lands_in_the_slice_that_checks_its_manifest():
     job = wf["jobs"]["install-update"]
     count = len(job["strategy"]["matrix"]["slice"])
     check = next(s for s in job["steps"] if s["name"] == "Every crash cell ran")
-    index = int(check["if"].rsplit("==", 1)[1])
+    picked = re.search(r"-ne '(\d+)/\d+'", check["run"])
+    assert picked, check["run"]
+    index = int(picked[1])
     files = _discover_files([ROOT / "tests" / "e2e" / "core" / "windows_update"])
     held = _slice_files(files, index, count, {}, ROOT)
     assert "test_crash_cells.py" in {f.name for f in held}

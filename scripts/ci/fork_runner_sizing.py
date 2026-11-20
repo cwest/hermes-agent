@@ -220,10 +220,23 @@ def _slice_step(step: list[str], factor: int) -> list[str]:
                 step[k] = f"{m[1]}{m[2]}-${{{{ matrix.slice }}}}  # {MARK} {m[2]}"
     name = _ENTRY.match(step[0])
     if name and name["name"] in _FIRST_SLICE_STEPS:
-        at = next((k for k, ln in enumerate(step) if ln.startswith(f"{key}if:")), None)
-        if at is None:
-            step = [step[0], f"{key}if: matrix.slice == 1  # {MARK} one job", *step[1:]]
+        step = _first_slice_only(step, key, factor)
     return step
+
+
+def _first_slice_only(step: list[str], key: str, factor: int) -> list[str]:
+    """Pass the step in every slice but the first, inside its script: an ``if:`` would make the
+    step optional, and upstream's oracle tests require it unconditional."""
+    at = next((k for k, ln in enumerate(step) if re.match(rf"^{key}run:\s*\|\s*$", ln)), None)
+    if at is None or at + 1 >= len(step):
+        return step
+    body = " " * _indent(step[at + 1])
+    guard = [f"{body}if ($env:HERMES_TEST_SLICE -ne '1/{factor}') {{",
+             f"{body}  'only slice 1/{factor} runs the file this step checks'",
+             f"{body}  exit 0",
+             f"{body}}}  # {MARK} one job"]
+    step = [*step[:at + 1], *guard, *step[at + 1:]]
+    return _add_env(step, f"HERMES_TEST_SLICE: ${{{{ matrix.slice }}}}/{factor}  # {MARK} one job")
 
 
 def _slice_suite(job: list[str], size: tuple[int, int]) -> list[str]:
