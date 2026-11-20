@@ -266,3 +266,41 @@ This is the gate owner's call, not a change on this branch. Options:
 1. Scale `HERMES_TEST_WORKERS` to the hosted runner in `scripts/ci/fork_hosted_runners.py`, alongside the timeout scaling it already does. The Python suite's subprocess CPU-wall is ~82000 s per slice, so this needs more slices as well, or each slice outruns its 90-minute timeout.
 2. Run the fork's CI on runners the size upstream's suite expects (larger hosted runners or self-hosted).
 3. Treat the env-only checks as advisory in the fork's merge gate and require the rest.
+
+## After runner sizing
+
+The direction for the env-only failures was to fix the runner sizing, not the tests.
+`scripts/ci/fork_hosted_runners.py` now scales `HERMES_TEST_WORKERS` by hosted/upstream vCPUs
+and multiplies each job's test slices by upstream//hosted (`scripts/ci/fork_runner_sizing.py`).
+The regenerated workflows run the Python suite as 24 slices of 4 workers, the macOS lanes as
+8 slices on 3-vCPU `macos-latest`, the Windows x64 lane as 8 and the Windows arm64 lanes as 16,
+each at upstream's workers per core.
+
+| Run | Head | Jobs passed | Jobs failed |
+|---|---|---|---|
+| 44662913396 (before) | `cb7563d8bf` | 17 | 12 |
+| 44680086674 (F1-F3 + (a) fixed, old sizing) | `d9dc3053c9` | 6 | 7 (3 Python slices: 72/69/81 failed tests) |
+| 44690724897 (sized) | `40234757e2` | 62 | 5 |
+
+The sized run left four failures, plus the aggregate gate:
+
+1. **Fixed: `test_session_recovery_lost_and_found.py::test_unreadable_schema_without_cli_names_the_sqlite3_requirement`**
+   (Run tests 12/24). Not a sizing failure. The test stubbed `find_sqlite3_cli`, but recovery
+   reads `find_sqlite3_cli_refusal()`, which still held the refusal from the module-level probe.
+   Ubuntu 24.04's apt `sqlite3` CLI carries the WAL-reset bug, so the refusal was
+   `wal_reset_vulnerable` and the message took the other branch. Reproduced locally by putting a
+   CLI reporting 3.45.1 on PATH; fixed by hiding `sqlite3` from `shutil.which`, which passes with
+   and without the vulnerable CLI.
+2. **`test_browse_schema_drift.py::test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out[ddl]`**
+   (macOS 2/8): `OwnershipConflict: Gateway runtime already owns profile`. The same failure appears
+   before and after sizing, and on this Mac the file hits the 300 s file timeout at the upstream base
+   `4c14d9df5b` exactly as at the fork head, so the fork's patches do not cause it. Upstream's own
+   macOS lanes (12-vCPU Blacksmith) passed it at the base. The cause has not been identified yet.
+3. **macOS 3/8: 4 errors in `test_plugins_cmd.py` and `test_update_missing_configured_deps.py`**:
+   `Failed to fetch ... truststore-0.10.5-py3-none-any.whl ... operation timed out` during the
+   tests' own `uv sync`. A PyPI download timeout from the runner (network), not a test failure.
+4. **JS & TS: `bundle-smoke-metadata.test.mjs > channel smoke binds the complete admitted request`**
+   timed out at 15000 ms (22.4 s). The JS lane sets no `HERMES_TEST_WORKERS` or slices, so the
+   sizing rewrite does not reach it; it runs on a 4-vCPU hosted runner in place of upstream's
+   larger one. Fixing it within the no-threshold-loosening rule means sizing that lane (its vitest
+   pool) the same way, which is not done here.
