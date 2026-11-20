@@ -338,6 +338,8 @@ gateway:
     paused_left: "\n⚠️ Tá {count} teachtaireacht a sheol tú agus an comhrá roimhe ar sos fós sábháilte ar an gcomhrá roimhe, gan freagra. Chun iad a rith: /resume {session_id}, ansin {discard}."
   restart:
     in_progress: "⏳ Tá atosú gateway ar siúl cheana féin..."
+    waiting: "⏳ Gateway restart already waiting {waited} for {count} live unit(s): {kinds}. Send /restart now to force it (live work is interrupted)."
+    forcing: "⚡ Forcing gateway restart now; live work is interrupted."
     restarting: "♻ Ag atosú gateway. Mura gcuirfear in iúl duit laistigh de 60 soicind, atosaigh ón gconsól le `hermes gateway restart`."
   resume:
     db_unavailable: "Níl bunachar sonraí na seisiún ar fáil."

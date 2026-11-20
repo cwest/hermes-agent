@@ -338,6 +338,8 @@ gateway:
     paused_left: "\n⚠️ {count} boodskap(pe) wat jy gestuur het terwyl die vorige gesprek gepouseer was, is nog op die vorige gesprek gestoor en nie beantwoord nie. Om hulle te laat loop: /resume {session_id}, dan {discard}."
   restart:
     in_progress: "⏳ Gateway-herbegin reeds aan die gang..."
+    waiting: "⏳ Gateway restart already waiting {waited} for {count} live unit(s): {kinds}. Send /restart now to force it (live work is interrupted)."
+    forcing: "⚡ Forcing gateway restart now; live work is interrupted."
     restarting: "♻ Herbegin van gateway. As jy nie binne 60 sekondes in kennis gestel word nie, herbegin vanaf die konsole met `hermes gateway restart`."
   resume:
     db_unavailable: "Sessie-databasis is nie beskikbaar nie."

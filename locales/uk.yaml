@@ -338,6 +338,8 @@ gateway:
     paused_left: "\n⚠️ {count} повідом. надісланих, поки попередня розмова була на паузі, досі збережені в попередній розмові без відповіді. Щоб виконати їх: /resume {session_id}, потім {discard}."
   restart:
     in_progress: "⏳ Перезапуск гейтвея вже виконується..."
+    waiting: "⏳ Gateway restart already waiting {waited} for {count} live unit(s): {kinds}. Send /restart now to force it (live work is interrupted)."
+    forcing: "⚡ Forcing gateway restart now; live work is interrupted."
     restarting: "♻ Перезапуск гейтвея. Якщо ви не отримаєте сповіщення протягом 60 секунд, перезапустіть із консолі командою `hermes gateway restart`."
   resume:
     db_unavailable: "База даних сеансів недоступна."
