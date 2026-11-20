@@ -374,4 +374,8 @@ install + update slices passed, including "Every crash cell ran" on slice 1/8. T
 
 The PR's own CI at `5f405a55ca` (44723825890 attempt 2) is 74 success / 8 skipped / 0 fail. Its
 attempt 1 failed only 15/24 (the timing test above) and 18/24 (`curl` 403 fetching the ripgrep
-release, before any test ran).
+release, before any test ran). On the docs-only head after it, attempt 1 failed only Run tests
+16/24, on the sibling bound `test_approval_windows_hardline_scripts.py::test_bare_cr_runs_scan_in_linear_time`
+(3.1 s and 2.9 s against 2 s). Neither that file nor the hardline patterns differ from upstream, and
+the same slice passed on the three runs before. All the linear-time bounds in the approval scanner
+sit near 2 s on a 4-vCPU runner and can recur.
