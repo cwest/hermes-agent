@@ -1286,6 +1286,7 @@ agent:
   restart_drain_timeout: 0          # default: interrupt in-flight chat turns at once
   cron_drain_timeout: 30            # floor for cron jobs and api_server (/v1) runs
   restart_after_turn_timeout: 1800  # /restart and `gateway restart` restart when idle; warn (never interrupt) every N s
+  restart_max_wait: 600             # force the restart after N s if the gateway never goes idle (0 = no bound)
 ```
 
 With the default `0`, a restart interrupts a running turn immediately. The turn settles as
@@ -1302,6 +1303,11 @@ agent:
 
 A longer drain makes every restart and update wait up to that long. `HERMES_RESTART_DRAIN_TIMEOUT`
 overrides the config value.
+
+`restart_max_wait` bounds the restart-when-idle wait. On a busy kanban board the gateway may never
+go idle by itself (workers keep finishing and new background processes keep starting), so once
+this many seconds pass with work still live, the restart is forced: live work is interrupted and
+every unit cut is logged at WARNING. `0` keeps the unbounded wait.
 
 :::caution systemd `TimeoutStopSec`
 The generated systemd unit sizes `TimeoutStopSec` from this value: the larger of

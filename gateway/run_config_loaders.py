@@ -636,6 +636,16 @@ class GatewayConfigLoadersMixin:
         )
 
     @classmethod
+    def _load_restart_max_wait(cls) -> float:
+        """``agent.restart_max_wait``: seconds before a waiting restart is forced (0 = unbounded)."""
+        from gateway.restart import DEFAULT_GATEWAY_RESTART_MAX_WAIT, parse_restart_max_wait
+        from gateway.run import _load_gateway_config
+        raw = cfg_get(_load_gateway_config(), "agent", "restart_max_wait", default=None)
+        if raw is not None and str(raw).strip() != "":
+            cls._warn_unparsable_timeout("restart_max_wait", raw, DEFAULT_GATEWAY_RESTART_MAX_WAIT)
+        return parse_restart_max_wait(raw)
+
+    @classmethod
     def _load_cron_drain_timeout(cls) -> float:
         """The cron and api_server (/v1) floor under the stop()/drain wait.
 

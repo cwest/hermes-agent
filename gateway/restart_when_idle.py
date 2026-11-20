@@ -111,14 +111,23 @@ async def await_idle(runner) -> bool:
     if _idle(runner) or force.is_set():
         return not force.is_set()
     warn_every = float(getattr(runner, "_restart_after_turn_timeout", 0.0) or 0.0)
-    logger.info("Restart requested; waiting for idle while serving normally (warn after %.0fs): %s",
-                warn_every, _log_view(runner._describe_active_work()))
+    max_wait = float(getattr(runner, "_restart_max_wait", 0.0) or 0.0)
+    logger.info("Restart requested; waiting for idle while serving normally (warn after %.0fs, force "
+                "after %s): %s", warn_every, f"{max_wait:.0f}s" if max_wait else "never",
+                _log_view(runner._describe_active_work()))
     loop = asyncio.get_running_loop()
     started = loop.time()
+    runner._restart_wait_started_at = time.time()
     next_warn = started + warn_every
     last_status = 0.0
     while not _idle(runner):
         now = loop.time()
+        if max_wait and now - started >= max_wait:
+            # A busy board may never go idle (workers keep arriving, poll loops never exit).
+            logger.warning("Restart waited %.0fs (agent.restart_max_wait); forcing it and interrupting: %s",
+                           now - started, _log_view(runner._describe_active_work()))
+            force.set()
+            return False
         if now >= next_warn:
             logger.warning(
                 "Restart still waiting after %.0fs; live work is NOT interrupted (only a forced "
