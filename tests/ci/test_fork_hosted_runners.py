@@ -295,6 +295,45 @@ def test_sizing_stays_inside_the_job_whose_runner_shrank():
     assert data["jobs"]["test"]["steps"][0]["env"]["HERMES_TEST_WORKERS"] == 4
 
 
+JS_CHECKS = """\
+jobs:
+  check:
+    name: JS & TS checks
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - name: Run all workspace checks
+        run: just check-js-ci
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
+"""
+
+
+def test_js_checks_split_into_shards_with_vitest_capped_to_the_hosted_cores():
+    """One 32-vCPU job becomes 8 shards on 4-vCPU runners, each running its checks one at a time
+    with vitest's pool at 4, so a check keeps at least upstream's cores per worker."""
+    mod = _load()
+    out = _rewrite(JS_CHECKS)
+    job = _yaml(out)["jobs"]["check"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["name"] == "JS & TS checks (${{ matrix.shard }}/8)"
+    assert job["strategy"] == {"fail-fast": False, "matrix": {"shard": list(range(1, 9))}}
+    step = job["steps"][0]
+    assert step["run"] == ("node .github/scripts/run-workspace-checks.mjs"
+                           " --shard ${{ matrix.shard }}/8 --concurrency 1")
+    assert step["env"] == {"VITEST_MAX_WORKERS": 4}
+    assert f"# {mod.TIMEOUT_MARK} just check-js-ci" in out
+    assert job["steps"][1]["uses"] == "./.github/actions/check-clean-worktree"
+    assert _rewrite(out) == out
+
+
+def test_js_checks_on_a_small_runner_stay_one_job():
+    out = _rewrite(JS_CHECKS.replace("blacksmith-32vcpu", "blacksmith-4vcpu"))
+    job = _yaml(out)["jobs"]["check"]
+    assert "strategy" not in job
+    assert job["steps"][0]["run"] == "just check-js-ci"
+
+
 def test_the_committed_tree_is_the_rewrite_of_upstreams_workflows(tmp_path):
     """--check over the committed tree is clean, so a resync regenerates the same files."""
     ran = subprocess.run([sys.executable, str(SCRIPT), "--root", str(ROOT), "--check"],
