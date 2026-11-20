@@ -108,7 +108,7 @@ def _counting_deliver(monkeypatch, *, delay=0.0, hold=None, refuse=0):
     first *refuse* calls. A call whose text is in *hold* (text -> asyncio.Event) parks until
     released and then counts as admitted without a real admission (a second wake into a session
     whose turn is still running may be refused as busy, which is not what that test measures)."""
-    import gateway.wake as wake
+    from gateway import wake
     real = wake.deliver_wake
     calls = []
 
@@ -184,7 +184,7 @@ async def test_a_retry_after_a_receipt_timeout_does_not_deliver_again(monkeypatc
 @pytest.mark.asyncio
 async def test_different_wake_ids_do_not_wait_on_each_other(monkeypatch):
     from hermes_constants import get_hermes_home
-    runner, _adapter, _authority, executed = await _gateway(monkeypatch)
+    runner, _adapter, _authority, _executed = await _gateway(monkeypatch)
     ctx, manager = _context(get_hermes_home())
     manager.set_gateway_message_injector(runner, runner._schedule_plugin_message_injection)
     release = asyncio.Event()
