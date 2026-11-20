@@ -15,7 +15,7 @@ test('a shard past the list length is empty, not an error', () => {
 })
 
 test('a malformed or out-of-range spec is refused by name', () => {
-  for (const spec of ['0/8', '9/8', '8', 'a/b', '1.5/8', undefined]) {
+  for (const spec of ['0/8', '9/8', '8', 'a/b', '1.5/8', '1/8/9', ' 1/8', '1/8 ', '1e0/8', '0x1/8', undefined]) {
     expect(() => shardUnits(units, spec)).toThrow('--shard')
   }
 })
