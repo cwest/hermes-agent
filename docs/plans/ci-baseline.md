@@ -259,13 +259,17 @@ The `ERR_PNPM_OUTDATED_LOCKFILE` lines in the job log are expected output from a
 
 Fixed on this branch: the pnpm-deps hash (commit `❄️ fix(nix): update the pnpm deps hash ...`); `pnpm deps hash` passes from that commit on. `nix flake check` also failed on a second cause, outside this repo: the patchelf patch that `nix/pm-packages.nix` fetches from `https://github.com/NixOS/patchelf/commit/59acc3d9....patch` returned HTTP 503 to the hosted runner on all four curl attempts (`cannot download patchelf-fix-executable-header-load-overlap.patch from any mirror`). The path is not on cache.nixos.org (narinfo 404), so every run fetches it. Upstream's own runs get the same 503s on that URL and succeed on a later curl retry (main push run 44670621219). The fetch is intermittent, not a repo defect: run 44677763182 at `7e9d518149` failed on it twice and passed `nix flake check` on attempt 3 with no change.
 
-## What would turn the (c) checks green
+## How the (c) checks were turned green
 
-This is the gate owner's call, not a change on this branch. Options:
+The decision was to fix the runner sizing on this branch, and not to waive the env-only checks or
+move CI to larger runners. Three options were on the table:
 
-1. Scale `HERMES_TEST_WORKERS` to the hosted runner in `scripts/ci/fork_hosted_runners.py`, alongside the timeout scaling it already does. The Python suite's subprocess CPU-wall is ~82000 s per slice, so this needs more slices as well, or each slice outruns its 90-minute timeout.
-2. Run the fork's CI on runners the size upstream's suite expects (larger hosted runners or self-hosted).
-3. Treat the env-only checks as advisory in the fork's merge gate and require the rest.
+1. **Taken:** scale `HERMES_TEST_WORKERS` to the hosted runner and multiply the test slices to
+   match, in `scripts/ci/fork_runner_sizing.py` (called from `scripts/ci/fork_hosted_runners.py`, so
+   a resync re-applies it). The section below gives the details and the runs.
+2. Not taken: run the fork's CI on runners the size upstream's suite expects (larger hosted runners
+   or self-hosted).
+3. Not taken: treat the env-only checks as advisory in the fork's merge gate.
 
 ## After runner sizing
 
@@ -323,3 +327,51 @@ The sized run left four failures, plus the aggregate gate:
 448 s on this Mac, both with and without the sharded `js-tests.yml`. It runs close to the 300 s cap
 on a 2-worker hosted Windows runner whatever the change, so the timeout is its own run time, not this
 branch's workflow edit. A rerun of the failed job passed it (job 136197037062).
+
+## E2E lanes: sliced, not serialised
+
+The E2E jobs run only on a release run or a manual dispatch (ci.yaml's `detect` forces their lanes
+off for pull requests), so every PR run above skipped them. The first sizing pass gave those jobs
+upstream's workers per core and nothing else: the Linux `e2e` job went from 3 workers on 32 vCPUs to
+1 worker on 4, running all 137 of its files in series under the same 90-minute cap. That is the same
+starvation the Python suite had, moved into wall time.
+
+`scripts/ci/fork_runner_sizing.py` now also slices a job whose worker count it cuts. The job gets a
+`slice: [1..upstream//hosted]` matrix, and every `scripts/run_tests.sh` step gets
+`HERMES_TEST_SLICE: ${{ matrix.slice }}/N`. `run_tests_parallel.py` partitions from the checkout
+alone, so all slices agree on the split, and a slice left with no files exits 0. Each of these jobs
+is now 8 slices at upstream's workers per core:
+
+| Job | Upstream | Hosted |
+|---|---|---|
+| `e2e` (137 files + messaging-gated cases) | 1 job, 3 workers, 32 vCPU | 8 slices, 1 worker, 4 vCPU |
+| `e2e-upgrade` (per suite directory) | 6 shards, 6 workers | 6 shards × 8 slices, 1 worker |
+| Windows E2E (real processes) | 1 job, 6 workers | 8 slices, 1 worker |
+| Windows install + update E2E (13 journeys) | 1 job, 6 workers | 8 slices, 1 worker |
+
+Jobs that run their tests at `nproc` (the Docker image build) or set no worker count (the venv
+live probes) lost no parallelism to the smaller runner, so they stay one job. Two steps follow the
+slice. The Windows journey's artifact upload gets a per-slice name. "Every crash cell ran" stays
+unconditional (`test_windows_update_crash_oracles.py` refuses an `if:` on it) and passes inside
+its script on every slice except the one holding `test_crash_cells.py`.
+`test_the_crash_cell_journey_lands_in_the_slice_that_checks_its_manifest` pins which slice that is.
+
+### Exercised: e2e dispatch run 44723885542 at `5f405a55ca`
+
+The run was started by `workflow_dispatch` on the branch, which turns every E2E lane on. It had
+152 jobs: 147 success, 4 failure, 1 skipped (Desktop E2E's own gate), plus the aggregate gate,
+which fails on the four. Every sliced job finished well inside its cap (longest job per family, cap
+in brackets): e2e 17 min [90], e2e-upgrade core 15 / git 32 / handoff 20 / hosts 5 / network 5 /
+pm 9 min [180], Windows E2E 3 min [75], Windows install + update E2E 46 min [225]. All 8 Windows
+install + update slices passed, including "Every crash cell ran" on slice 1/8. The four failures:
+
+| Job | Failure | Class | Evidence |
+|---|---|---|---|
+| Desktop core E2E (Linux) | `reply-painted-once.spec.ts:227`, `reply-settle-paths.spec.ts:207`, `webapp-stale-journal.spec.ts:261` | (b) upstream red | Upstream's dispatch runs 43400090137, 43213118137 and 43880707009 fail the same first two specs on 32-vCPU runners. The suite is `workers: 1` upstream (`apps/desktop/e2e/core/playwright.config.ts`), so slicing does not apply to it. |
+| e2e-upgrade (handoff) 1/8 | 5 of 8 in `test_handoff_from_head.py::TestFromHead` ("gateway alive but not serving <new commit>") | (b) upstream red | Upstream dispatch runs 43880707009 and 43885261886 fail the same 5 tests. |
+| e2e 5/8 | `test_messaging_exactly_once.py::test_crash_between_completion_and_send[stream_accepted_unpersisted-fk_tg]`: "unexpected extra marked copies" | (c) hosted-runner shape of an upstream known gap | Upstream wraps this cell in `known_failure(STREAM_CRASH_AFTER_ACCEPT_SIGNATURE, …)`, and it XFAILs on every upstream run checked (43400090137, 43213118137, 43917262706, 43912179345, 43885261886: `61✓ 1xf`). It also XFAILs locally at this head. On the hosted runner the gap surfaced as an extra marked copy, which the signature regex does not match, so it reported red. No fork patch touches `gateway/` delivery or `tests/e2e/core/delivery`. The upstream signature is not widened here. |
+| Run tests 15/24 | `test_approval_windows.py::test_repeated_launcher_words_scan_in_linear_time` (2.7 s against a 2 s bound) | (c) timing | Fork and base `tools/approval_detection.py` time the same on all four inputs (best of 3, local: 0.33 / 0.13 / 0.46 / 0.51 s for both). The same job passed on the PR run's rerun (44723825890 attempt 2, job 136263866841). |
+
+The PR's own CI at `5f405a55ca` (44723825890 attempt 2) is 74 success / 8 skipped / 0 fail. Its
+attempt 1 failed only 15/24 (the timing test above) and 18/24 (`curl` 403 fetching the ripgrep
+release, before any test ran).
