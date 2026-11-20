@@ -388,7 +388,9 @@ inside a fixed wall-clock bound. The list holds every test in the sliced suite's
 without `integration`, `e2e` and `docker`, which run in their own workflows) whose name says linear,
 quadratic, backtrack, ReDoS or fast and whose body reads `perf_counter`/`monotonic`. That includes
 the fail-fast tests with sub-second bounds, such as the lost-lease tests (<0.5 s). A further 6 entries
-are guards the rule doesn't catch by name (for example `does_not_rescan`, `runtime_is_bounded`).
+fall outside the rule: 4 whose names lack its keywords (for example `does_not_rescan`,
+`runtime_is_bounded`), and 2 linear-time tests that bound the run with a subprocess timeout instead
+of a clock read.
 `tests/ci/test_timing_bound_lane.py::test_every_test_the_rule_matches_is_listed` runs that rule over
 the tree and fails on any match that isn't listed, so this paragraph stays true as tests are added.
 
