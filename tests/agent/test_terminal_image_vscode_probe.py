@@ -5,6 +5,15 @@ measured to answer with ``terminal.integrated.enableImages`` on (sixel reply + D
 (DA1 only), optionally late, then types ``hi``. After the probe the child reads its tty and feeds
 it to prompt_toolkit's parser with the CLI's input tables, as the prompt would: ``typed`` is what
 would land in the user's prompt.
+
+"Late" is measured on a virtual clock, not by sleeping: two sleeping processes on a loaded runner
+drift by more than the probe's 50 ms deadline, so a reply scheduled inside the drain could miss
+the probe's window entirely. The child runs the probe on a clock that advances only through the
+probe's own ``select`` timeouts. A wait that ends before the reply's arrival time returns empty at
+once. A wait that reaches it asks the far end for the reply and blocks on the real tty until the
+bytes land. A reply scheduled past every wait is sent after the probe returns, which is where a
+reply that slow would land: in front of the prompt. The probe still reads real bytes from a real
+tty in the mode it set.
 """
 
 from __future__ import annotations
@@ -14,7 +23,6 @@ import select
 import subprocess
 import sys
 import textwrap
-import time
 from pathlib import Path
 
 import pytest
@@ -22,16 +30,38 @@ import pytest
 pytestmark = pytest.mark.platforms("posix")
 
 _REPO = str(Path(__file__).resolve().parents[2])
+_SEND_REPLY = b"<send-reply>"
+_PROBE_DONE = b"<probe-done>"
 _CHILD = textwrap.dedent("""
-    import os, select, sys, termios, tty
+    import os, select, sys, termios, time, tty
     from agent import terminal_image
     from hermes_cli.pt_input_extras import install_ignored_terminal_sequences
     from prompt_toolkit.input.vt100_parser import Vt100Parser
     from prompt_toolkit.keys import Keys
-    result = terminal_image.probe_vscode_images()
+
+    reply_at = float(os.environ["PROBE_REPLY_AT"])
+    clock = {"now": 0.0, "asked": False}
+    real_select, real_monotonic = select.select, time.monotonic
+
+    def virtual_select(r, w, x, timeout):
+        if clock["now"] + timeout < reply_at:
+            clock["now"] += timeout
+            return [], [], []
+        if not clock["asked"]:
+            os.write(1, os.environ["PROBE_SEND_REPLY"].encode())
+            clock["asked"] = True
+        clock["now"] = max(clock["now"], reply_at)
+        return real_select(r, w, x, 10)
+
+    select.select, time.monotonic = virtual_select, lambda: clock["now"]
+    try:
+        result = terminal_image.probe_vscode_images()
+    finally:
+        select.select, time.monotonic = real_select, real_monotonic
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
+    os.write(1, os.environ["PROBE_DONE"].encode())
     leaked = b""
     while select.select([fd], [], [], 0.3)[0]:
         leaked += os.read(fd, 256)
@@ -50,18 +80,20 @@ _ON = b"\x1b[?1;0;4096S\x1b[?62;4;9;22c"
 _OFF = b"\x1b[?1;2c"
 
 
-def _run(reply: bytes, delay: float) -> str:
+def _run(reply: bytes, reply_at: float) -> str:
     import pty
 
     master, slave = pty.openpty()
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("SSH_", "KITTY_", "ITERM_", "WEZTERM_", "KONSOLE_", "TMUX"))}
-    env.update(TERM_PROGRAM="vscode", TERM="xterm-256color", PYTHONPATH=_REPO)
+    env.update(TERM_PROGRAM="vscode", TERM="xterm-256color", PYTHONPATH=_REPO,
+               PROBE_REPLY_AT=repr(reply_at), PROBE_SEND_REPLY=_SEND_REPLY.decode(),
+               PROBE_DONE=_PROBE_DONE.decode())
     proc = subprocess.Popen([sys.executable, "-c", _CHILD], stdin=slave, stdout=slave,
                             stderr=subprocess.PIPE, env=env, cwd=_REPO)
     os.close(slave)
     out = b""
-    answered = False
+    replied = typed = False
     try:
         while select.select([master], [], [], 15)[0]:
             try:
@@ -71,12 +103,12 @@ def _run(reply: bytes, delay: float) -> str:
             if not data:
                 break
             out += data
-            if not answered and b"\x1b[c" in out:
-                time.sleep(delay)  # health: allow HX013 -- the late reply IS the scenario under test
+            if not replied and (_SEND_REPLY in out or _PROBE_DONE in out):
                 os.write(master, reply)
-                time.sleep(0.02)  # health: allow HX013 -- the user's keys arrive after the reply
+                replied = True
+            if not typed and _PROBE_DONE in out:  # the user's keys arrive after the probe
                 os.write(master, b"hi")
-                answered = True
+                typed = True
     finally:
         os.close(master)
         proc.wait(timeout=15)
@@ -86,7 +118,7 @@ def _run(reply: bytes, delay: float) -> str:
 
 
 @pytest.mark.parametrize(
-    ("reply", "delay", "expected"),
+    ("reply", "reply_at", "expected"),
     [
         (_ON, 0, "RESULT True True iterm typed='hi'"),  # enableImages on
         (_OFF, 0, "RESULT False False unicode typed='hi'"),  # enableImages off: DA1 only
@@ -96,5 +128,5 @@ def _run(reply: bytes, delay: float) -> str:
         (_OFF, 0.3, "RESULT False False unicode typed='hi'"),
     ],
 )
-def test_vscode_probe_reads_its_reply_and_leaves_nothing_for_the_prompt(reply, delay, expected):
-    assert _run(reply, delay) == expected
+def test_vscode_probe_reads_its_reply_and_leaves_nothing_for_the_prompt(reply, reply_at, expected):
+    assert _run(reply, reply_at) == expected
