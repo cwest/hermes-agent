@@ -49,6 +49,15 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
+    def _kanban_dispatch_held_for_restart(self) -> bool:
+        """True while a restart is pending: spawning workers then only postpones the idle it waits for."""
+        held = bool(getattr(self, "_restart_requested", False) or getattr(self, "_draining", False))
+        if held and not getattr(self, "_kanban_restart_hold_logged", False):
+            logger.info("kanban dispatcher: restart pending; spawning no new workers until it happens "
+                        "(ready cards stay ready and run after the restart)")
+        self._kanban_restart_hold_logged = held
+        return held
+
     async def _sleep_between_ticks(self, interval: float) -> None:
         """Sleep *interval* (floored to 1s) in 1s slices so stop() never waits a full interval."""
         interval = max(interval, 1.0)
@@ -297,6 +306,10 @@ class GatewayKanbanWatchersMixin:
                 # Emergency stop (`hermes pause`): no auto-decompose or
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
+                    bad_ticks = 0
+                elif self._kanban_dispatch_held_for_restart():
+                    # A pending restart waits for idle: new workers would keep it waiting forever.
+                    # Skipped cards stay ready and run after the restart.
                     bad_ticks = 0
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
