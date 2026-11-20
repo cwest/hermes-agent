@@ -49,10 +49,11 @@ def _handoff_follows(conn: sqlite3.Connection, task_id: str, newest: int, newest
     guarded (fail closed). Comment and event row ids are separate sequences, so the epoch second
     is the only clock both tables share."""
     from hermes_cli.kanban_db_dispatch import _rows_since
+    from hermes_cli.kanban_db_dispatch_requeue import is_handoff_event
 
     for t, e in _rows_since(conn, "task_events", task_id, newest, f"AND kind IN {_HANDOFF_KINDS}",
                             cols=", kind, payload"):
-        if t > newest and _is_handoff_event(e["kind"], e["payload"]):
+        if t > newest and is_handoff_event(e["kind"], e["payload"]):
             return True
         if t == newest and e["kind"] in _REVIEW_BOUNCES:
             reviewer = _bounce_reviewer(conn, task_id, e["kind"], e["payload"])
@@ -82,19 +83,3 @@ def _any_live_pr(urls: Iterable[str]) -> bool:
         if _kps.resolve_pr_state(url) not in _kps.INACTIVE_PR_STATES:
             return True
     return False
-
-
-def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
-    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
-    a handoff. A no-op re-assign (dev→dev via CLI/dashboard/``reassign
-    --reclaim``), an unassign, or the dispatcher's own
-    ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
-    the very implementer that opened the PR. Events without ``from`` (written
-    before it was recorded) are not trusted as handoffs — fail closed."""
-    if kind != "assigned":
-        return True
-    data = _kb._json_or(payload, {})
-    if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
-        return False
-    to = data.get("assignee")
-    return bool(to) and "from" in data and data["from"] != to
