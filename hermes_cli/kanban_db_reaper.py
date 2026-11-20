@@ -30,6 +30,31 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class _DeadWorker:
+    """How ``detect_crashed_workers`` should book one dead worker."""
+
+    kind: str
+    code: Optional[int]
+    error_text: str
+    event_kind: str
+    event_payload: dict
+    protocol_violation: bool = False
+    rate_limited: bool = False
+    terminal_provider: bool = False
+    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
+    credential/model — trips the breaker on this first occurrence."""
+    owner_unavailable: bool = False
+    """``KANBAN_OWNER_UNAVAILABLE_EXIT_CODE``: the profile owner stopped answering —
+    requeued uncharged, bounded by its own streak (``kanban_db_owner_unavailable``)."""
+
+    @property
+    def run_outcome(self) -> str:
+        # A rate-limited requeue is recorded as ``rate_limited`` so board history
+        # doesn't show a phantom crash for a quota wall.
+        return "rate_limited" if self.rate_limited else "crashed"
+
+
 def _clear_dead_claim_off_running(conn: sqlite3.Connection, row) -> None:
     """Clear a dead worker's claim on a card that left ``running`` without one.
 
