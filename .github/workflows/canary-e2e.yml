@@ -27,7 +27,7 @@ concurrency:
 jobs:
   resolve:
     name: Resolve the commit under test
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:
       commit: ${{ steps.commit.outputs.commit }}

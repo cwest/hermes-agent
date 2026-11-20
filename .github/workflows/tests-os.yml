@@ -85,29 +85,29 @@ jobs:
           # Two slices: on the old free standard runner (3 cores, 3 workers) one lane ran
           # ~7.5 min and became the slowest required job once the Linux suite split.
           - name: macOS-only tests (1/2)
-            runner: blacksmith-12vcpu-macos-latest
+            runner: macos-latest
             marker: macos
             slice: 1/2
           - name: macOS-only tests (2/2)
-            runner: blacksmith-12vcpu-macos-latest
+            runner: macos-latest
             marker: macos
             slice: 2/2
           - name: Windows-only tests
-            runner: blacksmith-32vcpu-windows-2025
+            runner: windows-latest
             marker: windows
           - name: Windows-only tests (arm64, 1/2)
-            runner: windows-latest-32-arm-core
+            runner: windows-11-arm
             marker: windows
             timeout: 60
             slice: 1/2
           - name: Windows-only tests (arm64, 2/2)
-            runner: windows-latest-32-arm-core
+            runner: windows-11-arm
             marker: windows
             timeout: 60
             slice: 2/2
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ inputs.commit }}
 
@@ -135,7 +135,7 @@ jobs:
         # PSModuleAnalysisCachePath); cold, each launch costs ~22s on arm64. Started
         # from cmd: a PowerShell step's own shell would pay the cold analysis too.
         if: runner.os == 'Windows'
-        timeout-minutes: 3
+        timeout-minutes: 9  # fork: hosted runner; upstream 3
         shell: cmd
         run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\ci\warm_powershell_module_cache.ps1
 
@@ -256,11 +256,11 @@ jobs:
     # Seven files, six at a time, each spawning process trees; on the 4-vCPU image the
     # suite step took 153-171 s (job 4.7-5.6 min), on 32 cores 124 s (job 3.1 min). 8 cores
     # measured as fast as 32 (job 3.4 vs 3.45 min).
-    runs-on: blacksmith-8vcpu-windows-2025
-    timeout-minutes: 25
+    runs-on: windows-latest
+    timeout-minutes: 75  # fork: hosted runner; upstream 25
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ inputs.commit }}
 

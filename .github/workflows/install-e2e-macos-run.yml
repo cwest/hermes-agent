@@ -66,7 +66,7 @@ on:
         type: string
         default: ''
       bundle-arch:
-        description: 'Architecture of the bundled pair. Only arm64 (blacksmith-12vcpu-macos-15) runs: there is no Intel macOS leg.'
+        description: 'Architecture of the bundled pair. Only arm64 (macos-latest) runs: there is no Intel macOS leg.'
         required: false
         type: string
         default: arm64
@@ -101,7 +101,7 @@ jobs:
       update-ref: ${{ inputs.update-ref }}
       tag-has-desktop: ${{ inputs.tag-has-desktop }}
       leg-id: ${{ inputs.leg-id }}
-      runner: blacksmith-6vcpu-macos-latest
+      runner: macos-latest
       timeout-minutes: ${{ inputs.timeout-minutes }}
 
   # ---- arm 2: the published dmg, then Playwright drives the app ------------
@@ -112,13 +112,13 @@ jobs:
     if: >-
       inputs.install-method == 'desktop-installer@latest' && inputs.tag-has-desktop
       && contains(fromJSON('["open-app-update", "hermes-desktop-app-update", "hermes-update", "installer-script", "installer-script+desktop"]'), inputs.update-method)
-    runs-on: blacksmith-12vcpu-macos-latest
+    runs-on: macos-latest
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     steps:
       # Full history: the driver bare-clones this checkout as the repo the
       # installer/updater talk to.
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ inputs.commit || github.sha }}
           fetch-depth: 0
@@ -226,7 +226,7 @@ jobs:
     name: packaged bundle (open-app-update)
     if: inputs.install-method == 'packaged-app' && inputs.update-method == 'open-app-update'
     # Not macos-15: v0.22.0 gives Squirrel.Mac 120 s to unpack and verify an update, and macos-15 takes 112-149 s.
-    runs-on: blacksmith-12vcpu-macos-15
+    runs-on: macos-latest
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     steps:
@@ -242,7 +242,7 @@ jobs:
             exit 1
           fi
 
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ inputs.commit || github.sha }}
 

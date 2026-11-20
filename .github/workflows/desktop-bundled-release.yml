@@ -217,7 +217,7 @@ jobs:
     # One dispatch: in disposable mode the allocation steps run first (the
     # channel pin comes from them), then admission validates the build source.
     # A failed allocation fails this job and skips everything downstream.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     # Public root is an environment variable, not a repository variable. No
     # secret is injected into admission; downstream jobs consume its outputs.
     environment: release-signing
@@ -227,7 +227,7 @@ jobs:
     # both Windows chains, and v0.23.1 rc.1 took 28 min on x64 and was
     # cancelled at 30 on arm64 (single files stalling 5-8 min). 60 matches the
     # standalone archive job it replaced.
-    timeout-minutes: 60
+    timeout-minutes: 180  # fork: hosted runner; upstream 60
     permissions:
       contents: read
     outputs:
@@ -262,7 +262,7 @@ jobs:
       channel-request-sha256: ${{ ((inputs.disposable_channel != '' || inputs.channel != '') && steps.allocate.outputs.channel_request_sha256) || '' }}
       disposable-run: ${{ (inputs.disposable_channel != '' && github.run_id) || inputs.disposable_run || '' }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ (inputs.build_commit != '' || inputs.channel != '' || inputs.release-phase != '') && github.sha || inputs.tag }}
           # Full checkout, always. Commit admission (require_pushed) needs the
@@ -432,7 +432,7 @@ jobs:
       matrix:
         target:
           - label: win32-x64
-            runner: blacksmith-32vcpu-windows-2025
+            runner: windows-latest
     env: &win32-env
       CHANNEL_BUILD: ${{ needs.validate.outputs.channel-build }}
       HERMES_DESKTOP_VARIANT: bundled
@@ -476,7 +476,7 @@ jobs:
       # Check out the SHA the validate job admitted — never the tag ref,
       # which a force-push can move between jobs. This is the privileged
       # (release-signing) build; it must run the reviewed bytes.
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ needs.validate.outputs.sha }}
           fetch-depth: ${{ (inputs.build_commit != '' || needs.validate.outputs.channel-build != '') && 1 || 0 }}
@@ -486,7 +486,7 @@ jobs:
 
       - name: Check out trusted channel controller
         if: needs.validate.outputs.channel-build != ''
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           path: .build/channel-controller
@@ -753,7 +753,7 @@ jobs:
       matrix:
         target:
           - label: win32-arm64
-            runner: windows-latest-32-arm-core
+            runner: windows-11-arm
     env: *win32-env
     steps: *win32-steps
 
@@ -807,18 +807,18 @@ jobs:
       && needs.validate.outputs.win32-x64 == 'true'
       && inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.')
       && needs.build-win32-x64-commit.result == 'success'
-    runs-on: blacksmith-2vcpu-windows-2025
+    runs-on: windows-latest
     environment: release-signing
     cache-mode: read
     permissions: { contents: read }
-    timeout-minutes: 15
+    timeout-minutes: 45  # fork: hosted runner; upstream 15
     env:
       TARGET: win32-x64
       COMMIT_ARTIFACT_ID: ${{ needs.build-win32-x64-commit.outputs.commit-artifact-id }}
       DOWNLOAD_PATH: staged-artifacts
       STAGE_INCLUDES: --include *.msix --include metadata-windows-x64.json
     steps: &stage-commit-steps
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
@@ -910,11 +910,11 @@ jobs:
       && needs.validate.outputs.win32-arm64 == 'true'
       && inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.')
       && needs.build-win32-arm64-commit.result == 'success'
-    runs-on: blacksmith-2vcpu-windows-2025
+    runs-on: windows-latest
     environment: release-signing
     cache-mode: read
     permissions: { contents: read }
-    timeout-minutes: 15
+    timeout-minutes: 45  # fork: hosted runner; upstream 15
     env:
       TARGET: win32-arm64
       COMMIT_ARTIFACT_ID: ${{ needs.build-win32-arm64-commit.outputs.commit-artifact-id }}
@@ -933,9 +933,9 @@ jobs:
     # The trust-branch legs are read through needs.*.result below, so they must
     # stay in the list — the result job gates on their outcomes, not its own.
     needs: [validate, build-win32-x64-release, build-win32-x64-commit, stage-commit-win32-x64]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions: {}
-    timeout-minutes: 5
+    timeout-minutes: 15  # fork: hosted runner; upstream 5
     env:
       SELECTED_BUILD_SUCCEEDED: >-
         ${{ (inputs.build_commit == '' && inputs.channel == '' && !startsWith(inputs.tag, 'commit.') && !startsWith(inputs.tag, 'channel.') && needs.build-win32-x64-release.result == 'success' && needs.build-win32-x64-commit.result == 'skipped' && needs.stage-commit-win32-x64.result == 'skipped')
@@ -956,9 +956,9 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && needs.validate.result == 'success'
     needs: [validate, build-win32-arm64-release, build-win32-arm64-commit, stage-commit-win32-arm64]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions: {}
-    timeout-minutes: 5
+    timeout-minutes: 15  # fork: hosted runner; upstream 5
     env:
       SELECTED_BUILD_SUCCEEDED: >-
         ${{ (inputs.build_commit == '' && inputs.channel == '' && !startsWith(inputs.tag, 'commit.') && !startsWith(inputs.tag, 'channel.') && needs.build-win32-arm64-release.result == 'success' && needs.build-win32-arm64-commit.result == 'skipped' && needs.stage-commit-win32-arm64.result == 'skipped')
@@ -991,7 +991,7 @@ jobs:
       matrix:
         target:
           - label: darwin-arm64
-            runner: blacksmith-12vcpu-macos-15
+            runner: macos-latest
     env: &darwin-env
       CHANNEL_BUILD: ${{ needs.validate.outputs.channel-build }}
       HERMES_DESKTOP_VARIANT: bundled
@@ -1019,7 +1019,7 @@ jobs:
       # Check out the SHA the validate job admitted — never the tag ref,
       # which a force-push can move between jobs. This is the privileged
       # (release-signing) build; it must run the reviewed bytes.
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ needs.validate.outputs.sha }}
           # Channel/commit builds derive versions from the request/env, not
@@ -1035,7 +1035,7 @@ jobs:
         if: >-
           needs.validate.outputs.channel-build != ''
           || (inputs.release-phase == 'candidate' && inputs.build_commit == '' && inputs.channel == '')
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           path: .build/channel-controller
@@ -1202,7 +1202,7 @@ jobs:
 
       - name: Build and package
         shell: bash
-        timeout-minutes: 330
+        timeout-minutes: 360  # fork: hosted runner; upstream 330
         env:
           HERMES_BUNDLE_ENV_JSON: ${{ inputs.bundle_env }}
           HERMES_MAC_SIGNATURE_CACHE: ${{ github.workspace }}/.cache/mac-payload-signatures
@@ -1375,11 +1375,11 @@ jobs:
       && needs.validate.outputs.darwin-arm64 == 'true'
       && inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.')
       && needs.build-darwin-arm64-commit.result == 'success'
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: macos-latest
     environment: release-signing
     cache-mode: read
     permissions: { contents: read }
-    timeout-minutes: 15
+    timeout-minutes: 45  # fork: hosted runner; upstream 15
     env:
       TARGET: darwin-arm64
       COMMIT_ARTIFACT_ID: ${{ needs.build-darwin-arm64-commit.outputs.commit-artifact-id }}
@@ -1394,9 +1394,9 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && needs.validate.result == 'success'
     needs: [validate, build-darwin-arm64-release, build-darwin-arm64-commit, stage-commit-darwin-arm64]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions: {}
-    timeout-minutes: 5
+    timeout-minutes: 15  # fork: hosted runner; upstream 5
     env:
       SELECTED_BUILD_SUCCEEDED: >-
         ${{ (inputs.build_commit == '' && inputs.channel == '' && !startsWith(inputs.tag, 'commit.') && !startsWith(inputs.tag, 'channel.') && needs.build-darwin-arm64-release.result == 'success' && needs.build-darwin-arm64-commit.result == 'skipped' && needs.stage-commit-darwin-arm64.result == 'skipped')
@@ -1429,13 +1429,13 @@ jobs:
     cache-mode: write
     # A failed Linux build stays visible on its job without failing the run.
     continue-on-error: true
-    timeout-minutes: 240
+    timeout-minutes: 360  # fork: hosted runner; upstream 240
     strategy:
       fail-fast: false
       matrix:
         target:
           - label: linux-x64
-            runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ubuntu-latest
             image: ubuntu:22.04
             python: python3.11
             alsa: libasound2
@@ -1458,7 +1458,7 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends git ca-certificates
 
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ needs.validate.outputs.sha }}
           fetch-depth: 0
@@ -1526,7 +1526,7 @@ jobs:
 
       - name: Build and package
         shell: bash scripts/ci/linux_bundle_shell.sh build {0}
-        timeout-minutes: 200
+        timeout-minutes: 360  # fork: hosted runner; upstream 200
         env:
           PYTHONUTF8: '1'
         run: |
@@ -1597,13 +1597,13 @@ jobs:
     environment: release-signing
     cache-mode: write
     continue-on-error: true
-    timeout-minutes: 240
+    timeout-minutes: 360  # fork: hosted runner; upstream 240
     strategy:
       fail-fast: false
       matrix:
         target:
           - label: linux-arm64
-            runner: blacksmith-32vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
             image: ubuntu:24.04
             python: python3.12
             alsa: libasound2t64
@@ -1621,10 +1621,10 @@ jobs:
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.darwin-arm64 == 'true'
       && needs.build-darwin-arm64.result == 'success'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
     cache-mode: read
-    timeout-minutes: 15
+    timeout-minutes: 45  # fork: hosted runner; upstream 15
     outputs:
       receipt-url: ${{ steps.receipt.outputs.receipt-url }}
       receipt-sha256: ${{ steps.receipt.outputs.receipt-sha256 }}
@@ -1636,7 +1636,7 @@ jobs:
       CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
       CLOUDFLARE_R2_PUBLIC_URL: ${{ needs.validate.outputs.public-root }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ startsWith(inputs.tag, 'commit.') && github.sha || needs.validate.outputs.sha }}
           # Claim custody is re-checked in place: full history and the tags.
@@ -1770,10 +1770,10 @@ jobs:
       && (needs.validate.outputs.win32-arm64 != 'true' || needs.build-win32-arm64.result == 'success')
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.upload_release == true || inputs.release-phase == 'candidate' || inputs.build_commit != '' || inputs.channel != '')
-    runs-on: blacksmith-32vcpu-windows-2025
+    runs-on: windows-latest
     environment: release-signing
     cache-mode: read
-    timeout-minutes: 45
+    timeout-minutes: 135  # fork: hosted runner; upstream 45
     outputs:
       receipt-url: ${{ steps.receipt.outputs.receipt-url }}
       receipt-sha256: ${{ steps.receipt.outputs.receipt-sha256 }}
@@ -1803,7 +1803,7 @@ jobs:
     steps:
       # Full checkout: stage-msixbundle.mjs imports ./msix-shared.mjs and the
       # job runs it with no checkout at all today — ERR_MODULE_NOT_FOUND.
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           # Channel and commit-claim assembly/receipt code stays at the trusted controller
           # so pre-PR commits remain compatible and unreviewed commits never own assembly code.
@@ -1980,10 +1980,10 @@ jobs:
       && needs.assemble-win32-bundle.result == 'success'
       && needs.smoke-darwin-arm64.result == 'success'
       && needs.smoke-win32-arm64.result == 'success' && needs.smoke-win32-x64.result == 'success'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
     cache-mode: read
-    timeout-minutes: 45
+    timeout-minutes: 135  # fork: hosted runner; upstream 45
     permissions:
       contents: write
       actions: read
@@ -1999,7 +1999,7 @@ jobs:
       CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
       CLOUDFLARE_R2_PUBLIC_URL: ${{ needs.validate.outputs.public-root }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           # require_pushed proves commit-build ancestry from local history;
@@ -2032,10 +2032,10 @@ jobs:
       && (inputs.upload_release == true || inputs.release-phase == 'candidate')
       && inputs.build_commit == ''
       && !startsWith(inputs.tag, 'commit.') && !startsWith(inputs.tag, 'channel.')
-    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-24.04-arm
     environment: release-signing
     cache-mode: write
-    timeout-minutes: 90
+    timeout-minutes: 270  # fork: hosted runner; upstream 90
     env:
       HERMES_PAYLOAD_TAG: ${{ inputs.tag }}
       # Archive ref for the termux handoff: attempt ref for stable phases.
@@ -2055,7 +2055,7 @@ jobs:
       CLOUDFLARE_R2_PUBLIC_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}
     steps:
       # Use the admitted commit, not a tag that can move after validation.
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ needs.validate.outputs.sha }}
           fetch-depth: 0
@@ -2064,7 +2064,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out controller Termux build action
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           path: .build/termux-action
@@ -2201,13 +2201,13 @@ jobs:
       && needs.validate.outputs.termux == 'true'
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.build_commit != '' || startsWith(inputs.tag, 'commit.') || startsWith(inputs.tag, 'channel.'))
-    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-24.04-arm
     environment: release-signing
     cache-mode: read
     permissions:
       contents: read
       packages: read
-    timeout-minutes: 90
+    timeout-minutes: 270  # fork: hosted runner; upstream 90
     outputs:
       commit-artifact-id: ${{ steps.commit_artifact.outputs.artifact-id }}
     env:
@@ -2219,7 +2219,7 @@ jobs:
       CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
       CLOUDFLARE_R2_PUBLIC_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ needs.validate.outputs.sha }}
           fetch-depth: 1
@@ -2228,7 +2228,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out controller Termux build action
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           path: .build/termux-action
@@ -2286,11 +2286,11 @@ jobs:
       && needs.validate.outputs.termux == 'true'
       && inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.')
       && needs.termux-deb-commit.result == 'success'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
     cache-mode: read
     permissions: { contents: read }
-    timeout-minutes: 15
+    timeout-minutes: 45  # fork: hosted runner; upstream 15
     env:
       TARGET: termux
       COMMIT_ARTIFACT_ID: ${{ needs.termux-deb-commit.outputs.commit-artifact-id }}
@@ -2306,9 +2306,9 @@ jobs:
       && (inputs.upload_release == true || inputs.release-phase == 'candidate' || inputs.build_commit != '')
       && needs.validate.result == 'success'
     needs: [validate, termux-deb-release, termux-deb-commit, stage-commit-termux]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions: {}
-    timeout-minutes: 5
+    timeout-minutes: 15  # fork: hosted runner; upstream 5
     env:
       SELECTED_BUILD_SUCCEEDED: >-
         ${{ (inputs.build_commit == '' && !startsWith(inputs.tag, 'commit.') && !startsWith(inputs.tag, 'channel.') && needs.termux-deb-release.result == 'success' && needs.termux-deb-commit.result == 'skipped' && needs.stage-commit-termux.result == 'skipped')
@@ -2333,13 +2333,13 @@ jobs:
       always() && inputs.build_commit != '' && inputs.channel == '' && inputs.disposable_channel == ''
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.all-jobs == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
     permissions:
       contents: write
       actions: read
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           # Runs from the admitted commit so the renderer matches the built bytes.
           ref: ${{ needs.validate.outputs.sha }}
@@ -2380,9 +2380,9 @@ jobs:
     name: Verify published candidate files
     needs: validate
     if: inputs.release-phase == 'publish'
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
-    timeout-minutes: 90
+    timeout-minutes: 270  # fork: hosted runner; upstream 90
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       RELEASE_COMMIT: ${{ needs.validate.outputs.sha }}
@@ -2394,7 +2394,7 @@ jobs:
       CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
       CLOUDFLARE_R2_PUBLIC_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ needs.validate.outputs.sha }}
       - uses: ./.github/actions/setup-pm
@@ -2415,9 +2415,9 @@ jobs:
     # The Store is not a release gate: a failed submission leaves the release publishable
     # and the summary names the Store package for a manual Partner Center upload.
     continue-on-error: true
-    runs-on: blacksmith-32vcpu-windows-2025
+    runs-on: windows-latest
     environment: release-signing
-    timeout-minutes: 60
+    timeout-minutes: 180  # fork: hosted runner; upstream 60
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       RELEASE_COMMIT: ${{ needs.validate.outputs.sha }}
@@ -2430,7 +2430,7 @@ jobs:
       MS_STORE_CLIENT_SECRET: ${{ secrets.MS_STORE_CLIENT_SECRET }}
       MS_STORE_PRODUCT_ID: ${{ vars.MS_STORE_PRODUCT_ID }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ needs.validate.outputs.sha }}
       - uses: ./.github/actions/setup-pm
@@ -2479,9 +2479,9 @@ jobs:
         stable-publish,
         stable-store
       ]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
       - name: Require every phase job

@@ -54,7 +54,7 @@ jobs:
     # that can read it.
     permissions:
       contents: write
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     outputs:
       claim-tag: ${{ steps.admit.outputs.claim-tag }}
       claim-object: ${{ steps.admit.outputs.claim-object }}
@@ -78,7 +78,7 @@ jobs:
       # Each candidate call passes it on and its validate re-checks it against the claim.
       bundle-env: ${{ steps.admit.outputs.bundle-env }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -346,14 +346,14 @@ jobs:
     name: Pin actual OLD and NEW signed packages (darwin-arm64)
     needs: [admit, candidates-darwin-arm64]
     if: fromJSON(needs.admit.outputs.jobs)['transitions-darwin-arm64']
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
     outputs:
       windows: ${{ steps.plan.outputs.windows }}
       macos: ${{ steps.plan.outputs.macos }}
       baseline: ${{ steps.plan.outputs.baseline }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -382,14 +382,14 @@ jobs:
     name: Pin actual OLD and NEW signed packages (win32)
     needs: [admit, candidates-win32-bundle]
     if: fromJSON(needs.admit.outputs.jobs)['transitions-win32']
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
     outputs:
       windows: ${{ steps.plan.outputs.windows }}
       macos: ${{ steps.plan.outputs.macos }}
       baseline: ${{ steps.plan.outputs.baseline }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -423,9 +423,9 @@ jobs:
     if: always() && fromJSON(needs.admit.outputs.jobs)['candidate-manifest']
     needs: [admit, candidates-darwin-arm64, candidates-win32-arm64,
             candidates-win32-x64, candidates-win32-bundle, candidates-termux]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
-    timeout-minutes: 90
+    timeout-minutes: 270  # fork: hosted runner; upstream 90
     outputs:
       manifest-url: ${{ steps.manifest.outputs.manifest-url }}
       manifest-sha256: ${{ steps.manifest.outputs.manifest-sha256 }}
@@ -440,7 +440,7 @@ jobs:
       CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
       CLOUDFLARE_R2_PUBLIC_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -496,9 +496,9 @@ jobs:
     name: Bootstrap installer release identity
     needs: admit
     if: fromJSON(needs.admit.outputs.jobs)['bootstrap-version']
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ needs.admit.outputs.commit }}
       - name: Stamp and verify the Cargo and Tauri release identity
@@ -535,9 +535,9 @@ jobs:
             candidate-manifest, transitions-darwin-arm64,
             transitions-win32, windows-packaged, macos-packaged-arm64,
             bootstrap-version]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
       - uses: ./.github/actions/setup-pm
@@ -602,9 +602,9 @@ jobs:
       !cancelled() && fromJSON(needs.admit.outputs.jobs)['publish-canary']
       && needs.candidate-manifest.result == 'success'
       && (needs.admit.outputs.require-green != 'true' || needs.acceptance.result == 'success')
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
-    timeout-minutes: 120
+    timeout-minutes: 360  # fork: hosted runner; upstream 120
     permissions:
       # The controller publishes the canary's GitHub prerelease.
       contents: write
@@ -627,7 +627,7 @@ jobs:
       CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
       CLOUDFLARE_R2_PUBLIC_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           # Custody reads the canary tag object and its ancestry on the default branch.
@@ -677,7 +677,7 @@ jobs:
       !cancelled() && fromJSON(needs.admit.outputs.jobs)['publish-commit']
       && needs.candidate-manifest.result == 'success'
       && (needs.admit.outputs.require-green != 'true' || needs.acceptance.result == 'success')
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
     env:
       RELEASE_TAG: ${{ needs.admit.outputs.tag }}
@@ -693,7 +693,7 @@ jobs:
       CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
       CLOUDFLARE_R2_PUBLIC_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
       - uses: ./.github/actions/setup-pm
@@ -710,9 +710,9 @@ jobs:
     name: All artifact publication succeeded
     if: always()
     needs: [admit, acceptance, publish-docker, publish-bundles, publish-canary, publish-commit]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
       - uses: ./.github/actions/setup-pm
@@ -733,13 +733,13 @@ jobs:
     # registry config. Not useblacksmith/setup-docker-builder: its no-cache-key fallback marks
     # docker.io `http = true`, Docker Hub 301s the plain-HTTP manifest PUT to HTTPS, Go replays
     # it as a GET, and the commit 404s (v0.22.3 rc.1-rc.4).
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
     permissions:
       contents: write
       actions: read
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -875,14 +875,14 @@ jobs:
       group: >-
         install-e2e-red-tracker-${{ needs.admit.outputs.policy == 'canary' && 'auto' || github.run_id }}
       cancel-in-progress: false
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # fork: hosted runner; upstream 5
     permissions:
       contents: read
       actions: read
       issues: write
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
         with:
           ref: ${{ github.sha }}
           sparse-checkout: tests/install/e2e-assets/red-tracker.mjs
