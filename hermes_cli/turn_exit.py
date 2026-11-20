@@ -7,6 +7,9 @@ Worker identity is supplied by the caller, not inferred from a daemon's environm
 TRANSIENT_PROVIDER_REASONS = frozenset({
     "rate_limit", "upstream_rate_limit", "billing", "overloaded", "server_error", "timeout",
 })
+# The profile owner (gateway) stopped answering the worker's durable writes: the card did not
+# fail, its host did. Requeued without spending the retry budget. 69 == BSD EX_UNAVAILABLE.
+KANBAN_OWNER_UNAVAILABLE_EXIT_CODE = 69
 # These failures need an operator change; the dispatcher parks the task immediately.
 TERMINAL_PROVIDER_REASONS = frozenset({
     "auth", "auth_permanent", "model_not_found", "ssl_cert_verification", "upstream_blocked",

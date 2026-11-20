@@ -256,6 +256,9 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("rate_limited", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
+    from hermes_cli.turn_exit import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+    if code == KANBAN_OWNER_UNAVAILABLE_EXIT_CODE:
+        return ("owner_unavailable", code)
     return ("nonzero_exit", code)
 
 
@@ -940,10 +943,6 @@ def _error_fingerprint(error_text: str) -> str:
 # nor extend it. Per-task ``max_retries`` overrides it.
 _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 
-# Closed runs to walk when counting the streak; it trips at a handful anyway.
-_PROTOCOL_VIOLATION_SCAN_LIMIT = 50
-
-
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
 
@@ -954,24 +953,13 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ``protocol_violation`` run-metadata marker, with the error text as fallback
     for runs recorded before the marker existed.
     """
-    streak = 0
-    rows = conn.execute(
-        "SELECT outcome, error, metadata FROM task_runs "
-        "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY id DESC LIMIT ?",
-        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
-    ).fetchall()
-    for row in rows:
-        outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
-            continue
+    from hermes_cli.kanban_db_owner_unavailable import trailing_run_streak
+
+    def violation(row) -> bool:
         head = (row["error"] or "").partition(WORKER_OUTPUT_SEP)[0]  # never the worker's own words
-        if outcome == "crashed" and (
-                _kb._json_dict(row["metadata"]).get("protocol_violation") or "protocol violation" in head):
-            streak += 1
-            continue
-        break
-    return streak
+        return row["outcome"] == "crashed" and bool(
+            _kb._json_dict(row["metadata"]).get("protocol_violation") or "protocol violation" in head)
+    return trailing_run_streak(conn, task_id, violation)
 
 
 WORKER_OUTPUT_SEP = " Worker's last output: "  # dead-worker error text: our words, then the worker's
@@ -1054,6 +1042,9 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    owner_unavailable: bool = False
+    """``KANBAN_OWNER_UNAVAILABLE_EXIT_CODE``: the profile owner stopped answering —
+    requeued uncharged, bounded by its own streak (``kanban_db_owner_unavailable``)."""
 
     @property
     def run_outcome(self) -> str:
@@ -1139,6 +1130,15 @@ def _classify_dead_worker_exit(
             {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "terminal_provider": True},
             terminal_provider=True,
         )
+    if kind == "owner_unavailable":
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} exited owner-unavailable (exit {code}): the profile owner stopped answering "
+            "its writes — requeued without counting a failure",
+            "crashed",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "owner_unavailable": True},
+            owner_unavailable=True,
+        )
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
@@ -1212,6 +1212,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
+        elif dead.owner_unavailable:
+            # The owner stalled, not the card: requeued uncharged until its own streak trips.
+            from hermes_cli.kanban_db_owner_unavailable import account_owner_unavailable
+            tripped = account_owner_unavailable(conn, tid, pid, claimer, dead)
         else:
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
             extra = {"pid": pid, "claimer": claimer}
