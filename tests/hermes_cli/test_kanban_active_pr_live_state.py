@@ -129,6 +129,64 @@ def test_a_same_second_unblock_stays_guarded(conn, states) -> None:
     assert kbd.check_respawn_guard(conn, tid) == "active_pr"
 
 
+def _reviewed_card(conn) -> str:
+    """A card the reviewer holds in an active review run, its PR comment older."""
+    tid = _card(conn)
+    claimed = kb.claim_task(conn, tid)
+    _comment(conn, tid, f"Opened {OPEN_PR}", int(time.time()) - 600)
+    assert kb.request_review(conn, tid, summary="PR ready", reviewer="reviewer",
+                             expected_run_id=claimed.current_run_id)
+    return tid
+
+
+def _verdict(conn, tid: str, author: str, at: int) -> None:
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (tid, author, f"Verdict: changes requested on {OPEN_PR}", at),
+        )
+
+
+def _pin_handoff_second(conn, tid: str, kind: str, at: int) -> None:
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = ?", (at, tid, kind))
+
+
+def test_a_reviewer_verdict_in_the_same_second_as_its_changes_requested_releases(conn, states) -> None:
+    """The verdict comment and the bounce are one act: a same-second tie is the normal case."""
+    tid = _reviewed_card(conn)
+    rclaim = kb.claim_review_task(conn, tid)
+    now = int(time.time())
+    _verdict(conn, tid, "reviewer", now)
+    assert kb.request_changes(conn, tid, reason="fix it", expected_run_id=rclaim.current_run_id) == (True, "dev")
+    _pin_handoff_second(conn, tid, "changes_requested", now)
+    states[OPEN_PR] = "open"
+    assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_a_reviewer_verdict_in_the_same_second_as_its_review_reopen_releases(conn, states) -> None:
+    tid = _reviewed_card(conn)
+    now = int(time.time())
+    _verdict(conn, tid, "reviewer", now)
+    assert kb.reopen_review_task(conn, tid)
+    _pin_handoff_second(conn, tid, "review_reopened", now)
+    states[OPEN_PR] = "open"
+    assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_a_foreign_pr_comment_tied_to_the_changes_requested_stays_guarded(conn, states) -> None:
+    """Only the reviewer's own verdict may tie; the implementer's PR comment never does."""
+    tid = _reviewed_card(conn)
+    rclaim = kb.claim_review_task(conn, tid)
+    now = int(time.time())
+    _verdict(conn, tid, "reviewer", now)
+    _verdict(conn, tid, "dev", now)
+    assert kb.request_changes(conn, tid, reason="fix it", expected_run_id=rclaim.current_run_id) == (True, "dev")
+    _pin_handoff_second(conn, tid, "changes_requested", now)
+    states[OPEN_PR] = "open"
+    assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
 def test_a_real_block_unblock_cycle_releases_the_card(conn, states) -> None:
     tid = _card(conn)
     _comment(conn, tid, f"Opened {OPEN_PR}", int(time.time()) - 60)
