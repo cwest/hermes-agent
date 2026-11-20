@@ -581,7 +581,7 @@ class GatewayPluginInjectionMixin:
                         wake_id)
             try:
                 return await asyncio.wait_for(asyncio.shield(pending), timeout=_PLUGIN_WAKE_RECEIPT_TIMEOUT)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return False
         # Installed before the first await, so no second dispatch of this key can start a delivery.
         owned = in_flight[key] = asyncio.get_running_loop().create_future()
