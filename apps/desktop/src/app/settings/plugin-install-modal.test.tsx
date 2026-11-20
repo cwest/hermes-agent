@@ -20,7 +20,7 @@ vi.mock('@/hermes', async importOriginal => ({
 
 import { $pluginDecisions, $pluginRecords, dropPlugin, patchPlugin, publishPlugin } from '@/contrib/plugins-store'
 import { queryClient } from '@/lib/query-client'
-import { $notifications } from '@/store/notifications'
+import { $notifications, dismissNotification } from '@/store/notifications'
 import {
   $pluginInstallRequest,
   closePluginInstallRequest,
@@ -102,6 +102,12 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   closePluginInstallRequest()
+
+  // An install toast arms an auto-dismiss timer that would otherwise fire after jsdom is gone.
+  for (const { id } of $notifications.get()) {
+    dismissNotification(id)
+  }
+
   vi.unstubAllGlobals()
 })
 

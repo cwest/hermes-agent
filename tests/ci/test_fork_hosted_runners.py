@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from ruamel.yaml import YAML
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "ci" / "fork_hosted_runners.py"
@@ -27,6 +28,10 @@ def _load():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _yaml(text: str):
+    return YAML(typ="safe").load(text)
 
 
 def _rewrite(text: str) -> str:
@@ -155,3 +160,347 @@ def test_the_fork_tree_targets_only_runners_the_fork_has():
             if m and not HOSTED.match(m.group(1)):
                 bad.append(f"{path.relative_to(ROOT)}:{n}: {m.group(1)}")
     assert bad == []
+
+
+SLICED = """\
+jobs:
+  test:
+    name: Run tests (${{ matrix.slice }}/3)
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    strategy:
+      matrix:
+        slice: [1, 2, 3]
+    steps:
+      - name: Run tests
+        run: just test-all
+        env:
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/3
+          HERMES_TEST_WORKERS: 32
+          KEEP: 3
+"""
+
+OS_LANES = """\
+jobs:
+  os:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - name: macOS-only tests (1/2)
+            runner: blacksmith-12vcpu-macos-latest
+            marker: macos
+            slice: 1/2
+          - name: macOS-only tests (2/2)
+            runner: blacksmith-12vcpu-macos-latest
+            marker: macos
+            slice: 2/2
+          - name: Windows-only tests
+            runner: blacksmith-32vcpu-windows-2025
+            marker: windows
+    steps:
+      - name: Run ${{ matrix.marker }} tests
+        env:
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '16' || '' }}
+          HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
+"""
+
+
+def test_a_sliced_suite_keeps_upstreams_per_core_load():
+    data = _yaml(_rewrite(SLICED))
+    job = data["jobs"]["test"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["strategy"]["matrix"]["slice"] == list(range(1, 25))
+    assert job["name"] == "Run tests (${{ matrix.slice }}/24)"
+    env = job["steps"][0]["env"]
+    assert env["HERMES_TEST_SLICE"] == "${{ matrix.slice }}/24"
+    assert env["HERMES_TEST_WORKERS"] == 4
+    assert env["KEEP"] == 3
+
+
+def test_matrix_include_lanes_split_by_their_own_runner():
+    """A 12-vCPU macOS lane becomes 4 slices on 3-vCPU macos-latest; 32-vCPU Windows 8 on 4."""
+    data = _yaml(_rewrite(OS_LANES))
+    lanes = data["jobs"]["os"]["strategy"]["matrix"]["include"]
+    mac = [lane for lane in lanes if lane["marker"] == "macos"]
+    win = [lane for lane in lanes if lane["marker"] == "windows"]
+    assert [lane["slice"] for lane in mac] == [f"{i}/8" for i in range(1, 9)]
+    assert [lane["name"] for lane in mac] == [f"macOS-only tests ({i}/8)" for i in range(1, 9)]
+    assert {lane["runner"] for lane in mac} == {"macos-latest"}
+    assert [lane["slice"] for lane in win] == [f"{i}/8" for i in range(1, 9)]
+    assert [lane["name"] for lane in win] == [f"Windows-only tests ({i}/8)" for i in range(1, 9)]
+    assert {lane["runner"] for lane in win} == {"windows-latest"}
+    # 16 workers on 32 vCPUs is 2 on 4: the per-core ratio upstream chose for these files
+    env = data["jobs"]["os"]["steps"][0]["env"]
+    assert env["HERMES_TEST_WORKERS"] == "${{ matrix.marker == 'windows' && '2' || '' }}"
+
+
+def test_sizing_annotates_upstreams_value_and_is_idempotent():
+    mod = _load()
+    once = _rewrite(SLICED)
+    assert f"HERMES_TEST_WORKERS: 4  # {mod.TIMEOUT_MARK} 32" in once
+    assert f"slice: [{', '.join(map(str, range(1, 25)))}]  # {mod.TIMEOUT_MARK} [1, 2, 3]" in once
+    assert _rewrite(once) == once
+    assert _rewrite(_rewrite(OS_LANES)) == _rewrite(OS_LANES)
+
+
+def test_jobs_already_sized_for_a_small_runner_are_untouched():
+    small = SLICED.replace("blacksmith-32vcpu", "blacksmith-4vcpu")
+    out = _rewrite(small)
+    assert "HERMES_TEST_WORKERS: 32\n" in out
+    assert "slice: [1, 2, 3]\n" in out
+    assert "/3)" in out
+
+
+def test_sizing_stays_inside_the_job_whose_runner_shrank():
+    two = SLICED + """\
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Lint
+        env:
+          HERMES_TEST_WORKERS: 32
+"""
+    data = _yaml(_rewrite(two))
+    assert data["jobs"]["lint"]["steps"][0]["env"]["HERMES_TEST_WORKERS"] == 32
+    assert data["jobs"]["test"]["steps"][0]["env"]["HERMES_TEST_WORKERS"] == 4
+
+
+JS_CHECKS = """\
+jobs:
+  check:
+    name: JS & TS checks
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - name: Run all workspace checks
+        run: just check-js-ci
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
+"""
+
+
+def test_js_checks_split_into_shards_with_vitest_capped_to_the_hosted_cores():
+    """One 32-vCPU job becomes 8 shards on 4-vCPU runners, each running its checks one at a time
+    with vitest's pool at 4, so a check keeps at least upstream's cores per worker."""
+    mod = _load()
+    out = _rewrite(JS_CHECKS)
+    job = _yaml(out)["jobs"]["check"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["name"] == "JS & TS checks (${{ matrix.shard }}/8)"
+    assert job["strategy"] == {"fail-fast": False, "matrix": {"shard": list(range(1, 9))}}
+    step = job["steps"][0]
+    assert step["run"] == ("node .github/scripts/run-workspace-checks.mjs"
+                           " --shard ${{ matrix.shard }}/8 --concurrency 1")
+    assert step["env"] == {"VITEST_MAX_WORKERS": 4}
+    assert f"# {mod.TIMEOUT_MARK} just check-js-ci" in out
+    assert job["steps"][1]["uses"] == "./.github/actions/check-clean-worktree"
+    assert _rewrite(out) == out
+
+
+def test_js_checks_on_a_small_runner_stay_one_job():
+    out = _rewrite(JS_CHECKS.replace("blacksmith-32vcpu", "blacksmith-4vcpu"))
+    job = _yaml(out)["jobs"]["check"]
+    assert "strategy" not in job
+    assert job["steps"][0]["run"] == "just check-js-ci"
+
+
+UNSLICED_E2E = """\
+jobs:
+  e2e:
+    if: inputs.e2e
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - name: Run messaging-gated gateway cases
+        run: |
+          scripts/run_tests.sh -rs tests/gateway/test_a.py
+        env:
+          OPENAI_API_KEY: ""
+      - name: Run e2e tests
+        run: |
+          scripts/run_tests.sh --include-integration "${files[@]}"
+        env:
+          HERMES_TEST_WORKERS: "3"
+          HERMES_TEST_FILE_TIMEOUT: "900"
+  e2e-upgrade:
+    name: e2e-upgrade (${{ matrix.shard }})
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - name: Run upgrade e2e tests (${{ matrix.shard }})
+        run: scripts/run_tests.sh --include-integration "${files[@]}"
+        env:
+          SHARD: ${{ matrix.shard }}
+          HERMES_TEST_WORKERS: "6"
+  install-update:
+    name: Windows install.ps1 + hermes update E2E
+    runs-on: blacksmith-32vcpu-windows-2025
+    steps:
+      - name: Run Windows install + update E2E
+        shell: bash
+        run: |
+          scripts/run_tests.sh tests/e2e/core/windows_update/ -- -m "platforms and integration"
+        env:
+          HERMES_TEST_WORKERS: '6'
+      - name: Every crash cell ran
+        shell: pwsh
+        run: |
+          if (-not (Test-Path crash-cells-ran.txt)) { throw 'no crash cells ran' }
+          Get-Content crash-cells-ran.txt
+      - name: Upload transcripts, logs and receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-install-update-e2e-${{ github.run_attempt }}
+          path: out
+"""
+
+
+def test_an_unsliced_suite_is_sliced_instead_of_serialised():
+    """A 32-vCPU e2e job running 3 files at once becomes 8 slices of 1 worker on 4 vCPUs, not
+    one job running all its files one at a time under the same cap."""
+    out = _rewrite(UNSLICED_E2E)
+    jobs = _yaml(out)["jobs"]
+    e2e = jobs["e2e"]
+    assert e2e["strategy"] == {"fail-fast": False, "matrix": {"slice": list(range(1, 9))}}
+    for step in e2e["steps"]:
+        assert step["env"]["HERMES_TEST_SLICE"] == "${{ matrix.slice }}/8"
+    assert e2e["steps"][1]["env"]["HERMES_TEST_WORKERS"] == "1"
+    up = jobs["e2e-upgrade"]
+    assert up["name"] == "e2e-upgrade (${{ matrix.shard }}) (${{ matrix.slice }}/8)"
+    assert up["strategy"]["matrix"]["slice"] == list(range(1, 9))
+    assert up["strategy"]["matrix"]["shard"] == "${{ fromJSON(needs.plan.outputs.shards) }}"
+    assert up["steps"][0]["env"]["HERMES_TEST_SLICE"] == "${{ matrix.slice }}/8"
+    assert _rewrite(out) == out
+
+
+def test_a_sliced_suites_per_job_steps_follow_the_slice():
+    """Each slice uploads under its own artifact name, and the crash-cell manifest is required
+    only of the slice that runs test_crash_cells.py."""
+    job = _yaml(_rewrite(UNSLICED_E2E))["jobs"]["install-update"]
+    assert job["name"] == "Windows install.ps1 + hermes update E2E (${{ matrix.slice }}/8)"
+    crash = next(s for s in job["steps"] if s["name"] == "Every crash cell ran")
+    assert "if" not in crash  # stays required in every slice
+    assert crash["env"]["HERMES_TEST_SLICE"] == "${{ matrix.slice }}/8"
+    guard = crash["run"].split("\n")
+    assert guard[0] == "if ($env:HERMES_TEST_SLICE -ne '1/8') {"
+    assert "throw" not in guard[2] and guard[2].strip() == "exit 0"
+    assert "throw" in crash["run"] and crash["run"].endswith("Get-Content crash-cells-ran.txt\n")
+    upload = next(s for s in job["steps"] if s["name"].startswith("Upload"))
+    assert upload["with"]["name"] == ("windows-install-update-e2e-${{ github.run_attempt }}"
+                                      "-${{ matrix.slice }}")
+
+
+def test_an_unsliced_suite_on_a_small_runner_stays_one_job():
+    out = _rewrite(UNSLICED_E2E.replace("blacksmith-32vcpu", "blacksmith-4vcpu"))
+    assert "matrix.slice" not in out and "HERMES_TEST_SLICE" not in out
+
+
+def test_only_a_suite_whose_workers_were_cut_is_sliced():
+    """A job whose test runs set no worker count (an image build that runs its tests at nproc, a
+    live probe of one named file) lost no parallelism to the smaller runner, so it stays one job:
+    slicing it would rebuild the image per slice and rename the artifact its publish job reads."""
+    build = """\
+jobs:
+  build:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    steps:
+      - name: Run docker integration tests
+        run: HERMES_TEST_WORKERS=$(nproc) scripts/run_tests.sh tests/docker/
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-test-image
+"""
+    assert "slice" not in _rewrite(build)
+
+
+def test_the_crash_cell_journey_lands_in_the_slice_that_checks_its_manifest():
+    """run_tests_parallel partitions from the checkout alone, so the slice holding
+    test_crash_cells.py is fixed; it must be the one the workflow's manifest check runs on."""
+    sys.path.insert(0, str(ROOT))
+    from scripts.run_tests_parallel import _discover_files, _slice_files
+
+    wf = _yaml((ROOT / ".github" / "workflows" / "windows-install-update-e2e.yml").read_text())
+    job = wf["jobs"]["install-update"]
+    count = len(job["strategy"]["matrix"]["slice"])
+    check = next(s for s in job["steps"] if s["name"] == "Every crash cell ran")
+    picked = re.search(r"-ne '(\d+)/\d+'", check["run"])
+    assert picked, check["run"]
+    index = int(picked[1])
+    files = _discover_files([ROOT / "tests" / "e2e" / "core" / "windows_update"])
+    held = _slice_files(files, index, count, {}, ROOT)
+    assert "test_crash_cells.py" in {f.name for f in held}
+
+
+def test_timing_bound_guards_leave_the_sliced_suite_for_one_single_worker_job():
+    """The sliced suite deselects tests/timing_bound.txt; one job runs exactly those tests with
+    one worker, so a wall-clock bound never shares the runner's cores with another test file."""
+    mod = _load()
+    out = _rewrite(SLICED)
+    jobs = _yaml(out)["jobs"]
+    sliced = jobs["test"]["steps"][0]
+    assert sliced["run"] == "scripts/run_tests.sh -- --timing-bound=exclude"
+    assert f"# {mod.TIMEOUT_MARK} just test-all" in out
+    lone = jobs["test-timing-bound"]
+    assert lone["runs-on"] == "ubuntu-latest"
+    assert "strategy" not in lone and "matrix.slice" not in str(lone)
+    step = lone["steps"][0]
+    assert step["run"] == ("scripts/run_tests.sh $(grep -o '^tests/[^:]*' tests/timing_bound.txt"
+                           " | sort -u) -- --timing-bound=only")
+    assert step["env"]["HERMES_TEST_WORKERS"] == 1
+    assert step["env"]["KEEP"] == 3
+    assert "HERMES_TEST_SLICE" not in step["env"]
+    assert list(jobs) == ["test", "test-timing-bound"]
+    assert _rewrite(out) == out
+
+
+def test_the_timing_bound_job_drops_steps_keyed_by_slice():
+    """A step that names its slice (the per-slice duration cache key) has no slice to name."""
+    job = SLICED + """\
+      - name: Save per-file duration cache (main only)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: test-durations-${{ github.run_id }}-${{ matrix.slice }}
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
+"""
+    lone = _yaml(_rewrite(job))["jobs"]["test-timing-bound"]
+    assert [s["name"] for s in lone["steps"]] == ["Run tests", "Check the checkout is clean"]
+
+
+def test_timing_bound_guards_stay_in_a_suite_on_a_small_runner():
+    out = _rewrite(SLICED.replace("blacksmith-32vcpu", "blacksmith-4vcpu"))
+    assert "timing-bound" not in out
+    assert "run: just test-all\n" in out
+
+
+def test_the_committed_timing_bound_job_runs_every_listed_file(tmp_path):
+    """The job's file selection, run as the runner's shell runs it, is the list's set of files."""
+    sys.path.insert(0, str(ROOT))
+    from tests._fixtures import timing_bound
+
+    tests = _yaml((ROOT / ".github" / "workflows" / "tests.yml").read_text())
+    step = next(s for s in tests["jobs"]["test-timing-bound"]["steps"] if s.get("name") == "Run tests")
+    assert step["env"]["HERMES_TEST_WORKERS"] == 1
+    pick = re.search(r"\$\((.*)\)", step["run"])
+    assert pick and step["run"].endswith("-- --timing-bound=only")
+    ran = subprocess.run(["bash", "-c", pick[1]], cwd=ROOT, capture_output=True, text=True, check=True)
+    assert ran.stdout.split() == sorted({i.split("::", 1)[0] for i in timing_bound.listed()})
+    run = next(s for s in tests["jobs"]["test"]["steps"] if s.get("name") == "Run tests")["run"]
+    assert run == "scripts/run_tests.sh -- --timing-bound=exclude"
+
+
+def test_the_committed_tree_is_the_rewrite_of_upstreams_workflows(tmp_path):
+    """--check over the committed tree is clean, so a resync regenerates the same files."""
+    ran = subprocess.run([sys.executable, str(SCRIPT), "--root", str(ROOT), "--check"],
+                         capture_output=True, text=True, check=False)
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    tests = _yaml((ROOT / ".github" / "workflows" / "tests.yml").read_text())
+    env = next(s for s in tests["jobs"]["test"]["steps"] if s.get("name") == "Run tests")["env"]
+    assert env["HERMES_TEST_WORKERS"] == 4
+    assert len(tests["jobs"]["test"]["strategy"]["matrix"]["slice"]) == 24

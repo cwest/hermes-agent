@@ -1,0 +1,398 @@
+"""Size a workflow's test parallelism for the hosted runner that replaces its upstream one.
+
+Upstream sizes its test lanes for the runner each job names: ``HERMES_TEST_WORKERS: 32``
+on ``blacksmith-32vcpu-ubuntu-2404`` across three slices. A 4-vCPU hosted runner runs
+those 32 workers at 8 per core, so the suite's wall-clock guards and waits time out.
+This keeps each core's load at upstream's: integer literals in ``HERMES_TEST_WORKERS``
+scale by hosted/upstream vCPUs, and the job's test slices multiply by upstream//hosted
+(a ``slice: [1, 2, 3]`` list with ``matrix.slice }}/3`` totals, or ``include`` entries
+each carrying ``slice: i/n``). It runs on upstream's text, which still names the
+Blacksmith runner, so the size comes from the label being replaced. Every edited line
+carries upstream's value after ``MARK``, and an edited line is never edited again.
+"""
+
+from __future__ import annotations
+
+import re
+
+MARK = "fork: hosted runner; upstream"
+# vCPUs of the standard GitHub-hosted runner each OS maps to, for a public repository.
+HOSTED_VCPUS = {"ubuntu": 4, "windows": 4, "macos": 3}
+
+_SIZED = re.compile(
+    r"\bblacksmith-(?P<n>\d+)vcpu-(?P<os>ubuntu|macos|windows)-"
+    r"|\b(?P<los>ubuntu|windows)-latest-(?P<ln>\d+)-(?:arm-)?core\b"
+)
+_COMMENT = re.compile(r"(^|\s)#")
+_JOB = re.compile(r"^  [\w-]+:\s*(?:#.*)?$")
+_TOP = re.compile(r"^\S")
+_RUNS_ON = re.compile(r"^\s*(?:runs-on|runner):(.*)$")
+_ENTRY = re.compile(r"^(?P<dash>\s*)- name:\s*(?P<name>.*?)\s*$")
+_WORKERS = re.compile(r"^(\s*HERMES_TEST_WORKERS:\s*)(.*?)\s*$")
+_INT = re.compile(r"(?<![\w.$])(['\"]?)(\d+)\1(?![\w.])")
+_SLICE_LIST = re.compile(r"^(\s*slice:\s*)\[([\d,\s]+)\]\s*$")
+_SLICE_ENTRY = re.compile(r"^(\s*)slice:\s*(\d+)/(\d+)\s*$")
+_SLICE_TOTAL = re.compile(r"(matrix\.slice\s*}}\s*/)(\d+)\b")
+# The JS workspace checks run as one job on upstream's 32-vCPU runner; each check sizes its own
+# pool from the core count, so on a 4-vCPU runner they contend and per-test timeouts trip.
+_CHECKS_CMD = "just check-js-ci"
+_CHECKS_RUN = re.compile(rf"^(\s*)run:\s*{re.escape(_CHECKS_CMD)}\s*$")
+_JOB_NAME = re.compile(r"^(    )name:\s*(.*?)\s*$")
+# An unsliced test job (the e2e suites) splits like the sliced ones: run_tests.sh reads
+# HERMES_TEST_SLICE and partitions from the checkout, so every slice agrees on the split.
+_RUN_TESTS = "scripts/run_tests.sh"
+_UPLOAD = "actions/upload-artifact@"
+# Steps that check a file only one test file writes: test_crash_cells.py, first in sort order,
+# so always in slice 1 (tests/ci/test_fork_hosted_runners.py holds that).
+_FIRST_SLICE_STEPS = {"Every crash cell ran"}
+# The full suite's wall-clock guards (tests/_fixtures/timing_bound.py) leave the sliced job for
+# one single-worker job: a linear-time bound must not share the runner's cores.
+_SUITE_CMD = "just test-all"
+_SUITE_RUN = re.compile(rf"^(\s*)run:\s*{re.escape(_SUITE_CMD)}\s*$")
+_SLICE_ENV = re.compile(r"^\s*HERMES_TEST_SLICE:")
+_TIMING_LIST = "tests/timing_bound.txt"
+
+
+def _code(line: str) -> str:
+    return _COMMENT.split(line, maxsplit=1)[0]
+
+
+def _size(text: str) -> tuple[int, int] | None:
+    """(upstream vCPUs, hosted vCPUs) of the runner label in ``text`` that shrinks most."""
+    sizes = [(int(m["n"] or m["ln"]), HOSTED_VCPUS[m["os"] or m["los"]])
+             for m in _SIZED.finditer(text)]
+    sizes = [s for s in sizes if s[0] > s[1]]
+    return max(sizes, key=lambda s: s[0] / s[1]) if sizes else None
+
+
+def _runner_size(lines: list[str]) -> tuple[int, int] | None:
+    sizes = [s for ln in lines if (r := _RUNS_ON.match(_code(ln))) and (s := _size(r[1]))]
+    return max(sizes, key=lambda s: s[0] / s[1]) if sizes else None
+
+
+def _workers(line: str, size: tuple[int, int]) -> str:
+    m = _WORKERS.match(line)
+    if not m or _COMMENT.search(m[2]):
+        return line
+    upstream, hosted = size
+
+    def per_core(i: re.Match) -> str:
+        return f"{i[1]}{max(1, round(int(i[2]) * hosted / upstream))}{i[1]}"
+
+    scaled = _INT.sub(per_core, m[2])
+    return line if scaled == m[2] else f"{m[1]}{scaled}  # {MARK} {m[2]}"
+
+
+def _entry_spans(job: list[str]) -> list[tuple[int, int]]:
+    """[start, end) spans of the ``- name:`` entries of a matrix ``include`` list."""
+    at = next((k for k, ln in enumerate(job) if ln.strip() == "include:"), None)
+    if at is None:
+        return []
+    spans, start, dash, stop = [], None, None, len(job)
+    for k in range(at + 1, len(job)):
+        line = job[k]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        m = _ENTRY.match(line)
+        if m and (dash is None or len(m["dash"]) == dash):
+            if start is not None:
+                spans.append((start, k))
+            start, dash = k, len(m["dash"])
+        elif dash is not None and indent <= dash:
+            stop = k
+            break
+    if start is not None:
+        spans.append((start, stop))
+    # An entry ends at its last content line; blank and comment lines after it stay put.
+    trimmed = []
+    for s, e in spans:
+        while e > s + 1 and (not job[e - 1].strip() or job[e - 1].lstrip().startswith("#")):
+            e -= 1
+        trimmed.append((s, e))
+    return trimmed
+
+
+def _split_entry(entry: list[str], factor: int) -> list[str]:
+    """One ``include`` entry as ``factor`` entries, each a slice of the slice it covered."""
+    head = _ENTRY.match(entry[0])
+    assert head
+    at = next((k for k, ln in enumerate(entry) if _SLICE_ENTRY.match(ln)), None)
+    if at is None:
+        index, total = 1, 1
+        key = " " * (len(head["dash"]) + 2)
+        entry = [*entry, f"{key}slice: 1/1"]
+        at = len(entry) - 1
+    else:
+        s = _SLICE_ENTRY.match(entry[at])
+        assert s
+        key, index, total = s[1], int(s[2]), int(s[3])
+    out = []
+    for j in range((index - 1) * factor + 1, index * factor + 1):
+        tag = f"{j}/{total * factor}"
+        own = re.compile(rf"\b{index}/{total}\b")
+        name = own.sub(tag, head["name"], count=1) if total > 1 and own.search(head["name"]) \
+            else f"{head['name']} ({tag})"
+        lines = [f"{head['dash']}- name: {name}", *entry[1:]]
+        lines[at] = f"{key}slice: {tag}  # {MARK} {index}/{total}"
+        out += lines
+    return out
+
+
+def _shard_checks(job: list[str], size: tuple[int, int]) -> list[str]:
+    """A single-runner JS workspace-checks job as upstream//hosted shards, each running its checks
+    one at a time with vitest's pool capped to the hosted vCPUs, so no check's CPU share drops."""
+    upstream, hosted = size
+    factor = upstream // hosted
+    at = next((k for k, ln in enumerate(job) if _CHECKS_RUN.match(ln)), None)
+    if at is None or factor <= 1 or any(ln.strip() == "strategy:" for ln in job):
+        return job
+    out = list(job)
+    run = _CHECKS_RUN.match(out[at])
+    assert run
+    step = " " * len(run[1])
+    out[at:at + 1] = [
+        f"{run[1]}run: node .github/scripts/run-workspace-checks.mjs"
+        f" --shard ${{{{ matrix.shard }}}}/{factor} --concurrency 1  # {MARK} {_CHECKS_CMD}",
+        f"{step}env:",
+        f"{step}  VITEST_MAX_WORKERS: {hosted}  # {MARK} the core count",
+    ]
+    for k, line in enumerate(out):
+        n = _JOB_NAME.match(line)
+        if n:
+            out[k] = f"{n[1]}name: {n[2]} (${{{{ matrix.shard }}}}/{factor})"
+            break
+    r = next(k for k, ln in enumerate(out) if _RUNS_ON.match(_code(ln)))
+    key = out[r][: len(out[r]) - len(out[r].lstrip())]
+    shards = ", ".join(map(str, range(1, factor + 1)))
+    out[r + 1:r + 1] = [f"{key}strategy:", f"{key}  fail-fast: false", f"{key}  matrix:",
+                        f"{key}    shard: [{shards}]  # {MARK} one job"]
+    return out
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _step_spans(job: list[str]) -> list[tuple[int, int]]:
+    """[start, end) spans of a job's ``steps:`` items, trailing blank/comment lines excluded."""
+    at = next((k for k, ln in enumerate(job) if ln.strip() == "steps:"), None)
+    if at is None:
+        return []
+    spans, start, dash, stop = [], None, None, len(job)
+    for k in range(at + 1, len(job)):
+        line = job[k]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if dash is None:
+            dash = _indent(line)
+        if _indent(line) < dash:
+            stop = k
+            break
+        if _indent(line) == dash and line.lstrip().startswith("- "):
+            if start is not None:
+                spans.append((start, k))
+            start = k
+    if start is not None:
+        spans.append((start, stop))
+    trimmed = []
+    for s, e in spans:
+        while e > s + 1 and (not job[e - 1].strip() or job[e - 1].lstrip().startswith("#")):
+            e -= 1
+        trimmed.append((s, e))
+    return trimmed
+
+
+def _add_env(step: list[str], entry: str) -> list[str]:
+    key = " " * (_indent(step[0]) + 2)
+    at = next((k for k, ln in enumerate(step) if ln == f"{key}env:"), None)
+    if at is None:
+        return [*step, f"{key}env:", f"{key}  {entry}"]
+    inner = next((_indent(ln) for ln in step[at + 1:] if ln.strip()), len(key) + 2)
+    return [*step[:at + 1], f"{' ' * inner}{entry}", *step[at + 1:]]
+
+
+def _slice_step(step: list[str], factor: int) -> list[str]:
+    """One step of a newly sliced job: the test run takes its slice, an artifact gets a name per
+    slice, and a check of a file only the first slice's tests write runs on that slice."""
+    key = " " * (_indent(step[0]) + 2)
+    code = [_code(ln) for ln in step]
+    if any(_RUN_TESTS in ln for ln in code):
+        step = _add_env(step, f"HERMES_TEST_SLICE: ${{{{ matrix.slice }}}}/{factor}  # {MARK} one job")
+    if any(_UPLOAD in ln for ln in code):
+        for k, line in enumerate(step):
+            m = re.match(rf"^({key}  name:\s*)(\S.*?)\s*$", line)
+            if m and not _COMMENT.search(m[2]):
+                step[k] = f"{m[1]}{m[2]}-${{{{ matrix.slice }}}}  # {MARK} {m[2]}"
+    name = _ENTRY.match(step[0])
+    if name and name["name"] in _FIRST_SLICE_STEPS:
+        step = _first_slice_only(step, key, factor)
+    return step
+
+
+def _first_slice_only(step: list[str], key: str, factor: int) -> list[str]:
+    """Pass the step in every slice but the first, inside its script: an ``if:`` would make the
+    step optional, and upstream's oracle tests require it unconditional."""
+    at = next((k for k, ln in enumerate(step) if re.match(rf"^{key}run:\s*\|\s*$", ln)), None)
+    if at is None or at + 1 >= len(step):
+        return step
+    body = " " * _indent(step[at + 1])
+    guard = [f"{body}if ($env:HERMES_TEST_SLICE -ne '1/{factor}') {{",
+             f"{body}  'only slice 1/{factor} runs the file this step checks'",
+             f"{body}  exit 0",
+             f"{body}}}  # {MARK} one job"]
+    step = [*step[:at + 1], *guard, *step[at + 1:]]
+    return _add_env(step, f"HERMES_TEST_SLICE: ${{{{ matrix.slice }}}}/{factor}  # {MARK} one job")
+
+
+def _slice_suite(job: list[str], size: tuple[int, int]) -> list[str]:
+    """An unsliced test job as upstream//hosted slices at upstream's workers per core, instead of
+    the same files run on fewer workers under the same cap."""
+    factor = size[0] // size[1]
+    if factor <= 1 or any("matrix.slice" in _code(ln) or "--slice" in _code(ln) for ln in job):
+        return job
+    # Only a job whose own worker count the sizing cuts lost parallelism; one that runs at
+    # nproc (or the runner's default) already fits the smaller runner.
+    if not any(_workers(ln, size) != ln for ln in job):
+        return job
+    spans = [(s, e) for s, e in _step_spans(job)
+             if any(_RUN_TESTS in _code(ln) for ln in job[s:e])]
+    if not spans:
+        return job
+    out = list(job)
+    for s, e in reversed(_step_spans(out)):
+        out[s:e] = _slice_step(out[s:e], factor)
+    slices = f"slice: [{', '.join(map(str, range(1, factor + 1)))}]  # {MARK} one job"
+    matrix = next((k for k, ln in enumerate(out) if _code(ln).strip() == "matrix:"), None)
+    if matrix is not None:
+        inner = next(_indent(ln) for ln in out[matrix + 1:] if ln.strip())
+        out.insert(matrix + 1, f"{' ' * inner}{slices}")
+    elif any(_code(ln).strip().startswith("strategy:") for ln in out):
+        return job
+    else:
+        r = next(k for k, ln in enumerate(out) if _RUNS_ON.match(_code(ln)))
+        key = " " * _indent(out[r])
+        out[r + 1:r + 1] = [f"{key}strategy:", f"{key}  fail-fast: false", f"{key}  matrix:",
+                            f"{key}    {slices}"]
+    for k, line in enumerate(out):
+        n = _JOB_NAME.match(line)
+        if n:
+            out[k] = f"{n[1]}name: {n[2]} (${{{{ matrix.slice }}}}/{factor})"
+            break
+    return out
+
+
+def _timing_bound_job(job: list[str]) -> list[str]:
+    """A sliced full-suite job's wall-clock guards (tests/timing_bound.txt) as one job at one
+    worker: on a small runner a linear-time bound otherwise times the CPU contention of the
+    other test files sharing its cores. Returns ``job`` with the guards deselected, then the
+    new job; ``job`` alone when it is not the full-suite run."""
+    at = next((k for k, ln in enumerate(job) if _SUITE_RUN.match(ln)), None)
+    if at is None or not any("matrix.slice" in _code(ln) for ln in job):
+        return job
+    run = _SUITE_RUN.match(job[at])
+    assert run
+    suite = list(job)
+    suite[at] = f"{run[1]}run: {_RUN_TESTS} -- --timing-bound=exclude  # {MARK} {_SUITE_CMD}"
+    lone = list(job)
+    lone[at] = (f"{run[1]}run: {_RUN_TESTS} $(grep -o '^tests/[^:]*' {_TIMING_LIST} | sort -u)"
+                f" -- --timing-bound=only  # {MARK} in the suite")
+    lone = [ln for k, ln in enumerate(lone)
+            if not (k > at and _SLICE_ENV.match(ln) and _belongs(lone, at, k))]
+    lone = [_one_worker(ln) if k > at and _belongs(lone, at, k) else ln for k, ln in enumerate(lone)]
+    lone[0] = re.sub(r"^(  [\w-]+)(:)", r"\1-timing-bound\2", lone[0])
+    for k, line in enumerate(lone):
+        n = _JOB_NAME.match(line)
+        if n:
+            lone[k] = f"{n[1]}name: Run timing-bound tests (1 worker)  # {MARK} in the sliced suite"
+            break
+    s = next((k for k, ln in enumerate(lone) if _code(ln).strip() == "strategy:"), None)
+    if s is not None:
+        e = next((k for k in range(s + 1, len(lone))
+                  if lone[k].strip() and _indent(lone[k]) <= _indent(lone[s])), len(lone))
+        del lone[s:e]
+    for s, e in reversed(_step_spans(lone)):
+        if any("matrix.slice" in _code(ln) for ln in lone[s:e]):
+            del lone[s:e]
+    # Upstream's comments on the job and on its test step describe the sliced suite.
+    step = next((s, e) for s, e in _step_spans(lone) if any("--timing-bound" in ln for ln in lone[s:e]))
+    head = next(k for k, ln in enumerate(lone) if k and ln.strip() and not ln.lstrip().startswith("#"))
+    lone = [ln for k, ln in enumerate(lone)
+            if not (ln.lstrip().startswith("#") and (0 < k < head or step[0] < k < step[1]))]
+    lone.insert(1, f"    # fork: one job at one worker for the wall-clock guards in {_TIMING_LIST},")
+    lone.insert(2, "    # which the sliced suite deselects (tests/_fixtures/timing_bound.py).")
+    lone = [ln for k, ln in enumerate(lone) if ln.strip() or (k and lone[k - 1].strip())]
+    # Blank and comment lines after the job introduce the next one; they stay after the new job.
+    suite_end = len(_trim(suite))
+    return [*suite[:suite_end], "", *_trim(lone), *suite[suite_end:]]
+
+
+def _trim(lines: list[str]) -> list[str]:
+    end = len(lines)
+    while end > 1 and (not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")):
+        end -= 1
+    return lines[:end]
+
+
+def _belongs(lines: list[str], at: int, k: int) -> bool:
+    """Whether line ``k`` sits inside the step whose ``run:`` is line ``at``."""
+    step = next(((s, e) for s, e in _step_spans(lines) if s <= at < e), None)
+    return step is not None and step[0] <= k < step[1]
+
+
+def _one_worker(line: str) -> str:
+    m = _WORKERS.match(line)
+    if not m:
+        return line
+    upstream = m[2].split(f"# {MARK}", 1)[-1].strip() if MARK in m[2] else m[2]
+    return f"{m[1]}1  # {MARK} {upstream}"
+
+
+def _size_job(job: list[str]) -> list[str]:
+    size = _runner_size(job)
+    if size is None:
+        return job
+    job = _shard_checks(job, size)
+    job = _slice_suite(job, size)
+    factor = size[0] // size[1]
+    out = list(job)
+    sliced = any("matrix.slice" in _code(ln) for ln in job)
+    # A slice list grows by the job's factor; its ``/N`` totals follow.
+    for k, line in enumerate(out):
+        s = _SLICE_LIST.match(line)
+        if not (sliced and s and factor > 1):
+            continue
+        old = [int(x) for x in s[2].split(",") if x.strip()]
+        if old != list(range(1, len(old) + 1)):
+            continue
+        new = len(old) * factor
+        out[k] = f"{s[1]}[{', '.join(map(str, range(1, new + 1)))}]  # {MARK} [{s[2].strip()}]"
+        out = [_SLICE_TOTAL.sub(lambda t: t[1] + str(new) if int(t[2]) == len(old) else t[0], ln)
+               for ln in out]
+    out = [_workers(ln, size) for ln in out]
+    # ``include`` entries each split by the runner they name.
+    if sliced:
+        for start, end in reversed(_entry_spans(out)):
+            entry_size = _runner_size(out[start:end])
+            if entry_size and entry_size[0] // entry_size[1] > 1:
+                out[start:end] = _split_entry(out[start:end], entry_size[0] // entry_size[1])
+    return _timing_bound_job(out) if factor > 1 else out
+
+
+def size_jobs(text: str) -> str:
+    """Scale every job's test parallelism to the hosted runner replacing its upstream one."""
+    body = text.splitlines()
+    if "jobs:" not in body:
+        return text
+    at = body.index("jobs:")
+    end = next((k for k in range(at + 1, len(body)) if _TOP.match(body[k])
+                and not body[k].startswith("#")), len(body))
+    starts = [k for k in range(at + 1, end) if _JOB.match(body[k])]
+    out = body[:at + 1]
+    prev = at + 1
+    for s, e in zip(starts, [*starts[1:], end]):
+        out += body[prev:s] + _size_job(body[s:e])
+        prev = e
+    out += body[prev:]
+    eol = "\r\n" if "\r\n" in text else "\n"
+    return eol.join(out) + (eol if text.endswith(("\n", "\r")) else "")

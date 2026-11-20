@@ -25,6 +25,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fork_runner_sizing import size_jobs
+
 # name -> (replacement repo, pinned commit, version comment)
 ACTIONS = {
     "checkout": (
@@ -86,6 +89,7 @@ def _action(m: re.Match) -> str:
 
 def rewrite(text: str) -> tuple[str, list[tuple[int, str]]]:
     """Rewrite one file's text; returns (text, [(line number, unhandled line)])."""
+    text = size_jobs(text)
     out, problems = [], []
     large = any(
         _LARGE_RUNNER.search(_COMMENT.split(ln, maxsplit=1)[0]) for ln in text.splitlines()
