@@ -334,6 +334,129 @@ def test_js_checks_on_a_small_runner_stay_one_job():
     assert job["steps"][0]["run"] == "just check-js-ci"
 
 
+UNSLICED_E2E = """\
+jobs:
+  e2e:
+    if: inputs.e2e
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - name: Run messaging-gated gateway cases
+        run: |
+          scripts/run_tests.sh -rs tests/gateway/test_a.py
+        env:
+          OPENAI_API_KEY: ""
+      - name: Run e2e tests
+        run: |
+          scripts/run_tests.sh --include-integration "${files[@]}"
+        env:
+          HERMES_TEST_WORKERS: "3"
+          HERMES_TEST_FILE_TIMEOUT: "900"
+  e2e-upgrade:
+    name: e2e-upgrade (${{ matrix.shard }})
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - name: Run upgrade e2e tests (${{ matrix.shard }})
+        run: scripts/run_tests.sh --include-integration "${files[@]}"
+        env:
+          SHARD: ${{ matrix.shard }}
+          HERMES_TEST_WORKERS: "6"
+  install-update:
+    name: Windows install.ps1 + hermes update E2E
+    runs-on: blacksmith-32vcpu-windows-2025
+    steps:
+      - name: Run Windows install + update E2E
+        shell: bash
+        run: |
+          scripts/run_tests.sh tests/e2e/core/windows_update/ -- -m "platforms and integration"
+        env:
+          HERMES_TEST_WORKERS: '6'
+      - name: Every crash cell ran
+        shell: pwsh
+        run: Get-Content crash-cells-ran.txt
+      - name: Upload transcripts, logs and receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-install-update-e2e-${{ github.run_attempt }}
+          path: out
+"""
+
+
+def test_an_unsliced_suite_is_sliced_instead_of_serialised():
+    """A 32-vCPU e2e job running 3 files at once becomes 8 slices of 1 worker on 4 vCPUs, not
+    one job running all its files one at a time under the same cap."""
+    out = _rewrite(UNSLICED_E2E)
+    jobs = _yaml(out)["jobs"]
+    e2e = jobs["e2e"]
+    assert e2e["strategy"] == {"fail-fast": False, "matrix": {"slice": list(range(1, 9))}}
+    for step in e2e["steps"]:
+        assert step["env"]["HERMES_TEST_SLICE"] == "${{ matrix.slice }}/8"
+    assert e2e["steps"][1]["env"]["HERMES_TEST_WORKERS"] == "1"
+    up = jobs["e2e-upgrade"]
+    assert up["name"] == "e2e-upgrade (${{ matrix.shard }}) (${{ matrix.slice }}/8)"
+    assert up["strategy"]["matrix"]["slice"] == list(range(1, 9))
+    assert up["strategy"]["matrix"]["shard"] == "${{ fromJSON(needs.plan.outputs.shards) }}"
+    assert up["steps"][0]["env"]["HERMES_TEST_SLICE"] == "${{ matrix.slice }}/8"
+    assert _rewrite(out) == out
+
+
+def test_a_sliced_suites_per_job_steps_follow_the_slice():
+    """Each slice uploads under its own artifact name, and the crash-cell manifest is required
+    only of the slice that runs test_crash_cells.py."""
+    job = _yaml(_rewrite(UNSLICED_E2E))["jobs"]["install-update"]
+    assert job["name"] == "Windows install.ps1 + hermes update E2E (${{ matrix.slice }}/8)"
+    crash = next(s for s in job["steps"] if s["name"] == "Every crash cell ran")
+    assert crash["if"] == "matrix.slice == 1"
+    upload = next(s for s in job["steps"] if s["name"].startswith("Upload"))
+    assert upload["with"]["name"] == ("windows-install-update-e2e-${{ github.run_attempt }}"
+                                      "-${{ matrix.slice }}")
+
+
+def test_an_unsliced_suite_on_a_small_runner_stays_one_job():
+    out = _rewrite(UNSLICED_E2E.replace("blacksmith-32vcpu", "blacksmith-4vcpu"))
+    assert "matrix.slice" not in out and "HERMES_TEST_SLICE" not in out
+
+
+def test_only_a_suite_whose_workers_were_cut_is_sliced():
+    """A job whose test runs set no worker count (an image build that runs its tests at nproc, a
+    live probe of one named file) lost no parallelism to the smaller runner, so it stays one job:
+    slicing it would rebuild the image per slice and rename the artifact its publish job reads."""
+    build = """\
+jobs:
+  build:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    steps:
+      - name: Run docker integration tests
+        run: HERMES_TEST_WORKERS=$(nproc) scripts/run_tests.sh tests/docker/
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-test-image
+"""
+    assert "slice" not in _rewrite(build)
+
+
+def test_the_crash_cell_journey_lands_in_the_slice_that_checks_its_manifest():
+    """run_tests_parallel partitions from the checkout alone, so the slice holding
+    test_crash_cells.py is fixed; it must be the one the workflow's manifest check runs on."""
+    sys.path.insert(0, str(ROOT))
+    from scripts.run_tests_parallel import _discover_files, _slice_files
+
+    wf = _yaml((ROOT / ".github" / "workflows" / "windows-install-update-e2e.yml").read_text())
+    job = wf["jobs"]["install-update"]
+    count = len(job["strategy"]["matrix"]["slice"])
+    check = next(s for s in job["steps"] if s["name"] == "Every crash cell ran")
+    index = int(check["if"].rsplit("==", 1)[1])
+    files = _discover_files([ROOT / "tests" / "e2e" / "core" / "windows_update"])
+    held = _slice_files(files, index, count, {}, ROOT)
+    assert "test_crash_cells.py" in {f.name for f in held}
+
+
 def test_the_committed_tree_is_the_rewrite_of_upstreams_workflows(tmp_path):
     """--check over the committed tree is clean, so a resync regenerates the same files."""
     ran = subprocess.run([sys.executable, str(SCRIPT), "--root", str(ROOT), "--check"],

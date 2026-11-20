@@ -38,6 +38,13 @@ _SLICE_TOTAL = re.compile(r"(matrix\.slice\s*}}\s*/)(\d+)\b")
 _CHECKS_CMD = "just check-js-ci"
 _CHECKS_RUN = re.compile(rf"^(\s*)run:\s*{re.escape(_CHECKS_CMD)}\s*$")
 _JOB_NAME = re.compile(r"^(    )name:\s*(.*?)\s*$")
+# An unsliced test job (the e2e suites) splits like the sliced ones: run_tests.sh reads
+# HERMES_TEST_SLICE and partitions from the checkout, so every slice agrees on the split.
+_RUN_TESTS = "scripts/run_tests.sh"
+_UPLOAD = "actions/upload-artifact@"
+# Steps that check a file only one test file writes: test_crash_cells.py, first in sort order,
+# so always in slice 1 (tests/ci/test_fork_hosted_runners.py holds that).
+_FIRST_SLICE_STEPS = {"Every crash cell ran"}
 
 
 def _code(line: str) -> str:
@@ -157,11 +164,111 @@ def _shard_checks(job: list[str], size: tuple[int, int]) -> list[str]:
     return out
 
 
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _step_spans(job: list[str]) -> list[tuple[int, int]]:
+    """[start, end) spans of a job's ``steps:`` items, trailing blank/comment lines excluded."""
+    at = next((k for k, ln in enumerate(job) if ln.strip() == "steps:"), None)
+    if at is None:
+        return []
+    spans, start, dash, stop = [], None, None, len(job)
+    for k in range(at + 1, len(job)):
+        line = job[k]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if dash is None:
+            dash = _indent(line)
+        if _indent(line) < dash:
+            stop = k
+            break
+        if _indent(line) == dash and line.lstrip().startswith("- "):
+            if start is not None:
+                spans.append((start, k))
+            start = k
+    if start is not None:
+        spans.append((start, stop))
+    trimmed = []
+    for s, e in spans:
+        while e > s + 1 and (not job[e - 1].strip() or job[e - 1].lstrip().startswith("#")):
+            e -= 1
+        trimmed.append((s, e))
+    return trimmed
+
+
+def _add_env(step: list[str], entry: str) -> list[str]:
+    key = " " * (_indent(step[0]) + 2)
+    at = next((k for k, ln in enumerate(step) if ln == f"{key}env:"), None)
+    if at is None:
+        return [*step, f"{key}env:", f"{key}  {entry}"]
+    inner = next((_indent(ln) for ln in step[at + 1:] if ln.strip()), len(key) + 2)
+    return [*step[:at + 1], f"{' ' * inner}{entry}", *step[at + 1:]]
+
+
+def _slice_step(step: list[str], factor: int) -> list[str]:
+    """One step of a newly sliced job: the test run takes its slice, an artifact gets a name per
+    slice, and a check of a file only the first slice's tests write runs on that slice."""
+    key = " " * (_indent(step[0]) + 2)
+    code = [_code(ln) for ln in step]
+    if any(_RUN_TESTS in ln for ln in code):
+        step = _add_env(step, f"HERMES_TEST_SLICE: ${{{{ matrix.slice }}}}/{factor}  # {MARK} one job")
+    if any(_UPLOAD in ln for ln in code):
+        for k, line in enumerate(step):
+            m = re.match(rf"^({key}  name:\s*)(\S.*?)\s*$", line)
+            if m and not _COMMENT.search(m[2]):
+                step[k] = f"{m[1]}{m[2]}-${{{{ matrix.slice }}}}  # {MARK} {m[2]}"
+    name = _ENTRY.match(step[0])
+    if name and name["name"] in _FIRST_SLICE_STEPS:
+        at = next((k for k, ln in enumerate(step) if ln.startswith(f"{key}if:")), None)
+        if at is None:
+            step = [step[0], f"{key}if: matrix.slice == 1  # {MARK} one job", *step[1:]]
+    return step
+
+
+def _slice_suite(job: list[str], size: tuple[int, int]) -> list[str]:
+    """An unsliced test job as upstream//hosted slices at upstream's workers per core, instead of
+    the same files run on fewer workers under the same cap."""
+    factor = size[0] // size[1]
+    if factor <= 1 or any("matrix.slice" in _code(ln) or "--slice" in _code(ln) for ln in job):
+        return job
+    # Only a job whose own worker count the sizing cuts lost parallelism; one that runs at
+    # nproc (or the runner's default) already fits the smaller runner.
+    if not any(_workers(ln, size) != ln for ln in job):
+        return job
+    spans = [(s, e) for s, e in _step_spans(job)
+             if any(_RUN_TESTS in _code(ln) for ln in job[s:e])]
+    if not spans:
+        return job
+    out = list(job)
+    for s, e in reversed(_step_spans(out)):
+        out[s:e] = _slice_step(out[s:e], factor)
+    slices = f"slice: [{', '.join(map(str, range(1, factor + 1)))}]  # {MARK} one job"
+    matrix = next((k for k, ln in enumerate(out) if _code(ln).strip() == "matrix:"), None)
+    if matrix is not None:
+        inner = next(_indent(ln) for ln in out[matrix + 1:] if ln.strip())
+        out.insert(matrix + 1, f"{' ' * inner}{slices}")
+    elif any(_code(ln).strip().startswith("strategy:") for ln in out):
+        return job
+    else:
+        r = next(k for k, ln in enumerate(out) if _RUNS_ON.match(_code(ln)))
+        key = " " * _indent(out[r])
+        out[r + 1:r + 1] = [f"{key}strategy:", f"{key}  fail-fast: false", f"{key}  matrix:",
+                            f"{key}    {slices}"]
+    for k, line in enumerate(out):
+        n = _JOB_NAME.match(line)
+        if n:
+            out[k] = f"{n[1]}name: {n[2]} (${{{{ matrix.slice }}}}/{factor})"
+            break
+    return out
+
+
 def _size_job(job: list[str]) -> list[str]:
     size = _runner_size(job)
     if size is None:
         return job
     job = _shard_checks(job, size)
+    job = _slice_suite(job, size)
     factor = size[0] // size[1]
     out = list(job)
     sliced = any("matrix.slice" in _code(ln) for ln in job)
