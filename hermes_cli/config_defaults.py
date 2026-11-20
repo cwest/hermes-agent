@@ -110,6 +110,11 @@ DEFAULT_CONFIG = {
         # pass with work still running, a WARNING names every unit and the wait continues. Only a
         # forced restart (`pause-for-update` with force) or SIGTERM stops live work.
         "restart_after_turn_timeout": 1800,
+        # Upper bound (seconds) on that wait. When it passes with work still live, the restart is
+        # forced: live work is interrupted and every unit cut is logged. A busy board (kanban
+        # workers, never-exiting background processes) may never go idle on its own. 0 = wait
+        # for idle with no bound.
+        "restart_max_wait": 600,
         # Max seconds a submitted prompt waits for the deferred agent build (MCP discovery, model
         # metadata, skills scan) before failing visibly. The prompt is delivered as soon as the
         # build completes (progress notice past 30s), so this only fires on a hung build. Raise for
