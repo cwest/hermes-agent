@@ -377,5 +377,26 @@ attempt 1 failed only 15/24 (the timing test above) and 18/24 (`curl` 403 fetchi
 release, before any test ran). On the docs-only head after it, attempt 1 failed only Run tests
 16/24, on the sibling bound `test_approval_windows_hardline_scripts.py::test_bare_cr_runs_scan_in_linear_time`
 (3.1 s and 2.9 s against 2 s). Neither that file nor the hardline patterns differ from upstream, and
-the same slice passed on the three runs before. All the linear-time bounds in the approval scanner
-sit near 2 s on a 4-vCPU runner and can recur.
+the same slice passed on the three runs before.
+
+### Wall-clock guards in a single-worker job
+
+Both attempt-1 failures above were linear-time bounds timing CPU contention: on a 4-vCPU runner
+each guard shared its core with three other test files. They are no longer retried until they pass.
+46 tests in 29 files (`tests/timing_bound.txt`) assert a scan or format finishes inside a fixed
+wall-clock bound. The list holds every test whose name says linear, quadratic, backtrack, ReDoS or
+fast and that reads `perf_counter`/`monotonic` or sets a subprocess timeout.
+
+- `tests/_fixtures/timing_bound.py` marks them `timing_bound`. `--timing-bound=exclude` deselects
+  them and `--timing-bound=only` keeps only them, through one predicate, so the two runs cover
+  every test once. Over the 29 files locally: `only` at 1 worker ran 86 tests, `exclude` at 4
+  workers ran 2449, and an unfiltered run ran 2535 (86 + 2449). `tests/ci/test_timing_bound_lane.py`
+  fails on a list entry that names no test.
+- `scripts/ci/fork_runner_sizing.py` runs the 24 sliced `Run tests` jobs with
+  `--timing-bound=exclude` and adds `Run timing-bound tests (1 worker)`. That job is upstream's
+  test job without the slice matrix and its slice-keyed cache save, and it runs the listed files at
+  `HERMES_TEST_WORKERS=1`. Each guard has a core to itself, as it does upstream with 32 workers on
+  32 cores. No bound is changed.
+
+The proof is 5 consecutive PR-CI runs on this section's head, each green on attempt 1. Their run
+ids are in the PR description, because recording them here would move the head they were measured on.
