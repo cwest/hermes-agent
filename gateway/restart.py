@@ -47,6 +47,8 @@ DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT = 5.0
 # In-band restart waits for active turns to finish *before* ``stop()`` begins; distinct from
 # ``restart_drain_timeout``, the force-interrupt budget once ``stop()`` runs (short under TimeoutStopSec).
 DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT = float(DEFAULT_CONFIG["agent"]["restart_after_turn_timeout"])
+# Past this the restart-when-idle wait forces the restart (``0`` = unbounded).
+DEFAULT_GATEWAY_RESTART_MAX_WAIT = float(DEFAULT_CONFIG["agent"]["restart_max_wait"])
 
 # Floor under the ``stop()`` drain for cron jobs and api_server (/v1) runs. ``restart_drain_timeout``
 # defaults to 0 because interrupting a *chat* turn is cheap and recoverable (user told, session
@@ -305,6 +307,11 @@ def parse_restart_drain_timeout(raw: object) -> float:
 def parse_restart_after_turn_timeout(raw: object) -> float:
     """Parse the after-turn wait cap for in-band restart (``0`` = legacy immediate drain)."""
     return _parse_timeout_keeping_zero(raw, DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT)
+
+
+def parse_restart_max_wait(raw: object) -> float:
+    """Parse the restart-when-idle bound (``0`` = wait for idle with no bound)."""
+    return _parse_timeout_keeping_zero(raw, DEFAULT_GATEWAY_RESTART_MAX_WAIT)
 
 
 def parse_cron_drain_timeout(raw: object) -> float:

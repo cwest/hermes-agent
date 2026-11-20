@@ -338,6 +338,8 @@ gateway:
     paused_left: "\n⚠️ {count} mensaje(s) que enviaste mientras la conversación anterior estaba en pausa siguen guardados en la conversación anterior, sin respuesta. Para ejecutarlos: /resume {session_id} y luego {discard}."
   restart:
     in_progress: "⏳ El reinicio del gateway ya está en curso..."
+    waiting: "⏳ Gateway restart already waiting {waited} for {count} live unit(s): {kinds}. Send /restart now to force it (live work is interrupted)."
+    forcing: "⚡ Forcing gateway restart now; live work is interrupted."
     restarting: "♻ Reiniciando el gateway. Si no recibes notificación en 60 segundos, reinicia desde la consola con `hermes gateway restart`."
   resume:
     db_unavailable: "Base de datos de sesiones no disponible."
