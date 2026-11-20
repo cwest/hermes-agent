@@ -270,8 +270,11 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
     budget.check()
     with closing(_connect_tracked_db(path, tracking_path=path, timeout=budget.busy_timeout(),
                                      isolation_level=None)) as conn:
-        _reapply_durability_barriers(conn)
+        # Armed first: on macOS the barrier pragmas parse the whole schema while gateway.lock is
+        # held, and that time counts against the budget a booting gateway waits out.
         budget.arm(conn)
+        _reapply_durability_barriers(conn)
+        budget.check()
         conn.execute('BEGIN IMMEDIATE')
         try:
             cursor = conn.cursor()
