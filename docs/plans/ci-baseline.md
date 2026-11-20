@@ -383,9 +383,14 @@ the same slice passed on the three runs before.
 
 Both attempt-1 failures above were linear-time bounds timing CPU contention: on a 4-vCPU runner
 each guard shared its core with three other test files. They are no longer retried until they pass.
-46 tests in 29 files (`tests/timing_bound.txt`) assert a scan or format finishes inside a fixed
-wall-clock bound. The list holds every test whose name says linear, quadratic, backtrack, ReDoS or
-fast and that reads `perf_counter`/`monotonic` or sets a subprocess timeout.
+60 tests in 41 files (`tests/timing_bound.txt`) assert that a scan, format or failure path finishes
+inside a fixed wall-clock bound. The list holds every test in the sliced suite's tree (`tests/`
+without `integration`, `e2e` and `docker`, which run in their own workflows) whose name says linear,
+quadratic, backtrack, ReDoS or fast and whose body reads `perf_counter`/`monotonic`. That includes
+the fail-fast tests with sub-second bounds, such as the lost-lease tests (<0.5 s). A further 6 entries
+are guards the rule doesn't catch by name (for example `does_not_rescan`, `runtime_is_bounded`).
+`tests/ci/test_timing_bound_lane.py::test_every_test_the_rule_matches_is_listed` runs that rule over
+the tree and fails on any match that isn't listed, so this paragraph stays true as tests are added.
 
 - `tests/_fixtures/timing_bound.py` marks them `timing_bound`. `--timing-bound=exclude` deselects
   them and `--timing-bound=only` keeps only them, through one predicate, so the two runs cover
