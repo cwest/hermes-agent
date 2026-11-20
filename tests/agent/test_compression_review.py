@@ -267,12 +267,15 @@ class TestF6ExecutorSaturation:
         results = {}
 
         def host(i):
+            # The ceiling only has to outlast the worker's start: the fence refuses a worker that
+            # starts after it, and a starved runner can take over 0.1s to start a pool thread,
+            # breaking the barrier below. The hosts still give up while their workers stay wedged.
             results[i] = run_compress_context_with_progress_timeout(
                 worker=blocked_worker,
                 messages=[{"role": "user", "content": f"m{i}"}],
                 system_prompt_fallback=f"fb{i}",
-                idle_timeout_seconds=0.05,
-                total_ceiling_seconds=0.1,
+                idle_timeout_seconds=2.0,
+                total_ceiling_seconds=2.0,
             )
 
         try:
