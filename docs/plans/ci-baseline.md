@@ -291,16 +291,35 @@ The sized run left four failures, plus the aggregate gate:
    `wal_reset_vulnerable` and the message took the other branch. Reproduced locally by putting a
    CLI reporting 3.45.1 on PATH; fixed by hiding `sqlite3` from `shutil.which`, which passes with
    and without the vulnerable CLI.
-2. **`test_browse_schema_drift.py::test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out[ddl]`**
-   (macOS 2/8): `OwnershipConflict: Gateway runtime already owns profile`. The same failure appears
-   before and after sizing, and on this Mac the file hits the 300 s file timeout at the upstream base
-   `4c14d9df5b` exactly as at the fork head, so the fork's patches do not cause it. Upstream's own
-   macOS lanes (12-vCPU Blacksmith) passed it at the base. The cause has not been identified yet.
+2. **Fixed: `test_browse_schema_drift.py::test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out[ddl]`**
+   (macOS 2/8): `OwnershipConflict: Gateway runtime already owns profile`. Not sizing and not
+   ordering: it reproduced on its own (`-k slow_browse`) at the upstream base too. Faulthandler
+   dumps from the browse subprocess showed it inside `_reapply_durability_barriers` →
+   `PRAGMA synchronous=FULL` for the whole 5 s boot wait. `_apply_additive_schema` re-applied the
+   macOS barrier pragmas before arming the browse budget, and that pragma parses the full schema;
+   on a slow connection it ran unbudgeted while `gateway.lock` was held, so the browse returned its
+   503 after 9.6 s instead of inside 3 s. The budget is now armed before the pragmas and checked
+   before `BEGIN IMMEDIATE`. Locally the test fails without the change and passes 10/10 with it.
 3. **macOS 3/8: 4 errors in `test_plugins_cmd.py` and `test_update_missing_configured_deps.py`**:
    `Failed to fetch ... truststore-0.10.5-py3-none-any.whl ... operation timed out` during the
    tests' own `uv sync`. A PyPI download timeout from the runner (network), not a test failure.
-4. **JS & TS: `bundle-smoke-metadata.test.mjs > channel smoke binds the complete admitted request`**
-   timed out at 15000 ms (22.4 s). The JS lane sets no `HERMES_TEST_WORKERS` or slices, so the
-   sizing rewrite does not reach it; it runs on a 4-vCPU hosted runner in place of upstream's
-   larger one. Fixing it within the no-threshold-loosening rule means sizing that lane (its vitest
-   pool) the same way, which is not done here.
+   It passed on the next run (44695170548) with no change.
+4. **Fixed: JS & TS: `bundle-smoke-metadata.test.mjs > channel smoke binds the complete admitted request`**
+   timed out at 15000 ms (22.4 s). Upstream runs every JS workspace check at once on one 32-vCPU
+   runner, and each check sizes its pool from the core count. The sizing rewrite now turns that job
+   into 8 shards on 4-vCPU runners (`run-workspace-checks.mjs --shard i/n`), each running its
+   checks one at a time with `VITEST_MAX_WORKERS=4`. The 15000 ms timeout is unchanged. The desktop
+   `window is not defined` unhandled error was a timer leak: an install toast's 5 s auto-dismiss
+   timer outlived `plugin-install-modal.test.tsx`. The test now dismisses its toasts in
+   `afterEach`, and the full desktop `vitest --project ui` run reports 0 unhandled errors.
+
+| Run | Head | Jobs passed | Jobs failed |
+|---|---|---|---|
+| 44695170548 | `a9c33209ac` | 72 | 3 (macOS 2/8 `[ddl]`; Python 18/24 `test_rich_payload_is_linear_in_unclosed_backtick_runs` 1.4 s against a 1.0 s bound, which passed on every other run; aggregate) |
+| 44701204737 | `910f1b24f0` | 72 | 2 (Windows-only 7/8: `tests/ci/test_update_ci_routing.py` hit the 300 s file timeout; aggregate) |
+| 44701204737 attempt 2 | `910f1b24f0` | 74 (8 skipped by path filters) | 0: CI, Nix and Docker all green |
+
+`test_update_ci_routing.py` took 245 s and 166 s on the Windows 7/8 lane in the two earlier runs and
+448 s on this Mac, both with and without the sharded `js-tests.yml`. It runs close to the 300 s cap
+on a 2-worker hosted Windows runner whatever the change, so the timeout is its own run time, not this
+branch's workflow edit. A rerun of the failed job passed it (job 136197037062).
