@@ -267,6 +267,11 @@ from tests._fixtures.live_system_guard import (
 )
 from tests._fixtures.model_peer import model_peer  # fixture registers here
 from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
+from tests._fixtures import timing_bound as _timing_bound
+
+
+def pytest_addoption(parser):
+    _timing_bound.addoption(parser)
 
 
 @pytest.fixture(autouse=True)
@@ -1250,6 +1255,7 @@ def pytest_unconfigure(config):
 def pytest_configure(config):
     """Register markers used by hermetic conftest."""
     _relocate_basetemp_outside_operator_home(config)
+    _timing_bound.configure(config)
     config.addinivalue_line(
         "markers",
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "
@@ -1400,6 +1406,7 @@ def pytest_collection_modifyitems(config, items):
     skip is diagnosable rather than mysterious.
     """
     _reject_contradictory_platform_marks(items)
+    _timing_bound.modifyitems(config, items)
 
     # platforms() gating: skip items whose specs exclude this host. The skip
     # markers (not -m expressions) are the authoritative host filter on
