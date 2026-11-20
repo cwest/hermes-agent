@@ -730,8 +730,10 @@ class WebhookAdapter(BasePlatformAdapter):
             prompt = (render_mcp_event_prompt(self, route_config, payload, event_type, route_name)
                       or self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name))
             # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.
+            # The skill scan parses every SKILL.md: off the loop, or a burst of deliveries stalls the
+            # gateway past every managed worker's persist receipt. to_thread carries the profile scope.
             if (skills := route_config.get("skills", [])) and not route_config.get("cron_job"):
-                prompt = self._apply_skills(prompt, skills)
+                prompt = await asyncio.to_thread(self._apply_skills, prompt, skills)
         now = time.time()  # idempotency: skip duplicate deliveries (webhook retries)
         delivery_identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
         coalesce = route_config.get("coalesce")
