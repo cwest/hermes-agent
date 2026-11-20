@@ -112,7 +112,7 @@ jobs:
         #
         # No --files: the runner discovers the suite itself. The discovered
         # set is identical to the list the removed matrix job used to pass in.
-        run: just test-all
+        run: scripts/run_tests.sh -- --timing-bound=exclude  # fork: hosted runner; upstream just test-all
         env:
           HERMES_TEST_SLICE: ${{ matrix.slice }}/24
           HERMES_TEST_FORKSERVER: "1"
@@ -133,6 +133,84 @@ jobs:
           # Per-slice key: each slice's file keeps the restored entries for the other
           # slices' files and refreshes its own, so the cache stays complete.
           key: test-durations-${{ github.run_id }}-${{ matrix.slice }}
+
+      - name: Check the checkout is clean
+        # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
+        # leaves an untracked or modified file in the checkout is reported here. Runs only when
+        # every earlier step passed: a step that failed midway can leave its own temp files
+        # (a half-extracted download, a worktree its later cleanup never removed).
+        uses: ./.github/actions/check-clean-worktree
+
+  test-timing-bound:
+    # fork: one job at one worker for the wall-clock guards in tests/timing_bound.txt,
+    # which the sliced suite deselects (tests/_fixtures/timing_bound.py).
+    name: Run timing-bound tests (1 worker)  # fork: hosted runner; upstream in the sliced suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 90  # fork: hosted runner; upstream 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+
+      - name: Install ripgrep (prebuilt binary)
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          # Tests that drive the real scripts/build/node-deps.mjs need pnpm (and
+          # with it PM's Node) on PATH.
+          packages: pnpm
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain"]'
+          test-environment: 'true'
+          prune-python-cache: true
+
+      - name: Check SQLite runs WAL
+        # Hermes picks DELETE journal mode on a SQLite with the WAL-reset
+        # bug. If the PM-pinned interpreter links one, every WAL test silently
+        # runs DELETE (or skips), so fail loudly instead. Tests that need DELETE
+        # select it explicitly (journal_mode config, a pinned vulnerable
+        # version), so they run on any interpreter.
+        run: |
+          "$HERMES_PYTHON" -c "import sqlite3, sys, hermes_agent.compat as compat; compat.install(); import sqlite_support as w; v = w.is_sqlite_wal_reset_vulnerable(); print(f'Python {sys.version.split()[0]}, SQLite {sqlite3.sqlite_version}, WAL-reset vulnerable: {v}'); sys.exit(1 if v else 0)"
+
+      - name: Restore per-file duration cache
+        # scripts/run_tests_parallel.py raises a file's timeout to
+        # 3x its last healthy duration (_effective_file_timeout) so a
+        # known-slow file dilated by load is not SIGKILL'd at the flat cap
+        # and laundered into a FLAKY retry. The scaler reads
+        # test_durations.json from the checkout; without this restore the
+        # file is absent on a fresh runner and the scaler is inert.
+        # Exact key never matches (run_id differs); restore-keys picks the
+        # most recent cache saved by a main push. PRs read, only main writes.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: test_durations.json
+          key: test-durations-never-exact
+          restore-keys: |
+            test-durations-
+
+      - name: Run tests
+        run: scripts/run_tests.sh $(grep -o '^tests/[^:]*' tests/timing_bound.txt | sort -u) -- --timing-bound=only  # fork: hosted runner; upstream in the suite
+        env:
+          HERMES_TEST_FORKSERVER: "1"
+          HERMES_TEST_WORKERS: 1  # fork: hosted runner; upstream 32
+          HERMES_TEST_FILE_TIMEOUT: 600
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
 
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
