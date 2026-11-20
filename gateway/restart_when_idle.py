@@ -9,9 +9,11 @@ whole wait, then lost them.
 
 Now the restart is "restart when idle": nothing is refused while work is in flight, the restart
 happens at the first moment no work is (background delegations, notify-watched background
-processes and queued completion notices count, since each delivers a new turn later), and the cap
-only means "warn and name what is still running". Only an explicit force (``pause-for-update`` with
-``{"force": true}``) stops live work; SIGTERM keeps its immediate-stop meaning.
+processes and queued completion notices count, since each delivers a new turn later), and
+``agent.restart_after_turn_timeout`` only means "warn and name what is still running". The wait is
+bounded by ``agent.restart_max_wait``: past it the restart is forced and every unit it cuts is
+logged (0 = no bound). An explicit force (``/restart now``, ``pause-for-update`` with
+``{"force": true}``) stops live work at once; SIGTERM keeps its immediate-stop meaning.
 """
 from __future__ import annotations
 
@@ -97,11 +99,14 @@ def _idle(runner) -> bool:
 
 
 async def await_idle(runner) -> bool:
-    """Keep serving until the gateway is idle (True) or a force arrives (False).
+    """Keep serving until the gateway is idle (True), or a force arrives or
+    ``agent.restart_max_wait`` elapses (False; the max-wait exit sets the force event itself).
 
     ``agent.restart_after_turn_timeout`` is a warning interval: each time it elapses with work
-    still live, a WARNING names every unit and the wait continues. Wedged chat turns (no activity
-    past ``agent.gateway_timeout``) and restart-safe external cron runs never hold it.
+    still live, a WARNING names every unit and the wait continues. ``agent.restart_max_wait`` (0 =
+    no bound) is the deadline: past it the remaining units are logged and the restart is forced.
+    Wedged chat turns (no activity past ``agent.gateway_timeout``) and restart-safe external cron
+    runs never hold it.
     """
     force = getattr(runner, "_restart_force_event", None)
     if force is None:
@@ -109,14 +114,23 @@ async def await_idle(runner) -> bool:
     if _idle(runner) or force.is_set():
         return not force.is_set()
     warn_every = float(getattr(runner, "_restart_after_turn_timeout", 0.0) or 0.0)
-    logger.info("Restart requested; waiting for idle while serving normally (warn after %.0fs): %s",
-                warn_every, _log_view(runner._describe_active_work()))
+    max_wait = float(getattr(runner, "_restart_max_wait", 0.0) or 0.0)
+    logger.info("Restart requested; waiting for idle while serving normally (warn after %.0fs, force "
+                "after %s): %s", warn_every, f"{max_wait:.0f}s" if max_wait else "never",
+                _log_view(runner._describe_active_work()))
     loop = asyncio.get_running_loop()
     started = loop.time()
+    runner._restart_wait_started_at = time.time()
     next_warn = started + warn_every
     last_status = 0.0
     while not _idle(runner):
         now = loop.time()
+        if max_wait and now - started >= max_wait:
+            # A busy board may never go idle (workers keep arriving, poll loops never exit).
+            logger.warning("Restart waited %.0fs (agent.restart_max_wait); forcing it and interrupting: %s",
+                           now - started, _log_view(runner._describe_active_work()))
+            force.set()
+            return False
         if now >= next_warn:
             logger.warning(
                 "Restart still waiting after %.0fs; live work is NOT interrupted (only a forced "

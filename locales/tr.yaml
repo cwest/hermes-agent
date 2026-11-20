@@ -338,6 +338,8 @@ gateway:
     paused_left: "\n⚠️ Önceki konuşma duraklatılmışken gönderdiğin {count} mesaj hâlâ önceki konuşmada kayıtlı ve yanıtlanmadı. Çalıştırmak için: /resume {session_id}, ardından {discard}."
   restart:
     in_progress: "⏳ Gateway yeniden başlatma zaten sürüyor..."
+    waiting: "⏳ Gateway restart already waiting {waited} for {count} live unit(s): {kinds}. Send /restart now to force it (live work is interrupted)."
+    forcing: "⚡ Forcing gateway restart now; live work is interrupted."
     restarting: "♻ Gateway yeniden başlatılıyor. 60 saniye içinde bildirim almazsanız konsoldan `hermes gateway restart` ile yeniden başlatın."
   resume:
     db_unavailable: "Oturum veritabanı kullanılamıyor."
