@@ -255,3 +255,32 @@ async def test_a_wake_called_on_the_gateway_loop_is_refused_instead_of_deadlocki
 def test_no_live_gateway_refuses_a_wake(tmp_path):
     ctx, _manager = _context(tmp_path)
     assert ctx.wake_chat("x", origin=ORIGIN, wake_id="evt-1") is False
+
+
+@pytest.mark.asyncio
+async def test_a_wake_that_runs_while_the_last_reply_is_sending_is_admitted_once(monkeypatch):
+    from hermes_constants import get_hermes_home
+    from gateway.platforms.base import SendResult
+    runner, adapter, _authority, executed = await _gateway(monkeypatch)
+    ctx, manager = _context(get_hermes_home())
+    manager.set_gateway_message_injector(runner, runner._schedule_plugin_message_injection)
+    release, sends = asyncio.Event(), []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        sends.append(content)
+        if len(sends) == 1:
+            await release.wait()  # the first turn is over in the runner; its reply still holds the chat
+        return SendResult(success=True, message_id="sent")
+    monkeypatch.setattr(adapter, "send", send)
+    calls = _counting_deliver(monkeypatch)
+
+    assert await asyncio.to_thread(ctx.wake_chat, "first", origin=ORIGIN, wake_id="evt-1") is True
+    await async_wait_until(lambda: sends, timeout=10, what="the first reply to start sending")
+    # The second wake runs as soon as it arrives, so its receipt must say so ...
+    assert await asyncio.to_thread(ctx.wake_chat, "second", origin=ORIGIN, wake_id="evt-2") is True
+    release.set()
+    await async_wait_until(lambda: not adapter._active_sessions, timeout=10, what="the chat to go idle")
+    # ... and a retry of it is answered from memory, never run again.
+    assert await asyncio.to_thread(ctx.wake_chat, "second", origin=ORIGIN, wake_id="evt-2") is True
+    assert calls == ["first", "second"]
+    assert executed.count("second") == 1
