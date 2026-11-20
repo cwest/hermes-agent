@@ -398,5 +398,19 @@ fast and that reads `perf_counter`/`monotonic` or sets a subprocess timeout.
   `HERMES_TEST_WORKERS=1`. Each guard has a core to itself, as it does upstream with 32 workers on
   32 cores. No bound is changed.
 
+### The routing replay at its file cap
+
+The first PR run with that job (44751651377) was red on attempt 1 in only two jobs: Linux slice 19/24
+and Windows 7/8. In both, `tests/ci/test_update_ci_routing.py` hit its file cap (600 s and
+300 s). The file had already taken 352-460 s on the earlier runs. It replays each workflow's
+selection step for 32 lane combinations, once per matrix entry, and the sizing above splits
+each OS lane into slices (macOS 2 to 8, Windows x64 1 to 8, Windows arm64 2 to 16 entries). The
+slices of one lane select the same files: the step reads its slice only through
+`HERMES_TEST_SLICE`, which the runner consumes, not the selection. The replay now runs one entry
+per lane unless the step's command reads `matrix.slice` or `matrix.name`
+(`tests/ci/test_update_ci_routing_slice_cells.py`). Locally at one worker the file went from
+1258 s to 190 s, with all 71 tests passing. The new timing-bound job was not the cause: before
+this fix the file took 1205 s at the head before that job and 1258 s with it.
+
 The proof is 5 consecutive PR-CI runs on this section's head, each green on attempt 1. Their run
 ids are in the PR description, because recording them here would move the head they were measured on.
