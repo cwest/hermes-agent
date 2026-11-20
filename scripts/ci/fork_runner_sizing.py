@@ -33,6 +33,11 @@ _INT = re.compile(r"(?<![\w.$])(['\"]?)(\d+)\1(?![\w.])")
 _SLICE_LIST = re.compile(r"^(\s*slice:\s*)\[([\d,\s]+)\]\s*$")
 _SLICE_ENTRY = re.compile(r"^(\s*)slice:\s*(\d+)/(\d+)\s*$")
 _SLICE_TOTAL = re.compile(r"(matrix\.slice\s*}}\s*/)(\d+)\b")
+# The JS workspace checks run as one job on upstream's 32-vCPU runner; each check sizes its own
+# pool from the core count, so on a 4-vCPU runner they contend and per-test timeouts trip.
+_CHECKS_CMD = "just check-js-ci"
+_CHECKS_RUN = re.compile(rf"^(\s*)run:\s*{re.escape(_CHECKS_CMD)}\s*$")
+_JOB_NAME = re.compile(r"^(    )name:\s*(.*?)\s*$")
 
 
 def _code(line: str) -> str:
@@ -121,10 +126,42 @@ def _split_entry(entry: list[str], factor: int) -> list[str]:
     return out
 
 
+def _shard_checks(job: list[str], size: tuple[int, int]) -> list[str]:
+    """A single-runner JS workspace-checks job as upstream//hosted shards, each running its checks
+    one at a time with vitest's pool capped to the hosted vCPUs, so no check's CPU share drops."""
+    upstream, hosted = size
+    factor = upstream // hosted
+    at = next((k for k, ln in enumerate(job) if _CHECKS_RUN.match(ln)), None)
+    if at is None or factor <= 1 or any(ln.strip() == "strategy:" for ln in job):
+        return job
+    out = list(job)
+    run = _CHECKS_RUN.match(out[at])
+    assert run
+    step = " " * len(run[1])
+    out[at:at + 1] = [
+        f"{run[1]}run: node .github/scripts/run-workspace-checks.mjs"
+        f" --shard ${{{{ matrix.shard }}}}/{factor} --concurrency 1  # {MARK} {_CHECKS_CMD}",
+        f"{step}env:",
+        f"{step}  VITEST_MAX_WORKERS: {hosted}  # {MARK} the core count",
+    ]
+    for k, line in enumerate(out):
+        n = _JOB_NAME.match(line)
+        if n:
+            out[k] = f"{n[1]}name: {n[2]} (${{{{ matrix.shard }}}}/{factor})"
+            break
+    r = next(k for k, ln in enumerate(out) if _RUNS_ON.match(_code(ln)))
+    key = out[r][: len(out[r]) - len(out[r].lstrip())]
+    shards = ", ".join(map(str, range(1, factor + 1)))
+    out[r + 1:r + 1] = [f"{key}strategy:", f"{key}  fail-fast: false", f"{key}  matrix:",
+                        f"{key}    shard: [{shards}]  # {MARK} one job"]
+    return out
+
+
 def _size_job(job: list[str]) -> list[str]:
     size = _runner_size(job)
     if size is None:
         return job
+    job = _shard_checks(job, size)
     factor = size[0] // size[1]
     out = list(job)
     sliced = any("matrix.slice" in _code(ln) for ln in job)

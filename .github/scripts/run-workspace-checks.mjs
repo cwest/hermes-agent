@@ -15,11 +15,14 @@
 //
 // This also runs on a laptop: `node .github/scripts/run-workspace-checks.mjs`.
 // `--concurrency N` sets the limit. `--list` prints the units and exits.
+// `--shard i/n` keeps every n-th unit, for a check split across n jobs.
 
 import { execFileSync, spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { availableParallelism } from 'node:os'
 import { join, relative } from 'node:path'
+
+import { shardUnits } from './workspace-check-shards.mjs'
 
 const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
 const PNPM = 'pnpm'
@@ -90,6 +93,23 @@ async function main() {
       '::error::No workspace package declares a check script — refusing to report green having run nothing.',
     )
     process.exit(1)
+  }
+
+  // n jobs on smaller runners together run the full list once. A shard left with no units has
+  // nothing to check.
+  const shardIdx = argv.indexOf('--shard')
+  if (shardIdx !== -1) {
+    const spec = argv[shardIdx + 1]
+    try {
+      units.splice(0, units.length, ...shardUnits(units, spec))
+    } catch (err) {
+      console.error(`::error::${err.message}`)
+      process.exit(1)
+    }
+    if (units.length === 0) {
+      console.log(`shard ${spec} has no checks`)
+      return
+    }
   }
 
   if (argv.includes('--list')) {
