@@ -8,8 +8,9 @@
  * @returns {T[]}
  */
 export function shardUnits(units, spec) {
-  const [index, total] = String(spec).split('/').map(Number)
-  if (!(Number.isInteger(index) && Number.isInteger(total) && index >= 1 && index <= total)) {
+  const match = /^([1-9]\d*)\/([1-9]\d*)$/.exec(String(spec))
+  const [index, total] = match ? [Number(match[1]), Number(match[2])] : [0, 0]
+  if (!(match && index <= total)) {
     throw new RangeError(`--shard takes i/n with 1 <= i <= n, got ${spec}`)
   }
   return units.filter((_, k) => k % total === index - 1)
