@@ -11,7 +11,7 @@ on:
 
 jobs:
   check:
-    name: JS & TS checks
+    name: JS & TS checks (${{ matrix.shard }}/4)
     # One 16-core job replaces a 14-leg matrix (32 cores measured only 4%
     # faster, 8 cores 64% slower). The matrix spread about 612s of check
     # payload over 4-core runners. It paid about 371s of repeated setup to do
@@ -20,6 +20,10 @@ jobs:
     # One larger runner installs one time. vitest, tsc and eslint each size
     # their own worker pool from the core count.
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]  # fork: hosted runner; upstream one job
     timeout-minutes: 90  # fork: hosted runner; upstream 30
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
@@ -135,7 +139,9 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: just check-js-ci
+        run: node .github/scripts/run-workspace-checks.mjs --shard ${{ matrix.shard }}/4 --concurrency 1  # fork: hosted runner; upstream just check-js-ci
+        env:
+          VITEST_MAX_WORKERS: 4  # fork: hosted runner; upstream the core count
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
         # leaves an untracked or modified file in the checkout is reported here. Runs only when
