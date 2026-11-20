@@ -39,6 +39,25 @@ def test_the_list_reads_ids_and_ignores_comments(tmp_path):
     assert timing_bound.listed(path) == {"tests/a.py::test_x", "tests/b.py::C::test_y"}
 
 
+def test_the_rule_matches_a_named_wall_clock_bound_only():
+    src = (
+        "import time\n"
+        "def test_scan_is_linear():\n    t = time.perf_counter()\n"
+        "class TestX:\n    def test_fails_fast(self):\n        time.monotonic()\n"
+        "def test_fast_but_untimed():\n    pass\n"
+        "def test_timed_but_unnamed():\n    time.perf_counter()\n"
+    )
+    assert timing_bound.rule_matches(src, "tests/a.py") == ["tests/a.py::test_scan_is_linear",
+                                                           "tests/a.py::TestX::test_fails_fast"]
+
+
+def test_every_test_the_rule_matches_is_listed():
+    """The list holds every test in the sliced suite's tree that ``rule_matches`` finds, so a new
+    wall-clock guard cannot land in the parallel lanes unlisted."""
+    found = timing_bound.rule_matches_under(ROOT)
+    assert sorted(set(found) - timing_bound.listed()) == []
+
+
 def _collect(files: list[str], *mode: str) -> list[str]:
     ran = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", *mode, *files],
