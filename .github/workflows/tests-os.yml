@@ -84,27 +84,150 @@ jobs:
         include:
           # Two slices: on the old free standard runner (3 cores, 3 workers) one lane ran
           # ~7.5 min and became the slowest required job once the Linux suite split.
-          - name: macOS-only tests (1/2)
+          - name: macOS-only tests (1/8)
             runner: macos-latest
             marker: macos
-            slice: 1/2
-          - name: macOS-only tests (2/2)
+            slice: 1/8  # fork: hosted runner; upstream 1/2
+          - name: macOS-only tests (2/8)
             runner: macos-latest
             marker: macos
-            slice: 2/2
-          - name: Windows-only tests
+            slice: 2/8  # fork: hosted runner; upstream 1/2
+          - name: macOS-only tests (3/8)
+            runner: macos-latest
+            marker: macos
+            slice: 3/8  # fork: hosted runner; upstream 1/2
+          - name: macOS-only tests (4/8)
+            runner: macos-latest
+            marker: macos
+            slice: 4/8  # fork: hosted runner; upstream 1/2
+          - name: macOS-only tests (5/8)
+            runner: macos-latest
+            marker: macos
+            slice: 5/8  # fork: hosted runner; upstream 2/2
+          - name: macOS-only tests (6/8)
+            runner: macos-latest
+            marker: macos
+            slice: 6/8  # fork: hosted runner; upstream 2/2
+          - name: macOS-only tests (7/8)
+            runner: macos-latest
+            marker: macos
+            slice: 7/8  # fork: hosted runner; upstream 2/2
+          - name: macOS-only tests (8/8)
+            runner: macos-latest
+            marker: macos
+            slice: 8/8  # fork: hosted runner; upstream 2/2
+          - name: Windows-only tests (1/8)
             runner: windows-latest
             marker: windows
-          - name: Windows-only tests (arm64, 1/2)
+            slice: 1/8  # fork: hosted runner; upstream 1/1
+          - name: Windows-only tests (2/8)
+            runner: windows-latest
+            marker: windows
+            slice: 2/8  # fork: hosted runner; upstream 1/1
+          - name: Windows-only tests (3/8)
+            runner: windows-latest
+            marker: windows
+            slice: 3/8  # fork: hosted runner; upstream 1/1
+          - name: Windows-only tests (4/8)
+            runner: windows-latest
+            marker: windows
+            slice: 4/8  # fork: hosted runner; upstream 1/1
+          - name: Windows-only tests (5/8)
+            runner: windows-latest
+            marker: windows
+            slice: 5/8  # fork: hosted runner; upstream 1/1
+          - name: Windows-only tests (6/8)
+            runner: windows-latest
+            marker: windows
+            slice: 6/8  # fork: hosted runner; upstream 1/1
+          - name: Windows-only tests (7/8)
+            runner: windows-latest
+            marker: windows
+            slice: 7/8  # fork: hosted runner; upstream 1/1
+          - name: Windows-only tests (8/8)
+            runner: windows-latest
+            marker: windows
+            slice: 8/8  # fork: hosted runner; upstream 1/1
+          - name: Windows-only tests (arm64, 1/16)
             runner: windows-11-arm
             marker: windows
             timeout: 60
-            slice: 1/2
-          - name: Windows-only tests (arm64, 2/2)
+            slice: 1/16  # fork: hosted runner; upstream 1/2
+          - name: Windows-only tests (arm64, 2/16)
             runner: windows-11-arm
             marker: windows
             timeout: 60
-            slice: 2/2
+            slice: 2/16  # fork: hosted runner; upstream 1/2
+          - name: Windows-only tests (arm64, 3/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 3/16  # fork: hosted runner; upstream 1/2
+          - name: Windows-only tests (arm64, 4/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 4/16  # fork: hosted runner; upstream 1/2
+          - name: Windows-only tests (arm64, 5/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 5/16  # fork: hosted runner; upstream 1/2
+          - name: Windows-only tests (arm64, 6/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 6/16  # fork: hosted runner; upstream 1/2
+          - name: Windows-only tests (arm64, 7/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 7/16  # fork: hosted runner; upstream 1/2
+          - name: Windows-only tests (arm64, 8/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 8/16  # fork: hosted runner; upstream 1/2
+          - name: Windows-only tests (arm64, 9/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 9/16  # fork: hosted runner; upstream 2/2
+          - name: Windows-only tests (arm64, 10/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 10/16  # fork: hosted runner; upstream 2/2
+          - name: Windows-only tests (arm64, 11/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 11/16  # fork: hosted runner; upstream 2/2
+          - name: Windows-only tests (arm64, 12/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 12/16  # fork: hosted runner; upstream 2/2
+          - name: Windows-only tests (arm64, 13/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 13/16  # fork: hosted runner; upstream 2/2
+          - name: Windows-only tests (arm64, 14/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 14/16  # fork: hosted runner; upstream 2/2
+          - name: Windows-only tests (arm64, 15/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 15/16  # fork: hosted runner; upstream 2/2
+          - name: Windows-only tests (arm64, 16/16)
+            runner: windows-11-arm
+            marker: windows
+            timeout: 60
+            slice: 16/16  # fork: hosted runner; upstream 2/2
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
@@ -211,7 +334,7 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '2' || '2') || '' }}  # fork: hosted runner; upstream ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
@@ -279,7 +402,7 @@ jobs:
             -m "platforms and integration" -v --tb=short -rA
         env:
           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
-          HERMES_TEST_WORKERS: '6'
+          HERMES_TEST_WORKERS: '3'  # fork: hosted runner; upstream '6'
           HERMES_TEST_FILE_TIMEOUT: '900'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''

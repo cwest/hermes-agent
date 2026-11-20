@@ -42,13 +42,13 @@ jobs:
     # 3x the price because files contend for the shared machine. Separate machines
     # scale linearly. run_tests_parallel.py partitions from the checkout alone, so
     # every slice agrees on the split without a planning job.
-    name: Run tests (${{ matrix.slice }}/3)
+    name: Run tests (${{ matrix.slice }}/24)
     runs-on: ubuntu-latest
     timeout-minutes: 90  # fork: hosted runner; upstream 30
     strategy:
       fail-fast: false
       matrix:
-        slice: [1, 2, 3]
+        slice: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]  # fork: hosted runner; upstream [1, 2, 3]
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
@@ -114,9 +114,9 @@ jobs:
         # set is identical to the list the removed matrix job used to pass in.
         run: just test-all
         env:
-          HERMES_TEST_SLICE: ${{ matrix.slice }}/3
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/24
           HERMES_TEST_FORKSERVER: "1"
-          HERMES_TEST_WORKERS: 32
+          HERMES_TEST_WORKERS: 4  # fork: hosted runner; upstream 32
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -246,7 +246,7 @@ jobs:
           # across unrelated SQLite, tenancy, provider and terminal suites.
           # Bound the trees, not the child readiness/turn timeouts. At 4 the
           # PTY turn and serve-SIGTERM deadlines still starved intermittently.
-          HERMES_TEST_WORKERS: "3"
+          HERMES_TEST_WORKERS: "2"  # fork: hosted runner; upstream "3"
           # Multi-process episodes (torture chamber, compaction kill -9,
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.
@@ -433,7 +433,7 @@ jobs:
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines. A
           # shard holds at most ~7 files, so this runs each shard in one wave.
-          HERMES_TEST_WORKERS: "6"
+          HERMES_TEST_WORKERS: "2"  # fork: hosted runner; upstream "6"
           HERMES_TEST_FILE_TIMEOUT: "3000"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
