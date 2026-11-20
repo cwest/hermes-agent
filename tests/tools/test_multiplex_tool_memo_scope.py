@@ -74,6 +74,8 @@ def test_skill_manage_schema_stable_but_creation_follows_active_profile(two_prof
     for home, create_dir in ((prof_a, "brain-a"), (prof_b, "brain-b")):
         with (home / "config.yaml").open("a", encoding="utf-8") as config:
             config.write(f"skills:\n  create_dir: {create_dir}\n")
+        # skill_manage refuses a skills.create_dir that is not an existing directory.
+        (home / create_dir).mkdir()
 
     def definition():
         return json.dumps(registry.get_definitions({"skill_manage"}, quiet=True))
