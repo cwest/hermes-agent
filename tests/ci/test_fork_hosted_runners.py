@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from ruamel.yaml import YAML
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "ci" / "fork_hosted_runners.py"
@@ -27,6 +28,10 @@ def _load():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _yaml(text: str):
+    return YAML(typ="safe").load(text)
 
 
 def _rewrite(text: str) -> str:
@@ -142,6 +147,35 @@ def test_cli_rewrites_a_tree_and_check_reports_drift(tmp_path):
     assert run("--check").returncode == 0
 
 
+def test_a_later_regeneration_sizes_from_upstreams_text_not_the_last_output(tmp_path):
+    """Each Fork-Regenerate replay runs the tool on top of the previous regeneration, whose
+    output a newer tool may extend (sizing came after the label rewrite). The Blacksmith labels
+    it sizes from are gone by then, so it reads upstream's workflows from the commit before the
+    first regeneration instead of the working tree."""
+    def git(*args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c",
+                        "commit.gpgsign=false", *args], cwd=tmp_path, check=True,
+                       capture_output=True)
+
+    def run(*args):
+        return subprocess.run([sys.executable, str(SCRIPT), "--root", str(tmp_path), *args],
+                              capture_output=True, text=True, check=False)
+
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "tests.yml").write_text(SLICED)
+    git("init", "-q")
+    git("add", "-A")
+    git("commit", "-q", "-m", "upstream")
+    # An older tool's output: labels rewritten, nothing sized.
+    (wf / "tests.yml").write_text(SLICED.replace("blacksmith-32vcpu-ubuntu-2404", "ubuntu-latest"))
+    git("commit", "-q", "-am", "regenerate\n\nFork-Regenerate: python3 scripts/ci/fork_hosted_runners.py")
+    assert run("--check").returncode == 1
+    assert run().returncode == 0
+    assert (wf / "tests.yml").read_text() == _rewrite(SLICED)
+    assert run("--check").returncode == 0
+
+
 def test_the_fork_tree_targets_only_runners_the_fork_has():
     """Every literal runner label in the committed workflows is GitHub-hosted."""
     ran = subprocess.run([sys.executable, str(SCRIPT), "--root", str(ROOT), "--check"],
@@ -155,3 +189,118 @@ def test_the_fork_tree_targets_only_runners_the_fork_has():
             if m and not HOSTED.match(m.group(1)):
                 bad.append(f"{path.relative_to(ROOT)}:{n}: {m.group(1)}")
     assert bad == []
+
+
+SLICED = """\
+jobs:
+  test:
+    name: Run tests (${{ matrix.slice }}/3)
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    strategy:
+      matrix:
+        slice: [1, 2, 3]
+    steps:
+      - name: Run tests
+        run: just test-all
+        env:
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/3
+          HERMES_TEST_WORKERS: 32
+          KEEP: 3
+"""
+
+OS_LANES = """\
+jobs:
+  os:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - name: macOS-only tests (1/2)
+            runner: blacksmith-12vcpu-macos-latest
+            marker: macos
+            slice: 1/2
+          - name: macOS-only tests (2/2)
+            runner: blacksmith-12vcpu-macos-latest
+            marker: macos
+            slice: 2/2
+          - name: Windows-only tests
+            runner: blacksmith-32vcpu-windows-2025
+            marker: windows
+    steps:
+      - name: Run ${{ matrix.marker }} tests
+        env:
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '16' || '' }}
+          HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
+"""
+
+
+def test_a_sliced_suite_keeps_upstreams_per_core_load():
+    data = _yaml(_rewrite(SLICED))
+    job = data["jobs"]["test"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["strategy"]["matrix"]["slice"] == list(range(1, 25))
+    assert job["name"] == "Run tests (${{ matrix.slice }}/24)"
+    env = job["steps"][0]["env"]
+    assert env["HERMES_TEST_SLICE"] == "${{ matrix.slice }}/24"
+    assert env["HERMES_TEST_WORKERS"] == 4
+    assert env["KEEP"] == 3
+
+
+def test_matrix_include_lanes_split_by_their_own_runner():
+    """A 12-vCPU macOS lane becomes 4 slices on 3-vCPU macos-latest; 32-vCPU Windows 8 on 4."""
+    data = _yaml(_rewrite(OS_LANES))
+    lanes = data["jobs"]["os"]["strategy"]["matrix"]["include"]
+    mac = [lane for lane in lanes if lane["marker"] == "macos"]
+    win = [lane for lane in lanes if lane["marker"] == "windows"]
+    assert [lane["slice"] for lane in mac] == [f"{i}/8" for i in range(1, 9)]
+    assert [lane["name"] for lane in mac] == [f"macOS-only tests ({i}/8)" for i in range(1, 9)]
+    assert {lane["runner"] for lane in mac} == {"macos-latest"}
+    assert [lane["slice"] for lane in win] == [f"{i}/8" for i in range(1, 9)]
+    assert [lane["name"] for lane in win] == [f"Windows-only tests ({i}/8)" for i in range(1, 9)]
+    assert {lane["runner"] for lane in win} == {"windows-latest"}
+    # 16 workers on 32 vCPUs is 2 on 4: the per-core ratio upstream chose for these files
+    env = data["jobs"]["os"]["steps"][0]["env"]
+    assert env["HERMES_TEST_WORKERS"] == "${{ matrix.marker == 'windows' && '2' || '' }}"
+
+
+def test_sizing_annotates_upstreams_value_and_is_idempotent():
+    mod = _load()
+    once = _rewrite(SLICED)
+    assert f"HERMES_TEST_WORKERS: 4  # {mod.TIMEOUT_MARK} 32" in once
+    assert f"slice: [{', '.join(map(str, range(1, 25)))}]  # {mod.TIMEOUT_MARK} [1, 2, 3]" in once
+    assert _rewrite(once) == once
+    assert _rewrite(_rewrite(OS_LANES)) == _rewrite(OS_LANES)
+
+
+def test_jobs_already_sized_for_a_small_runner_are_untouched():
+    small = SLICED.replace("blacksmith-32vcpu", "blacksmith-4vcpu")
+    out = _rewrite(small)
+    assert "HERMES_TEST_WORKERS: 32\n" in out
+    assert "slice: [1, 2, 3]\n" in out
+    assert "/3)" in out
+
+
+def test_sizing_stays_inside_the_job_whose_runner_shrank():
+    two = SLICED + """\
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Lint
+        env:
+          HERMES_TEST_WORKERS: 32
+"""
+    data = _yaml(_rewrite(two))
+    assert data["jobs"]["lint"]["steps"][0]["env"]["HERMES_TEST_WORKERS"] == 32
+    assert data["jobs"]["test"]["steps"][0]["env"]["HERMES_TEST_WORKERS"] == 4
+
+
+def test_the_committed_tree_is_the_rewrite_of_upstreams_workflows(tmp_path):
+    """--check over the committed tree is clean, so a resync regenerates the same files."""
+    ran = subprocess.run([sys.executable, str(SCRIPT), "--root", str(ROOT), "--check"],
+                         capture_output=True, text=True, check=False)
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    tests = _yaml((ROOT / ".github" / "workflows" / "tests.yml").read_text())
+    env = next(s for s in tests["jobs"]["test"]["steps"] if s.get("name") == "Run tests")["env"]
+    assert env["HERMES_TEST_WORKERS"] == 4
+    assert len(tests["jobs"]["test"]["strategy"]["matrix"]["slice"]) == 24
