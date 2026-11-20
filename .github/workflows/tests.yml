@@ -146,6 +146,10 @@ jobs:
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
     if: inputs.e2e
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2]  # fork: hosted runner; upstream one job
     timeout-minutes: 90  # fork: hosted runner; upstream 30
     steps:
       - name: Checkout code
@@ -226,6 +230,7 @@ jobs:
             *skipped*) echo "::error::messaging-gated gateway cases skipped: $summary"; exit 1 ;;
           esac
         env:
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/2  # fork: hosted runner; upstream one job
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
@@ -239,6 +244,7 @@ jobs:
           mapfile -t files < <(find tests/e2e -name 'test_*.py' -not -path 'tests/e2e/core/upgrade/*' | sort)
           scripts/run_tests.sh --include-integration "${files[@]}"
         env:
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/2  # fork: hosted runner; upstream one job
           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
           # An e2e file is a process tree, not one CPU-bound pytest worker. With
           # 32 files at once the hosted run starved live children before their
@@ -317,7 +323,7 @@ jobs:
     # suites below it (pm: PM environment lifecycle across updates, ...).
     # Its own job: it needs full history + tags, bubblewrap, and one file
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
-    name: e2e-upgrade (${{ matrix.shard }})
+    name: e2e-upgrade (${{ matrix.shard }}) (${{ matrix.slice }}/4)
     needs: e2e-upgrade-plan
     # 8 vCPU ran each moved shard within 13% of 16; git was already 11% slower on 16
     # than on 32 vCPU, so it was not halved again.
@@ -326,6 +332,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        slice: [1, 2, 3, 4]  # fork: hosted runner; upstream one job
         shard: ${{ fromJSON(needs.e2e-upgrade-plan.outputs.shards) }}
     steps:
       - name: Checkout code
@@ -428,6 +435,7 @@ jobs:
           printf 'shard %s: %s\n' "$SHARD" "${files[*]}"
           scripts/run_tests.sh --include-integration "${files[@]}"
         env:
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/4  # fork: hosted runner; upstream one job
           SHARD: ${{ matrix.shard }}
           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
           # Each file drives real installs/updaters (process trees plus uv and

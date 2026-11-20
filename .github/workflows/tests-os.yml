@@ -374,12 +374,16 @@ jobs:
     # files spawn their own trees and must not share interpreter state. No retries: a
     # Windows race that passes on retry is still a race. Tracked Windows bugs are strict
     # xfails (per-file KNOWN tables), so a fix turns this job red until the entry goes.
-    name: Windows E2E (real processes)
+    name: Windows E2E (real processes) (${{ matrix.slice }}/2)
     if: inputs.e2e
     # Seven files, six at a time, each spawning process trees; on the 4-vCPU image the
     # suite step took 153-171 s (job 4.7-5.6 min), on 32 cores 124 s (job 3.1 min). 8 cores
     # measured as fast as 32 (job 3.4 vs 3.45 min).
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2]  # fork: hosted runner; upstream one job
     timeout-minutes: 75  # fork: hosted runner; upstream 25
     steps:
       - name: Checkout code
@@ -401,6 +405,7 @@ jobs:
           scripts/run_tests.sh tests/e2e/core/windows/ -- \
             -m "platforms and integration" -v --tb=short -rA
         env:
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/2  # fork: hosted runner; upstream one job
           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
           HERMES_TEST_WORKERS: '3'  # fork: hosted runner; upstream '6'
           HERMES_TEST_FILE_TIMEOUT: '900'
