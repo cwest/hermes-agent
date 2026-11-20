@@ -53,12 +53,18 @@ def configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", f"{MARK}: a wall-clock guard listed in tests/timing_bound.txt")
 
 
+def mode(config: pytest.Config) -> str:
+    """The run's ``--timing-bound`` mode; ``all`` where only the collection hook was borrowed
+    (a test's own conftest re-exporting it without ``pytest_addoption``)."""
+    return config.getoption("--timing-bound", default="all")
+
+
 def modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     ids = listed()
     for item in items:
         if is_listed(item.nodeid, ids):
             item.add_marker(MARK)
-    kept, dropped = partition([i.nodeid for i in items], ids, config.getoption("--timing-bound"))
+    kept, dropped = partition([i.nodeid for i in items], ids, mode(config))
     if dropped:
         keep = set(kept)
         config.hook.pytest_deselected(items=[i for i in items if i.nodeid not in keep])
