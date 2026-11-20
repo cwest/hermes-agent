@@ -45,6 +45,12 @@ _UPLOAD = "actions/upload-artifact@"
 # Steps that check a file only one test file writes: test_crash_cells.py, first in sort order,
 # so always in slice 1 (tests/ci/test_fork_hosted_runners.py holds that).
 _FIRST_SLICE_STEPS = {"Every crash cell ran"}
+# The full suite's wall-clock guards (tests/_fixtures/timing_bound.py) leave the sliced job for
+# one single-worker job: a linear-time bound must not share the runner's cores.
+_SUITE_CMD = "just test-all"
+_SUITE_RUN = re.compile(rf"^(\s*)run:\s*{re.escape(_SUITE_CMD)}\s*$")
+_SLICE_ENV = re.compile(r"^\s*HERMES_TEST_SLICE:")
+_TIMING_LIST = "tests/timing_bound.txt"
 
 
 def _code(line: str) -> str:
@@ -276,6 +282,72 @@ def _slice_suite(job: list[str], size: tuple[int, int]) -> list[str]:
     return out
 
 
+def _timing_bound_job(job: list[str]) -> list[str]:
+    """A sliced full-suite job's wall-clock guards (tests/timing_bound.txt) as one job at one
+    worker: on a small runner a linear-time bound otherwise times the CPU contention of the
+    other test files sharing its cores. Returns ``job`` with the guards deselected, then the
+    new job; ``job`` alone when it is not the full-suite run."""
+    at = next((k for k, ln in enumerate(job) if _SUITE_RUN.match(ln)), None)
+    if at is None or not any("matrix.slice" in _code(ln) for ln in job):
+        return job
+    run = _SUITE_RUN.match(job[at])
+    assert run
+    suite = list(job)
+    suite[at] = f"{run[1]}run: {_RUN_TESTS} -- --timing-bound=exclude  # {MARK} {_SUITE_CMD}"
+    lone = list(job)
+    lone[at] = (f"{run[1]}run: {_RUN_TESTS} $(grep -o '^tests/[^:]*' {_TIMING_LIST} | sort -u)"
+                f" -- --timing-bound=only  # {MARK} in the suite")
+    lone = [ln for k, ln in enumerate(lone)
+            if not (k > at and _SLICE_ENV.match(ln) and _belongs(lone, at, k))]
+    lone = [_one_worker(ln) if k > at and _belongs(lone, at, k) else ln for k, ln in enumerate(lone)]
+    lone[0] = re.sub(r"^(  [\w-]+)(:)", r"\1-timing-bound\2", lone[0])
+    for k, line in enumerate(lone):
+        n = _JOB_NAME.match(line)
+        if n:
+            lone[k] = f"{n[1]}name: Run timing-bound tests (1 worker)  # {MARK} in the sliced suite"
+            break
+    s = next((k for k, ln in enumerate(lone) if _code(ln).strip() == "strategy:"), None)
+    if s is not None:
+        e = next((k for k in range(s + 1, len(lone))
+                  if lone[k].strip() and _indent(lone[k]) <= _indent(lone[s])), len(lone))
+        del lone[s:e]
+    for s, e in reversed(_step_spans(lone)):
+        if any("matrix.slice" in _code(ln) for ln in lone[s:e]):
+            del lone[s:e]
+    # Upstream's comments on the job and on its test step describe the sliced suite.
+    step = next((s, e) for s, e in _step_spans(lone) if any("--timing-bound" in ln for ln in lone[s:e]))
+    head = next(k for k, ln in enumerate(lone) if k and ln.strip() and not ln.lstrip().startswith("#"))
+    lone = [ln for k, ln in enumerate(lone)
+            if not (ln.lstrip().startswith("#") and (0 < k < head or step[0] < k < step[1]))]
+    lone.insert(1, f"    # fork: one job at one worker for the wall-clock guards in {_TIMING_LIST},")
+    lone.insert(2, "    # which the sliced suite deselects (tests/_fixtures/timing_bound.py).")
+    lone = [ln for k, ln in enumerate(lone) if ln.strip() or (k and lone[k - 1].strip())]
+    # Blank and comment lines after the job introduce the next one; they stay after the new job.
+    suite_end = len(_trim(suite))
+    return [*suite[:suite_end], "", *_trim(lone), *suite[suite_end:]]
+
+
+def _trim(lines: list[str]) -> list[str]:
+    end = len(lines)
+    while end > 1 and (not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")):
+        end -= 1
+    return lines[:end]
+
+
+def _belongs(lines: list[str], at: int, k: int) -> bool:
+    """Whether line ``k`` sits inside the step whose ``run:`` is line ``at``."""
+    step = next(((s, e) for s, e in _step_spans(lines) if s <= at < e), None)
+    return step is not None and step[0] <= k < step[1]
+
+
+def _one_worker(line: str) -> str:
+    m = _WORKERS.match(line)
+    if not m:
+        return line
+    upstream = m[2].split(f"# {MARK}", 1)[-1].strip() if MARK in m[2] else m[2]
+    return f"{m[1]}1  # {MARK} {upstream}"
+
+
 def _size_job(job: list[str]) -> list[str]:
     size = _runner_size(job)
     if size is None:
@@ -304,7 +376,7 @@ def _size_job(job: list[str]) -> list[str]:
             entry_size = _runner_size(out[start:end])
             if entry_size and entry_size[0] // entry_size[1] > 1:
                 out[start:end] = _split_entry(out[start:end], entry_size[0] // entry_size[1])
-    return out
+    return _timing_bound_job(out) if factor > 1 else out
 
 
 def size_jobs(text: str) -> str:
