@@ -157,6 +157,16 @@ def install_cua_driver(upgrade: bool = False, show_installer_progress: bool = Tr
         if result.returncode:
             _print_output_tail(result)
             return _fail("    cua-driver macOS app registration failed.")
+        if not override:
+            # cua-driver launches its daemon from /Applications/CuaDriver.app, so that path must be
+            # the pinned app, not a stale standalone install that would own the daemon socket.
+            from pm.cua_app_link import sync_installed_app_link
+
+            status = sync_installed_app_link()
+            if status and status.startswith("⚠"):
+                _print_warning(f"    {status}")
+            elif status and show_installer_progress:
+                _print_info(f"    {status}")
     if show_installer_progress:
         _print_success(f"    cua-driver ready: {contract.get('version') or 'unknown version'}.")
         _print_cua_platform_notes(sys.platform == "win32", sys.platform == "linux",
