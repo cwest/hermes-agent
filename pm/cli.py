@@ -241,6 +241,12 @@ def _install_names(names: list[str], target: str | None = None, *, verify: bool 
                         publish_launchers(repo_root(), create=False)
                     progress.finish()
                     print(f"✓ {name}", flush=True)
+                    if name == "cua-driver":
+                        from pm.cua_app_link import sync_installed_app_link
+
+                        status = sync_installed_app_link()
+                        if status:
+                            print(f"  {status}", flush=True)
             except InstallError as e:
                 progress.finish()
                 print(f"✗ {e}", flush=True)
@@ -585,7 +591,11 @@ def _gc_store(store, facts) -> tuple[int, int]:
 
         facts.forget(RETIRED_DEFAULTS)
         facts.drop_dead_pins(_live_pin(store, _lockfile()))
-        keep = facts.entries_in_use()
+        from pm.cua_app_link import linked_store_entries
+
+        # /Applications/CuaDriver.app links into an entry; deleting it would dangle the link the
+        # daemon launches from. A re-pointed link releases the old entry on the next sweep.
+        keep = facts.entries_in_use() | linked_store_entries(store.root)
         collect_partials(partials_dir)
         removed += _reclaim_set_aside(store)
         for item in sorted(store.root.iterdir()):

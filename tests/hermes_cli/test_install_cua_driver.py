@@ -235,6 +235,34 @@ def test_setup_registers_only_the_validated_selected_app(monkeypatch, tmp_path):
 
 
 @pytest.mark.platforms("macos")
+def test_setup_points_the_system_app_path_at_the_pm_pin(monkeypatch, tmp_path):
+    """cua-driver launches its daemon from /Applications/CuaDriver.app: install must own that link."""
+    import pm
+    from hermes_cli import tools_config_cua as cua
+    from pm import cua_app_link
+    from tools.computer_use import cua_backend_daemon as daemon
+
+    app = tmp_path / "store" / "cua-driver-9.9.9-darwin-arm64" / "CuaDriver.app"
+    driver = app / "Contents" / "MacOS" / "cua-driver"
+    driver.parent.mkdir(parents=True)
+    driver.write_text("#!/bin/sh\nexit 0\n")
+    driver.chmod(0o755)
+    link = tmp_path / "Applications" / "CuaDriver.app"
+    link.parent.mkdir()
+    link.symlink_to(tmp_path / "store" / "cua-driver-0.1.0-darwin-arm64" / "CuaDriver.app")  # dangling
+    monkeypatch.setattr(cua_app_link, "SYSTEM_APP", link)
+    monkeypatch.delenv("HERMES_CUA_DRIVER_CMD", raising=False)
+    monkeypatch.setattr(pm, "ensure", lambda *a, **kw: None)
+    monkeypatch.setattr(cua, "_resolved_cua_driver_cmd", lambda: str(driver))
+    monkeypatch.setattr(cua_app_link, "selected_app", lambda: (app, "9.9.9"))
+    monkeypatch.setattr(cua, "_cua_driver_contract_status", lambda *a: {"ready": True})
+    with patch.object(daemon, "_validate_cua_driver_app_signature"), \
+         patch.object(cua, "_run_text", return_value=SimpleNamespace(returncode=0)):
+        assert cua.install_cua_driver(show_installer_progress=False)
+    assert link.is_symlink() and link.resolve() == app.resolve()
+
+
+@pytest.mark.platforms("macos")
 def test_setup_keeps_permission_guidance(capsys):
     from hermes_cli.tools_config_cua import _print_cua_platform_notes
 
