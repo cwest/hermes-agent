@@ -494,6 +494,7 @@ def _pin_kanban_pr_state(request, monkeypatch):
     except ImportError:
         return
     monkeypatch.setattr(_kps, "resolve_pr_state", lambda _url: "unknown")
+    monkeypatch.setattr(_kps, "resolve_pr_head", lambda _url: None)
 
 
 @pytest.fixture(autouse=True)

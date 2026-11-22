@@ -248,3 +248,25 @@ def test_resolver_fails_open_to_unknown(monkeypatch, kwargs) -> None:
 def test_tests_never_reach_gh_without_opting_in() -> None:
     """The autouse pin keeps every other test on the old always-guard answer."""
     assert kps.resolve_pr_state(OPEN_PR) == "unknown"
+    assert kps.resolve_pr_head(OPEN_PR) is None
+
+
+@pytest.mark.real_pr_state
+def test_head_resolver_reads_the_head_commit(monkeypatch) -> None:
+    seen = _fake_run(monkeypatch, stdout='{"headRefOid": "1C4BCE7B2023D8993E8BB75047EB207EC9A2EA0A"}')
+    assert kps.resolve_pr_head(OPEN_PR) == "1c4bce7b2023d8993e8bb75047eb207ec9a2ea0a"
+    assert seen == [["gh", "pr", "view", OPEN_PR, "--json", "headRefOid"]]
+
+
+@pytest.mark.real_pr_state
+@pytest.mark.parametrize("kwargs", [
+    {"returncode": 1, "stderr": "error connecting to api.github.com"},
+    {"stdout": "not json"},
+    {"stdout": '{"headRefOid": 7}'},
+    {"stdout": '{"headRefOid": "main"}'},
+    {"raises": FileNotFoundError("gh")},
+    {"raises": subprocess.TimeoutExpired(["gh"], 20)},
+])
+def test_head_resolver_fails_open_to_none(monkeypatch, kwargs) -> None:
+    _fake_run(monkeypatch, **kwargs)
+    assert kps.resolve_pr_head(OPEN_PR) is None
