@@ -7,6 +7,7 @@ in ``TMPDIR``); a helper script one wrote there under a fixed name was run by th
 import json
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -159,10 +160,12 @@ def test_bound_worker_process_moves_its_temp_space_into_the_task_dir(tmp_path, m
                "run_id": task.current_run_id, "claim_lock": task.claim_lock, "workspace": str(workspace),
                "workspaces_root": str(tmp_path / "wsroot"), "profile": "default", "branch": None,
                "tenant": None, "goal_mode": False, "max_runtime_seconds": None}
+    turns_done = threading.Event()
+    monkeypatch.setattr(session_kanban, "_TURNS_DONE", turns_done)
     try:
         session_kanban.bind_worker_context({"policy": {"source": "kanban", "kanban_json": json.dumps(context)}})
     finally:
-        session_kanban._TURNS_DONE.set()  # stops the submitter watcher thread the bind started
+        turns_done.set()  # stops the submitter watcher thread the bind started
 
     expected = str(kanban_task_scratch_dir(task_id, tmp_path))
     assert os.environ["TMPDIR"] == os.environ["TMP"] == os.environ["TEMP"] == expected
