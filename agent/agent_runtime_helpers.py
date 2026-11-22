@@ -19,6 +19,7 @@ from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import _FULL_ARGS_LOG_BOUND, coerce_tool_name
 from session_rules.turns import coalesce_tool_call_id, tool_call_id_variants, tool_result_id_variants
 from agent.cache_bounds import publish_lru
+from agent.litellm_proxy import is_litellm_route
 from agent.agent_init_session import agent_interface
 from agent.prompt_builder import steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
@@ -1241,19 +1242,6 @@ def plan_cache_sections_for_destination(
     return plan.messages, plan.tools
 
 
-def _is_litellm_route(provider_lower: str, base_url: str) -> bool:
-    """True when a route is a LiteLLM proxy: ``litellm`` as a whole delimited token (not
-    substring) in the provider id or host; a path segment never qualifies."""
-    return _has_litellm_token(provider_lower, ":-_/") or _has_litellm_token(base_url_hostname(base_url), ".-")
-
-
-def _has_litellm_token(value: str, delimiters: str) -> bool:
-    """True when ``value`` contains ``litellm`` as a whole delimited token."""
-    if not value:
-        return False
-    return "litellm" in value.translate(str.maketrans(delimiters, " " * len(delimiters))).split()
-
-
 def _moa_aggregator_cache_policy(agent, eff_model: str) -> tuple[bool, bool]:
     """MoA virtual provider: resolve the policy from the preset's real aggregator slot (the
     virtual provider matches no caching branch and would silently lose caching)."""
@@ -1356,7 +1344,7 @@ def anthropic_prompt_cache_policy(
     # for the two transports this planner handles, not Responses/Bedrock.
     supports_cache_markers = eff_api_mode in {"anthropic_messages", "chat_completions"}
     litellm_openai_wire = (
-        eff_api_mode == "chat_completions" and is_claude and _is_litellm_route(provider_lower, eff_base_url)
+        eff_api_mode == "chat_completions" and is_claude and is_litellm_route(provider_lower, eff_base_url)
     )
     if supports_cache_markers and (
         is_anthropic_wire

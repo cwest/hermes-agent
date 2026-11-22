@@ -29,9 +29,9 @@ def envelope_tool_part_cache_markers_supported(provider: str | None, base_url: s
     block; LiteLLM-style proxies copy parts verbatim, so it lands at ``tool_result.content[0]``
     (non-retryable 400). There, role:tool carries no part markers and the budget reallocates.
     """
-    from agent.agent_runtime_helpers import _is_litellm_route
+    from agent.litellm_proxy import is_litellm_route
 
-    return not _is_litellm_route((provider or "").strip().lower(), base_url or "")
+    return not is_litellm_route((provider or "").strip().lower(), base_url or "")
 
 
 def is_one_shot_request(messages: list[dict[str, Any]] | None, tools: list[dict[str, Any]] | None) -> bool:
