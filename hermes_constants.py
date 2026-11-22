@@ -1114,6 +1114,38 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     return scratch
 
 
+KANBAN_TASK_ENV = "HERMES_KANBAN_TASK"
+_KANBAN_SCRATCH_PREFIX = "kanban-"
+_UNSAFE_SCRATCH_NAME = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def kanban_task_scratch_dir(task_id: str, home: str | Path | None = None) -> Path:
+    """``<scratch>/kanban-<task_id>`` (created): one Kanban task's own temp space.
+
+    Concurrent workers of one profile otherwise share the profile's scratch dir, so a helper one
+    writes there under a fixed name is run by the other. Each task's dir is a top-level scratch
+    entry, so the idle prune retires it on its own once the task stops writing to it, never held
+    back by a sibling task that is still live. *task_id* is reduced to one safe path component.
+    """
+    base = Path(home) if home is not None else get_hermes_home()
+    root = get_scratch_dir(base)
+    path = root / (_KANBAN_SCRATCH_PREFIX + _UNSAFE_SCRATCH_NAME.sub("_", task_id.strip()))
+    try:
+        path.mkdir(exist_ok=True)
+        if sys.platform != "win32":
+            apply_secure_dir_policy(path, home=base)
+    except OSError:
+        pass
+    return path
+
+
+def get_session_scratch_dir() -> Path:
+    """The scratch dir this process should use: its Kanban task's own dir inside a worker
+    (``HERMES_KANBAN_TASK`` set), the profile's shared scratch dir everywhere else."""
+    task = os.environ.get(KANBAN_TASK_ENV, "").strip()
+    return kanban_task_scratch_dir(task) if task else get_scratch_dir()
+
+
 def prune_scratch_dir(scratch: Path | None = None, max_idle_hours: float = SCRATCH_MAX_IDLE_HOURS) -> int:
     """Delete top-level scratch entries with no write anywhere in their subtree for
     *max_idle_hours*, reaping processes and git worktree registrations rooted in them
@@ -1165,15 +1197,21 @@ def apply_scratch_tmp_env(env: MutableMapping[str, str]) -> bool:
     because it equals ``HERMES_SCRATCH_DIR`` — is re-derived, so a child running under another
     profile's home gets that home's scratch dir rather than its parent's. Returns True when
     the vars were (re)written.
+
+    A Kanban worker's env (``HERMES_KANBAN_TASK`` set) always gets its task's own dir
+    (:func:`kanban_task_scratch_dir`), even over an inherited temp var: the OS default is as
+    shared between concurrent workers as the profile's scratch dir.
     """
+    task = env.get(KANBAN_TASK_ENV, "").strip()
     ours = env.get(SCRATCH_DIR_MARKER_ENV, "")
     for key in SCRATCH_TMP_ENV_VARS:
         value = env.get(key, "").strip()
-        if value and value != ours:
+        if value and value != ours and not task:
             return False
     home = env.get("HERMES_HOME", "").strip()
     try:
-        scratch = str(get_scratch_dir(_expand_hermes_home(home) if home else get_process_hermes_home()))
+        base = _expand_hermes_home(home) if home else get_process_hermes_home()
+        scratch = str(kanban_task_scratch_dir(task, base) if task else get_scratch_dir(base))
     except (RuntimeError, OSError):
         # No HERMES_HOME and no resolvable user home (a child env built from nothing on
         # Windows): there is no scratch dir to point at; the child keeps the OS default.

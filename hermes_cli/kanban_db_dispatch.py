@@ -2616,13 +2616,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # The task's own scratch dir, never the profile's shared one: concurrent cards of one profile
+    # otherwise write and run each other's same-named helper scripts there.
+    from hermes_constants import apply_scratch_tmp_env
+    apply_scratch_tmp_env(env)
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"
-    # TERMINAL_CWD takes precedence over process cwd in file_tools and
-    # build_context_files_prompt; without it relative writes land in the gateway
-    # user's home and workers load the gateway's AGENTS.md. file_tools rejects
-    # relative / sentinel values, so only set a real absolute directory.
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and context-file loader anchor on
     # the workspace, not whatever cwd the dispatching gateway happened to export. The worker subprocess is
     # already launched with cwd=workspace, but TERMINAL_CWD takes precedence over the process cwd in both

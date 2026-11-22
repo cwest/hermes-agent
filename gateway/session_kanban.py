@@ -213,6 +213,9 @@ def bind_worker_context(frame):
         env['HERMES_KANBAN_CLAIM_TTL_SECONDS'] = str(max(1, expires - int(claimed[1])))
     _watch_submitter(Path(context['db']), context['run_id'])
     os.environ.update(env)
+    # Temp space follows the claim: this task's own scratch dir, for this process and every child.
+    from hermes_constants import export_scratch_tmp_env
+    export_scratch_tmp_env()
     os.chdir(context['workspace'])
 
 

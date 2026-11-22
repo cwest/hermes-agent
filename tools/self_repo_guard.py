@@ -553,9 +553,9 @@ def detect_self_repo_git_mutation(
 
 
 def _block_message(operation: str, root: Path) -> str:
-    from hermes_constants import get_scratch_dir
+    from hermes_constants import get_session_scratch_dir
 
-    scratch = get_scratch_dir()
+    scratch = get_session_scratch_dir()
     return (
         f"Blocked: `{operation}` would rewrite Hermes's live source checkout "
         f"({root}) and can mix module versions in this running process. "
