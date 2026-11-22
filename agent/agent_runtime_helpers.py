@@ -1251,8 +1251,12 @@ def plan_cache_sections_for_destination(
 
 def _is_litellm_route(provider_lower: str, base_url: str) -> bool:
     """True when a route is a LiteLLM proxy: ``litellm`` as a whole delimited token (not
-    substring) in the provider id or host; a path segment never qualifies."""
-    return _has_litellm_token(provider_lower, ":-_/") or _has_litellm_token(base_url_hostname(base_url), ".-")
+    substring) in the provider id or host (a path segment never qualifies), or a local endpoint
+    that answers as LiteLLM (``127.0.0.1:4000`` names nothing, so it is probed once)."""
+    if _has_litellm_token(provider_lower, ":-_/") or _has_litellm_token(base_url_hostname(base_url), ".-"):
+        return True
+    from agent.model_metadata import is_litellm_proxy
+    return is_litellm_proxy(base_url)
 
 
 def _has_litellm_token(value: str, delimiters: str) -> bool:

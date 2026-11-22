@@ -781,6 +781,47 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     return result
 
 
+#: LiteLLM's proxy answers this route, unauthenticated, with exactly this JSON string.
+_LITELLM_LIVENESS_PATH = "/health/liveliness"
+_LITELLM_LIVENESS_BODY = "I'm alive!"
+_litellm_probe_cache: dict[str, tuple[bool, float]] = {}
+
+
+def is_litellm_proxy(base_url: str) -> bool:
+    """True when a LOCAL endpoint is a LiteLLM proxy, recognized by what it serves rather than its name.
+
+    A proxy on ``127.0.0.1:4000`` carries no ``litellm`` token in its host or provider id, so it is probed
+    once at LiteLLM's unauthenticated liveness route. Hosted endpoints are never probed. Verdicts are cached
+    like ``detect_local_server_type``'s: positive for an hour (and on disk), negative for five minutes in
+    memory only, so a proxy that was still starting is picked up soon after.
+    """
+    if not base_url or not is_local_endpoint(base_url):
+        return False
+    server_url = _server_root(_normalize_base_url(base_url))
+    cached = _litellm_probe_cache.get(server_url)
+    if cached is not None and (time.monotonic() - cached[1]) < (
+            _ENDPOINT_PROBE_TTL_SECONDS if cached[0] else _ENDPOINT_PROBE_FAILURE_TTL_SECONDS):
+        return cached[0]
+    if _endpoint_blackholed(server_url):
+        return False
+    if _local_probe_disk_get("litellm", server_url) is True:
+        _litellm_probe_cache[server_url] = (True, time.monotonic())
+        return True
+    import httpx
+    result = False
+    try:
+        with httpx.Client(timeout=2.0, verify=model_metadata_http.resolve_verify(base_url)) as client:
+            response = client.get(server_url + _LITELLM_LIVENESS_PATH)
+            result = response.status_code == 200 and response.json() == _LITELLM_LIVENESS_BODY
+    except Exception as exc:
+        if _is_connect_timeout(exc):
+            _note_endpoint_blackholed(server_url)
+    _litellm_probe_cache[server_url] = (result, time.monotonic())
+    if result:
+        _local_probe_disk_put("litellm", server_url, True)
+    return result
+
+
 # Cache the negative verdict in memory only (never on disk — a failure is often transient: server starting,
 # key being fixed) so the very next turn does not re-run the whole waterfall against an endpoint that just
 # answered nothing (#89863).
