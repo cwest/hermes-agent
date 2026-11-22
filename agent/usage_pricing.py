@@ -642,6 +642,38 @@ def _models_dev_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
     )
 
 
+_DECLARED_RATE_KEYS = ("input", "output", "cache_read", "cache_write")
+
+
+def _declared_route_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+    """Prices the user declared for this exact route + model in config
+    (``providers.<id>.models.<model>.pricing``, USD per million tokens). An endpoint such as a
+    local proxy publishes no rates, so without this every call on it is ``unknown``. One unusable
+    rate voids the whole declaration rather than under-counting."""
+    if not route.base_url or not route.model:
+        return None
+    from hermes_cli.config_providers import get_custom_provider_model_pricing
+
+    declared = get_custom_provider_model_pricing(route.model, route.base_url)
+    if not declared:
+        return None
+    rates: dict[str, Optional[Decimal]] = {}
+    for key in _DECLARED_RATE_KEYS:
+        raw = declared.get(key)
+        value = _to_decimal(raw)
+        if raw is not None and (value is None or not value.is_finite() or value < 0):
+            logger.warning("Ignoring declared pricing for %s: unusable %s rate %r", route.model, key, raw)
+            return None
+        rates[key] = value
+    if all(value is None for value in rates.values()):
+        return None
+    return PricingEntry(
+        input_cost_per_million=rates["input"], output_cost_per_million=rates["output"],
+        cache_read_cost_per_million=rates["cache_read"], cache_write_cost_per_million=rates["cache_write"],
+        source="user_override", pricing_version="config-declared",
+    )
+
+
 def get_pricing_entry(
     model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -649,6 +681,9 @@ def get_pricing_entry(
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
         return _INCLUDED_ENTRY
+    declared_entry = _declared_route_pricing_entry(route)
+    if declared_entry:
+        return declared_entry
     if route.provider == "openrouter":
         return _openrouter_pricing_entry(route)
 
