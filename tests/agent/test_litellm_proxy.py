@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
+import agent.litellm_proxy as lp
 import agent.model_metadata as mm
 from agent.agent_runtime_helpers import anthropic_prompt_cache_policy
 from agent.prompt_caching import build_prompt_cache_plan, envelope_tool_part_cache_markers_supported
@@ -30,7 +31,7 @@ def _server(routes: dict[str, tuple[int, bytes]]):
     hits: list[str] = []
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802 - http.server API
+        def do_GET(self):
             hits.append(self.path)
             status, body = routes.get(self.path, (404, b'{"detail":"Not Found"}'))
             self.send_response(status)
@@ -57,10 +58,10 @@ LITELLM = {"/health/liveliness": (200, b'"I\'m alive!"')}
 
 @pytest.fixture(autouse=True)
 def _fresh_probe_caches():
-    mm._litellm_probe_cache.clear()
+    lp._probe_cache.clear()
     mm._endpoint_blackhole_cache.clear()
     yield
-    mm._litellm_probe_cache.clear()
+    lp._probe_cache.clear()
 
 
 def _agent(base_url: str, model: str = "claude-opus-5-5", provider: str = "custom",
@@ -72,44 +73,44 @@ def _agent(base_url: str, model: str = "claude-opus-5-5", provider: str = "custo
 class TestIsLitellmProxy:
     def test_local_litellm_server_is_recognized(self):
         with _server(LITELLM) as (base_url, hits):
-            assert mm.is_litellm_proxy(base_url) is True
+            assert lp.is_litellm_proxy(base_url) is True
         assert hits == ["/health/liveliness"]
 
     def test_local_server_without_the_route_is_not_litellm(self):
         with _server({}) as (base_url, _):
-            assert mm.is_litellm_proxy(base_url) is False
+            assert lp.is_litellm_proxy(base_url) is False
 
     @pytest.mark.parametrize("body", [b'{"status": "ok"}', b'"healthy"', b"I'm alive and well, says vLLM"])
     def test_other_liveness_bodies_are_not_litellm(self, body):
         with _server({"/health/liveliness": (200, body)}) as (base_url, _):
-            assert mm.is_litellm_proxy(base_url) is False
+            assert lp.is_litellm_proxy(base_url) is False
 
     def test_unreachable_local_port_is_not_litellm(self):
         with _server({}) as (base_url, _):
             pass  # closed: nothing listens on the port any more
-        assert mm.is_litellm_proxy(base_url) is False
+        assert lp.is_litellm_proxy(base_url) is False
 
     def test_verdict_is_cached_per_server(self):
         with _server(LITELLM) as (base_url, hits):
-            assert mm.is_litellm_proxy(base_url) is True
-            assert mm.is_litellm_proxy(base_url.removesuffix("/v1")) is True
-            assert mm.is_litellm_proxy(base_url.replace("127.0.0.1", "localhost")) is True
+            assert lp.is_litellm_proxy(base_url) is True
+            assert lp.is_litellm_proxy(base_url.removesuffix("/v1")) is True
+            assert lp.is_litellm_proxy(base_url.replace("127.0.0.1", "localhost")) is True
         assert hits == ["/health/liveliness"]
 
     def test_positive_verdict_survives_a_new_process(self):
         with _server(LITELLM) as (base_url, hits):
-            assert mm.is_litellm_proxy(base_url) is True
-            mm._litellm_probe_cache.clear()  # what a fresh process starts with
-            assert mm.is_litellm_proxy(base_url) is True
+            assert lp.is_litellm_proxy(base_url) is True
+            lp._probe_cache.clear()  # what a fresh process starts with
+            assert lp.is_litellm_proxy(base_url) is True
         assert hits == ["/health/liveliness"]
 
     def test_negative_verdict_expires(self):
         with _server({}) as (base_url, hits):
-            assert mm.is_litellm_proxy(base_url) is False
+            assert lp.is_litellm_proxy(base_url) is False
             server = mm._server_root(base_url)
-            verdict, at = mm._litellm_probe_cache[server]
-            mm._litellm_probe_cache[server] = (verdict, at - mm._ENDPOINT_PROBE_FAILURE_TTL_SECONDS - 1)
-            assert mm.is_litellm_proxy(base_url) is False
+            verdict, at = lp._probe_cache[server]
+            lp._probe_cache[server] = (verdict, at - mm._ENDPOINT_PROBE_FAILURE_TTL_SECONDS - 1)
+            assert lp.is_litellm_proxy(base_url) is False
         assert hits == ["/health/liveliness", "/health/liveliness"]
 
     @pytest.mark.parametrize("base_url", [
@@ -117,7 +118,7 @@ class TestIsLitellmProxy:
     ])
     def test_hosted_and_blank_endpoints_are_never_probed(self, base_url):
         with patch("httpx.Client", side_effect=AssertionError("hosted endpoint was probed")):
-            assert mm.is_litellm_proxy(base_url) is False
+            assert lp.is_litellm_proxy(base_url) is False
 
 
 class TestCachePolicyOnLoopbackLitellm:
