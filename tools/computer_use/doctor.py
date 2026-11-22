@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 from contextlib import contextmanager, suppress
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -384,6 +385,55 @@ def _apply_stale_unit_guard(report: Report) -> Report:
                 report["overall"] = "degraded"
     return report
 
+def _apply_app_link_guard(report: Report, binary: str) -> Report:
+    """macOS: fail when ``/Applications/CuaDriver.app`` — the path cua-driver launches its daemon from — is missing,
+    dangling, resolves to another version than the pinned app, or is a different real bundle; and when the daemon
+    answering the socket runs another version than the pin. Either way computer_use talks to a driver it never
+    validated, while every binary-level check stays green. Skipped for a driver outside a CuaDriver.app (an
+    override, a dev build) and off macOS."""
+    from pm.cua_app_link import FIX_COMMAND, app_link_state, managed_here
+    from tools.computer_use.cua_backend_daemon import _resolve_cua_driver_app_path
+
+    checks = report.get("checks")
+    app = _resolve_cua_driver_app_path(binary) if managed_here() else None
+    if not app or not isinstance(checks, list):
+        return report
+    state = app_link_state(Path(app))
+    failed = not state.healthy
+    checks.append({"name": "app_link", "status": "fail" if failed else "pass", "message": state.describe(),
+                   **({"hint": state.fix()} if failed else {})})
+    owner = _socket_owner_version(binary)
+    want = state.expected_version
+    if owner and want and owner != want:
+        failed = True
+        checks.append({"name": "daemon_version", "status": "fail",
+                       "message": f"the cua-driver daemon on the socket is {owner}, not the pinned {want}",
+                       "hint": f"Run: {FIX_COMMAND}, then `{binary} stop` so the pinned app starts the daemon"})
+    elif owner and want:
+        checks.append({"name": "daemon_version", "status": "pass", "message": f"cua-driver daemon {owner} on the socket"})
+    if failed and report.get("overall") == "ok":  # fail-worse overalls are never softened
+        report["overall"] = "degraded"
+    return report
+
+def _socket_owner_version(binary: str) -> Optional[str]:
+    """Version of the executable serving the default daemon socket, from ``status``'s pid, or None when unknown."""
+    cp = _cli_text(binary, "status", timeout=5.0)
+    if isinstance(cp, BaseException) or cp.returncode != 0:
+        return None
+    m = re.search(r"^\s*pid:\s*(\d+)", cp.stdout or "", re.MULTILINE)
+    if not m:
+        return None
+    ps = _cli_text("/bin/ps", "-o", "comm=", "-p", m.group(1), timeout=5.0)
+    exe = _first_line(ps.stdout or "") if not isinstance(ps, BaseException) and ps.returncode == 0 else None
+    if not exe:
+        return None
+    from pm.cua_app_link import bundle_version
+    head, marker, _ = os.path.realpath(exe).partition(".app/Contents/MacOS/")
+    if marker:
+        return bundle_version(Path(head + ".app"))
+    status, version = _cli_driver_version(exe)
+    return version if status == "pass" else None
+
 def _wayland_environment_context(report: Report) -> Optional[Report]:
     """Linux+Wayland only: doctor probes the CLI process's environment, not the gateway's."""
     if report.get("platform") != "linux" or not os.environ.get("WAYLAND_DISPLAY"):
@@ -458,6 +508,7 @@ def run_doctor(driver_cmd: Optional[str] = None, *, include: Sequence[str] = (),
     report = _apply_stale_tcc_guard(report)
     report = _apply_stale_unit_guard(report)
     report = _apply_daemon_liveness_guard(report, binary)
+    report = _apply_app_link_guard(report, binary)
     identity = _build_identity(binary, report)
     environment = _wayland_environment_context(report)
     if json_output:

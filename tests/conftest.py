@@ -579,6 +579,17 @@ def _close_leaked_session_dbs():
 
 
 @pytest.fixture(autouse=True)
+def _neutralize_system_cua_app_link(tmp_path, monkeypatch):
+    """Point PM's /Applications/CuaDriver.app owner at a per-test path: an install-path test must never
+    re-point (or read) the developer's real link."""
+    try:
+        from pm import cua_app_link
+    except Exception:
+        return
+    monkeypatch.setattr(cua_app_link, "SYSTEM_APP", tmp_path / "_system_applications" / "CuaDriver.app")
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_webbrowser(monkeypatch):
     """Record browser-open attempts instead of opening real browser windows."""
     import webbrowser as _webbrowser
