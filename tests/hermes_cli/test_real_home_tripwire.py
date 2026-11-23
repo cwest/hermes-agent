@@ -216,6 +216,19 @@ def test_checkout_inside_a_guarded_root_is_not_hermes_state():
         guard.check(PROJECT_ROOT.parent / "config.yaml")
 
 
+def test_payload_manifest_probe_beside_a_checkout_inside_the_home_is_allowed():
+    """Importing any entry point asks ``pm.environments.payload_venv`` whether the
+    checkout is a sealed payload, which reads ``<checkout>/../manifest.json``. For a
+    checkout inside the guarded root that file sits in the home, yet reading it is the
+    installation's own layout probe, not Hermes state; writing it is still refused."""
+    from tests.home_io_guard import HomeIOGuard
+
+    guard = HomeIOGuard(lambda: [PROJECT_ROOT.parent])
+    guard.check(PROJECT_ROOT.parent / "manifest.json")
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(PROJECT_ROOT.parent / "manifest.json", destructive=True)
+
+
 @pytest.mark.parametrize("kind", ["environments", "test-environment"])
 def test_pm_generation_dir_around_the_running_venv_is_the_interpreter(tmp_path, kind):
     """scripts/run_tests.sh runs ``<home>/installs/<key>/<kind>/<gen>/venv`` with HOME pointed at the
