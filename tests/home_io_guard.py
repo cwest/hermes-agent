@@ -119,13 +119,7 @@ class HomeIOGuard:
                 entries = self._path_entries(path, cwd)
                 if os.path.dirname(absolute) in entries or any(_contains(absolute, entry) for entry in entries):
                     return
-            # The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
-            # stdlib source reads (linecache, traceback) are not Hermes state either, nor is
-            # realpath() walking up through its ancestors.
-            for prefix in _INTERPRETER_PREFIX_STRS:
-                if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
-                    return
-            if not destructive and absolute == _PAYLOAD_MANIFEST_PROBE:
+            if self._is_own_installation(absolute, metadata=metadata, destructive=destructive):
                 return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
@@ -145,6 +139,16 @@ class HomeIOGuard:
                     self.refuse(value)
         finally:
             self.checking.active = False
+
+    @staticmethod
+    def _is_own_installation(absolute, *, metadata, destructive):
+        """The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
+        stdlib source reads (linecache, traceback) are not Hermes state, nor is realpath()
+        walking up through its ancestors, nor reading the payload manifest beside the checkout."""
+        for prefix in _INTERPRETER_PREFIX_STRS:
+            if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
+                return True
+        return not destructive and absolute == _PAYLOAD_MANIFEST_PROBE
 
     def _refuse_installed_app_change(self, value, absolute):
         """Fail on a change to an installed app (already normalized, literal and resolved);
