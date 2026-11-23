@@ -176,7 +176,8 @@ def _cmd_run(args) -> int:
             f"auto: checked={auto.get('checked', 0)} "
             f"stale={auto.get('marked_stale', 0)} "
             f"archived={auto.get('archived', 0)} "
-            f"reactivated={auto.get('reactivated', 0)}")
+            f"reactivated={auto.get('reactivated', 0)} "
+            f"held={auto.get('skipped_referenced', 0)}")
     if not synchronous:
         print("llm pass running in background — check `hermes curator status` later")
     if dry:
@@ -366,8 +367,11 @@ def _idle_days(record: dict) -> Optional[int]:
 
 
 def _cmd_prune(args) -> int:
-    """Bulk-archive curator-managed skills idle for >= N days (pinned exempt, archived skipped)."""
+    """Bulk-archive curator-managed skills idle for >= N days. Pinned skills, skills a cron job references and
+    skills an open kanban card names are exempt (the automatic pass's rules); archived skills are skipped. If a
+    kanban board can't be read, nothing is archived."""
     from agent import curator
+    from agent.curator_card_refs import BoardUnreadable, card_referenced_skills
     from tools import skill_usage
     days = getattr(args, "days", None)
     if days is None:
@@ -375,12 +379,22 @@ def _cmd_prune(args) -> int:
     if days < 1:
         print(f"curator: --days must be >= 1 (got {days})", file=sys.stderr)
         return 2
-    candidates = [
+    cron = curator._cron_referenced_skills()
+    idle_rows = [
         (r["name"], idle) for r in skill_usage.curated_report()
-        if not (r.get("pinned") or r.get("state") == skill_usage.STATE_ARCHIVED)
+        if not (r.get("pinned") or r.get("state") == skill_usage.STATE_ARCHIVED or r["name"] in cron)
         and (idle := _idle_days(r)) is not None and idle >= days]
+    try:
+        cards = card_referenced_skills(name for name, _ in idle_rows)
+    except BoardUnreadable as e:
+        print(f"curator: archiving nothing — kanban board unreadable ({e})")
+        return 1
+    for name, _ in idle_rows:
+        if name in cards:
+            print(f"curator: keeping {name} — referenced by {', '.join(cards[name])}")
+    candidates = [(name, idle) for name, idle in idle_rows if name not in cards]
     if not candidates:
-        print(f"curator: nothing to prune (no unpinned skills idle >= {days}d)")
+        print(f"curator: nothing to prune (no unpinned, unreferenced skills idle >= {days}d)")
         return 0
     candidates.sort(key=lambda c: -c[1])
     print(f"curator: {len(candidates)} skill(s) idle >= {days}d:")
