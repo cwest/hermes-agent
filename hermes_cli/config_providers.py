@@ -606,6 +606,25 @@ def get_custom_provider_model_capability(
     return None
 
 
+def get_custom_provider_model_pricing(
+    model: str,
+    base_url: str,
+    custom_providers: Optional[list[dict[str, Any]]] = None,
+    config: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+    """Declared per-model ``pricing`` mapping (USD per million tokens) from a route-matching
+    entry, or ``None``. For endpoints such as a local proxy whose ``/models`` publishes no prices."""
+    from hermes_cli.config import load_config_readonly
+    if not model or not base_url:
+        return None
+    if custom_providers is None and config is None:
+        config = load_config_readonly()
+    for model_cfg in _route_model_cfgs(model, base_url, custom_providers, config):
+        pricing = model_cfg.get("pricing")
+        if isinstance(pricing, dict) and pricing:
+            return pricing
+    return None
+
+
 def is_provider_enabled(provider_cfg: Optional[dict[str, Any]]) -> bool:
     """Whether a ``providers.<name>`` block is enabled: default True; only an explicit
     ``enabled: false`` hides it from the picker, ``/models``, runtime resolver and doctor."""
