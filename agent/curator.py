@@ -207,10 +207,44 @@ def _archive_as_curator(_u, name: str) -> bool:
                 reset_ledger_actor(tok)
 
 
+def _record_archive_skip(name: str, reason: str, cards: Optional[list[str]] = None) -> None:
+    """Ledger the archive the curator declined, so `hermes curator ledger` shows why an idle skill survived."""
+    from tools import skill_ledger
+    skill_ledger.append_entry("skip-archive", name, actor="curator",
+                              evidence={"skipped": reason, **({"cards": cards} if cards else {})})
+
+
+class _CardReferenceGuard:
+    """Reads the board once, on the first archive candidate, so a pass with nothing to archive never opens it.
+    ``hold(name)`` returns the skip reason, or None when the archive may proceed."""
+
+    def __init__(self, candidates: list[str]):
+        self._candidates = candidates
+        self._refs: Optional[dict[str, list[str]]] = None
+        self._unreadable: Optional[str] = None
+
+    def hold(self, name: str) -> Optional[str]:
+        if self._refs is None and self._unreadable is None:
+            from agent.curator_card_refs import BoardUnreadable, card_referenced_skills
+            try:
+                self._refs = card_referenced_skills(self._candidates)
+            except BoardUnreadable as e:
+                # Fail toward keeping: an unread board may name any of these skills.
+                logger.warning("Curator archiving nothing this run: %s", e)
+                self._unreadable = f"skipped: kanban board unreadable ({e})"
+        if self._unreadable is not None:
+            return self._unreadable
+        cards = (self._refs or {}).get(name)
+        return f"skipped: referenced by {', '.join(cards)}" if cards else None
+
+    def cards(self, name: str) -> list[str]:
+        return (self._refs or {}).get(name, [])
+
+
 def apply_automatic_transitions(now: Optional[datetime] = None) -> dict[str, int]:
     """Move every curator-managed skill between active/stale/archived based on its latest real activity; pinned skills are
-    never touched. Built-ins are seeded with a baseline record on first sight so their inactivity clock starts NOW, not at epoch.
-    Returns a counter dict."""
+    never touched, and a skill an open kanban card names is never archived. Built-ins are seeded with a baseline record on
+    first sight so their inactivity clock starts NOW, not at epoch. Returns a counter dict."""
     from tools import skill_usage as _u
 
     now = now or datetime.now(UTC)
@@ -219,7 +253,9 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> dict[str, int
     # Cron-referenced skills are in use by definition (usage only bumps when a
     # job fires, so paused/rare jobs would age them out). Treat as pinned.
     protected = _cron_referenced_skills()
-    counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
+    counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0, "skipped_referenced": 0}
+    rows = _u.curated_report()
+    card_guard = _CardReferenceGuard([r["name"] for r in rows])
 
     def _set(name: str, state: str, key: str) -> None:
         _u.set_state(name, state)
@@ -227,7 +263,7 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> dict[str, int
 
     from tools.skill_lock import is_locked_skill
     locked_names = _u.locked_skill_names()  # keyed by directory; rows carry the frontmatter name
-    for row in _u.curated_report():
+    for row in rows:
         counts["checked"] += 1
         name = row["name"]
         if row.get("pinned") or name in protected or (locked_names and is_locked_skill(name, locked_names)):
@@ -255,7 +291,11 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> dict[str, int
                 _set(name, _u.STATE_ACTIVE, "reactivated")
             continue
         if anchor <= archive_cutoff and current != _u.STATE_ARCHIVED:
-            if _archive_as_curator(_u, name):
+            # Named by live work counts as use: hold it, and leave its stale/active state alone.
+            if reason := card_guard.hold(name):
+                _record_archive_skip(name, reason, card_guard.cards(name))
+                counts["skipped_referenced"] += 1
+            elif _archive_as_curator(_u, name):
                 counts["archived"] += 1
         elif anchor <= stale_cutoff and current == _u.STATE_ACTIVE:
             _set(name, _u.STATE_STALE, "marked_stale")
@@ -334,6 +374,10 @@ CURATOR_REVIEW_PROMPT = (
     "run. You MAY still consolidate it into an umbrella — but only because "
     "the curator rewrites cron job skill references to follow consolidations; "
     "never simply prune it.\n"
+    "3d. DO NOT archive, prune, or consolidate any skill marked `card=yes` in "
+    "the candidate list. An open kanban card names it: the card's worker will "
+    "load or edit it, and a force-loaded skill that is gone fails the spawn "
+    "outright.\n"
     "4. DO NOT use usage counters as a reason to skip consolidation. The "
     "counters are new and often mostly zero. Judge overlap on CONTENT, "
     "not on use_count. 'use=0' is not evidence a skill is valuable; it's "
@@ -816,7 +860,8 @@ def _render_report_markdown(p: dict[str, Any]) -> str:
         f"Agent-created skills: {counts.get('before', 0)} → {counts.get('after', 0)} ({counts.get('delta', 0):+d})\n",
         *([f"> ⚠ LLM pass error: `{error}`\n"] if error else []),
         "## Auto-transitions (pure, no LLM)\n", f"- checked: {auto.get('checked', 0)}", f"- marked stale: {auto.get('marked_stale', 0)}",
-        f"- archived (no LLM, pure time-based staleness): {auto.get('archived', 0)}", f"- reactivated: {auto.get('reactivated', 0)}", "",
+        f"- archived (no LLM, pure time-based staleness): {auto.get('archived', 0)}", f"- reactivated: {auto.get('reactivated', 0)}",
+        f"- archive held (named by an open kanban card, or board unreadable): {auto.get('skipped_referenced', 0)}", "",
         "## LLM consolidation pass\n",
         f"- tool calls: **{counts.get('tool_calls_total', 0)}** (by name: {', '.join(f'{k}={v}' for k, v in sorted(tc_counts.items())) or 'none'})",
         f"- consolidated into umbrellas: **{counts.get('consolidated_this_run', 0)}**",
@@ -869,9 +914,16 @@ def _render_candidate_list() -> str:
     if not rows:
         return "No agent-created skills to review."
     cron_referenced = _cron_referenced_skills()
+    from agent.curator_card_refs import BoardUnreadable, card_referenced_skills
+    try:
+        card_referenced = set(card_referenced_skills(r["name"] for r in rows))
+    except BoardUnreadable as e:  # every skill may be named, and archive_skill refuses them all anyway
+        logger.warning("Curator marking every candidate card=yes: %s", e)
+        card_referenced = {r["name"] for r in rows}
     return "\n".join([f"Agent-created skills ({len(rows)}):\n"] + [
         f"- {r['name']}  provenance={r.get('provenance', 'agent')}  state={r['state']}  "
         f"pinned={'yes' if r.get('pinned') else 'no'}  cron={'yes' if r['name'] in cron_referenced else 'no'}  "
+        f"card={'yes' if r['name'] in card_referenced else 'no'}  "
         f"activity={r.get('activity_count', 0)}  use={r.get('use_count', 0)}  view={r.get('view_count', 0)}  "
         f"patches={r.get('patch_count', 0)}  last_activity={r.get('last_activity_at') or 'never'}"
         for r in rows
@@ -962,7 +1014,8 @@ def run_curator_review(
                 curator_backup.prune_old_snapshots()
         counts = apply_automatic_transitions(now=start)
     auto_summary = ", ".join(
-        f"{counts[key]} {label}" for key, label in (("marked_stale", "marked stale"), ("archived", "archived"), ("reactivated", "reactivated")) if counts[key]
+        f"{counts[key]} {label}" for key, label in (("marked_stale", "marked stale"), ("archived", "archived"), ("reactivated", "reactivated"),
+                           ("skipped_referenced", "held (named by open cards)")) if counts.get(key)
     ) or "no changes"
 
     # Persist before the LLM pass so a crash mid-review still records the run.
