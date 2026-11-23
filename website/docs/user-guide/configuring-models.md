@@ -261,6 +261,28 @@ host, or model family. The marker layout follows the configured transport:
 `prompt_caching: false` to explicitly disable cache markers for a model; when
 omitted, Hermes keeps its normal provider and model capability detection.
 
+An endpoint that publishes no prices (a local proxy, a self-hosted gateway)
+leaves every call's cost `unknown`. Declare the rates per model, in USD per
+million tokens, and Hermes prices each token bucket at its own rate:
+
+```yaml
+providers:
+  model-proxy:
+    api: http://127.0.0.1:4000/v1
+    models:
+      claude-opus-5-5:
+        pricing:
+          input: 4.00
+          output: 20.00
+          cache_read: 0.20
+          cache_write: 5.00   # 5-minute tier; 1-hour writes bill at 2x input
+```
+
+The declaration applies only to that route and model id, and it wins over any
+other price source for the route. A bucket with no declared rate makes a call
+that uses it `unknown` rather than free; a negative or non-numeric rate voids
+the whole declaration.
+
 Some OpenAI-compatible servers return the whole answer in the `reasoning`
 field with empty `content`. Hermes does not show reasoning as the reply by
 default, because most providers put private chain-of-thought there. It retries
