@@ -362,6 +362,10 @@ CURATOR_REVIEW_PROMPT = (
     "run. You MAY still consolidate it into an umbrella — but only because "
     "the curator rewrites cron job skill references to follow consolidations; "
     "never simply prune it.\n"
+    "3d. DO NOT archive, prune, or consolidate any skill marked `card=yes` in "
+    "the candidate list. An open kanban card names it: the card's worker will "
+    "load or edit it, and a force-loaded skill that is gone fails the spawn "
+    "outright.\n"
     "4. DO NOT use usage counters as a reason to skip consolidation. The "
     "counters are new and often mostly zero. Judge overlap on CONTENT, "
     "not on use_count. 'use=0' is not evidence a skill is valuable; it's "
@@ -898,9 +902,16 @@ def _render_candidate_list() -> str:
     if not rows:
         return "No agent-created skills to review."
     cron_referenced = _cron_referenced_skills()
+    from agent.curator_card_refs import BoardUnreadable, card_referenced_skills
+    try:
+        card_referenced = set(card_referenced_skills(r["name"] for r in rows))
+    except BoardUnreadable as e:  # every skill may be named, and archive_skill refuses them all anyway
+        logger.warning("Curator marking every candidate card=yes: %s", e)
+        card_referenced = {r["name"] for r in rows}
     return "\n".join([f"Agent-created skills ({len(rows)}):\n"] + [
         f"- {r['name']}  provenance={r.get('provenance', 'agent')}  state={r['state']}  "
         f"pinned={'yes' if r.get('pinned') else 'no'}  cron={'yes' if r['name'] in cron_referenced else 'no'}  "
+        f"card={'yes' if r['name'] in card_referenced else 'no'}  "
         f"activity={r.get('activity_count', 0)}  use={r.get('use_count', 0)}  view={r.get('view_count', 0)}  "
         f"patches={r.get('patch_count', 0)}  last_activity={r.get('last_activity_at') or 'never'}"
         for r in rows

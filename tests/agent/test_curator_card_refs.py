@@ -91,14 +91,17 @@ def test_same_skill_is_archived_once_the_card_is_done(env):
     assert _state(env, "researching-lodging-prices") == env["usage"].STATE_ARCHIVED
 
 
-def test_board_read_failure_archives_nothing(env, monkeypatch):
+def _corrupt(path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        Path(f"{path}{suffix}").unlink(missing_ok=True)
+    path.write_bytes(b"this is not a sqlite database" * 64)
+
+
+def test_board_read_failure_archives_nothing(env):
     _idle_skill(env, "alpha")
     _idle_skill(env, "beta")
     _card(env, "unrelated")
-
-    def _boom(*a, **k):
-        raise OSError("disk I/O error")
-    monkeypatch.setattr(env["kb"], "list_tasks", _boom)
+    _corrupt(env["kb"].kanban_db_path())
 
     counts = env["curator"].apply_automatic_transitions()
 
@@ -142,3 +145,171 @@ def test_install_without_a_board_still_archives(env):
 
     assert _state(env, "orphan") == env["usage"].STATE_ARCHIVED
     assert not env["kb"].kanban_db_path().exists(), "the archive pass must not create a board"
+
+
+def test_skills_field_leading_slash_still_protects(env):
+    """``/github-code-review`` in a card's skills field names ``github-code-review``."""
+    _idle_skill(env, "slashed")
+    with env["kbc"].connect_closing() as conn:
+        env["kb"].create_task(conn, title="t", body="nothing named here", assignee="w", skills=["/slashed"])
+
+    env["curator"].apply_automatic_transitions()
+
+    assert _state(env, "slashed") != env["usage"].STATE_ARCHIVED
+
+
+# ─── every board, read-only ────────────────────────────────────────────────
+
+
+def _board_card(env, board: str, body: str) -> str:
+    with env["kbc"].connect_closing(board=board) as conn:
+        return env["kb"].create_task(conn, title="t", body=body, assignee="w")
+
+
+def test_cards_on_other_and_archived_boards_protect(env):
+    from hermes_cli import kanban_db_boards as kbb
+    _idle_skill(env, "other-board-skill")
+    _idle_skill(env, "archived-board-skill")
+    kbb.create_board("other")
+    _board_card(env, "other", "Needs other-board-skill.")
+    kbb.create_board("parked")
+    _board_card(env, "parked", "Needs archived-board-skill.")
+    kbb.write_board_metadata("parked", archived=True)
+
+    env["curator"].apply_automatic_transitions()
+
+    assert _state(env, "other-board-skill") != env["usage"].STATE_ARCHIVED
+    assert _state(env, "archived-board-skill") != env["usage"].STATE_ARCHIVED
+
+
+@pytest.mark.parametrize("pinned", ["default", "other"])
+def test_single_board_db_pin_does_not_narrow_the_scan(env, monkeypatch, pinned):
+    """Workers carry HERMES_KANBAN_DB pinned to one board; the scan must still read every board."""
+    from hermes_cli import kanban_db_boards as kbb
+    _idle_skill(env, "default-skill")
+    _idle_skill(env, "other-skill")
+    _card(env, "Needs default-skill.")
+    kbb.create_board("other")
+    _board_card(env, "other", "Needs other-skill.")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(env["kb"].kanban_db_path(pinned)))
+
+    env["curator"].apply_automatic_transitions()
+
+    assert _state(env, "default-skill") != env["usage"].STATE_ARCHIVED
+    assert _state(env, "other-skill") != env["usage"].STATE_ARCHIVED
+
+
+def test_off_tree_pinned_db_is_scanned_too(env, monkeypatch, tmp_path):
+    _idle_skill(env, "default-skill")
+    _idle_skill(env, "pinned-skill")
+    _card(env, "Needs default-skill.")
+    off_tree = tmp_path / "elsewhere" / "kanban.db"
+    off_tree.parent.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(off_tree))
+    _card(env, "Needs pinned-skill.")
+
+    env["curator"].apply_automatic_transitions()
+
+    assert _state(env, "default-skill") != env["usage"].STATE_ARCHIVED
+    assert _state(env, "pinned-skill") != env["usage"].STATE_ARCHIVED
+
+
+def test_board_is_read_without_the_read_write_connector(env, monkeypatch):
+    """The scan opens each board ``mode=ro``: never the kanban connector, which opens read-write and runs
+    schema migrations on whatever board file it is pointed at."""
+    _idle_skill(env, "card-skill")
+    tid = _card(env, "Needs card-skill.")
+
+    def _forbidden(*a, **k):
+        raise AssertionError("the curator's board scan must not open a read-write kanban connection")
+    for mod, attr in ((env["kbc"], "connect"), (env["kbc"], "connect_closing"), (env["kb"], "init_db")):
+        monkeypatch.setattr(mod, attr, _forbidden)
+
+    env["curator"].apply_automatic_transitions()
+
+    [entry] = _skip_entries("card-skill")
+    assert entry["evidence"]["skipped"] == f"skipped: referenced by {tid}"
+
+
+# ─── every archive path honours the same guard ─────────────────────────────
+
+
+def _prune(days: int = 30) -> int:
+    from types import SimpleNamespace
+    import hermes_cli.curator as curator_cli
+    return curator_cli._cmd_prune(SimpleNamespace(days=days, yes=True, dry_run=False))
+
+
+def test_cli_prune_skips_card_referenced_skill(env, capsys):
+    _idle_skill(env, "card-skill")
+    _idle_skill(env, "orphan")
+    tid = _card(env, "Needs card-skill.", initial_status="blocked")
+
+    assert _prune() == 0
+
+    assert (env["home"] / "skills" / "card-skill").exists()
+    assert _state(env, "orphan") == env["usage"].STATE_ARCHIVED
+    out = capsys.readouterr().out
+    assert "card-skill" in out and tid in out, "a held skill is reported with its card"
+
+
+def test_cli_prune_skips_cron_referenced_skill(env, monkeypatch):
+    _idle_skill(env, "cron-skill")
+    monkeypatch.setattr(env["curator"], "_cron_referenced_skills", lambda: {"cron-skill"})
+
+    assert _prune() == 0
+
+    assert (env["home"] / "skills" / "cron-skill").exists()
+
+
+def test_cli_prune_archives_nothing_when_board_unreadable(env, capsys):
+    _idle_skill(env, "orphan")
+    _card(env, "unrelated")
+    _corrupt(env["kb"].kanban_db_path())
+
+    assert _prune() == 1
+
+    assert (env["home"] / "skills" / "orphan").exists()
+    assert "unreadable" in capsys.readouterr().out
+
+
+def test_archive_skill_refuses_card_referenced_skill(env):
+    _idle_skill(env, "card-skill")
+    tid = _card(env, "Needs card-skill.")
+
+    ok, msg = env["usage"].archive_skill("card-skill")
+
+    assert ok is False and tid in msg
+    assert (env["home"] / "skills" / "card-skill").exists()
+
+
+def test_archive_skill_refuses_when_board_unreadable(env):
+    _idle_skill(env, "orphan")
+    _card(env, "unrelated")
+    _corrupt(env["kb"].kanban_db_path())
+
+    ok, msg = env["usage"].archive_skill("orphan")
+
+    assert ok is False and "unreadable" in msg
+    assert (env["home"] / "skills" / "orphan").exists()
+
+
+def test_archive_skill_still_archives_unreferenced_skill(env):
+    _idle_skill(env, "orphan")
+    _card(env, "unrelated")
+
+    ok, msg = env["usage"].archive_skill("orphan")
+
+    assert ok, msg
+
+
+def test_candidate_list_marks_card_referenced_skills(env):
+    _idle_skill(env, "card-skill")
+    _idle_skill(env, "orphan")
+    _card(env, "Needs card-skill.")
+
+    lines = env["curator"]._render_candidate_list().splitlines()
+
+    assert "card=yes" in next(line for line in lines if "- card-skill " in line)
+    assert "card=no" in next(line for line in lines if "- orphan " in line)
+    assert "card=yes" in env["curator"].CURATOR_REVIEW_PROMPT

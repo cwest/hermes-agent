@@ -662,6 +662,11 @@ def archive_skill(skill_name: str) -> tuple[bool, str]:
         return False, f"skill '{skill_name}' not found"
     if is_external_skill_path(skill_dir):
         return False, _external_read_only_message(skill_name)
+    # Every archive path (automatic pass, `hermes curator archive|prune`, the LLM pass's deletes) lands here:
+    # a skill an open kanban card names is in use however long ago it last loaded.
+    from agent.curator_card_refs import archive_hold_reason
+    if hold := archive_hold_reason(skill_name):
+        return False, f"skill '{skill_name}' not archived: {hold}"
     # Flatten under the skill NAME, not the directory name: `mlops/training/accelerate` is the skill
     # `huggingface-accelerate`, and restore/list/purge all key on the name.
     dest = _archive_dir() / skill_name
