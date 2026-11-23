@@ -48,6 +48,11 @@ _INTERPRETER_PREFIXES = tuple({
 # resolve once at import, as before: they are fixed for the process lifetime.
 _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
+# Importing any entry point asks pm.environments.payload_venv whether the checkout is a sealed
+# payload, which reads <checkout>/../manifest.json. For a checkout inside the home (the default
+# install, or a worktree under a scratch dir) that is a read in the home, but it is the
+# installation probing its own layout. Reads only: writing there is still refused.
+_PAYLOAD_MANIFEST_PROBE = _normcase(os.fspath(Path(__file__).resolve().parent.parent.parent / "manifest.json"))
 
 
 def _within(path: str, prefix: str) -> bool:
@@ -120,6 +125,8 @@ class HomeIOGuard:
             for prefix in _INTERPRETER_PREFIX_STRS:
                 if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
                     return
+            if not destructive and absolute == _PAYLOAD_MANIFEST_PROBE:
+                return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
             for root in roots:
