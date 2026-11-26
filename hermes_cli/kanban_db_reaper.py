@@ -47,6 +47,9 @@ class _DeadWorker:
     owner_unavailable: bool = False
     """``KANBAN_OWNER_UNAVAILABLE_EXIT_CODE``: the profile owner stopped answering —
     requeued uncharged, bounded by its own streak (``kanban_db_owner_unavailable``)."""
+    owner_stopped: Optional[str] = None
+    """The stop cause the owner recorded when its own restart/shutdown interrupted the run
+    (``owner_stop_cause``): requeued and kept out of ``crash_details``, so never charged."""
 
     @property
     def run_outcome(self) -> str:
@@ -158,12 +161,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation or dead.owner_unavailable:
+            if dead.rate_limited or dead.protocol_violation or dead.owner_unavailable or dead.owner_stopped:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation or owner-unavailable run
-                # never reaches ``_record_task_failure`` (which stamps this column),
-                # yet the board UI and retry worker need the corrective message.
+                # blocker; a below-budget protocol violation, owner-unavailable or
+                # owner-stopped run never reaches ``_record_task_failure`` (which
+                # stamps this column), yet the board UI and retry worker need the
+                # corrective message.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
@@ -172,5 +176,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.rate_limited.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
-                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+                if not dead.owner_stopped:
+                    # The owner's own restart/shutdown killed it: never charged to the breaker, and
+                    # never a systemic fingerprint (one restart kills every in-flight worker at once).
+                    sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
     return sweep

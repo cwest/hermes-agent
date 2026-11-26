@@ -609,7 +609,15 @@ attempt `unknown`. The card did not fail, its host did: the dispatcher records
 the run as `crashed` with `exit_kind: owner_unavailable` and requeues it
 without counting a failure, so one stalled gateway turn cannot park every card
 in flight at once. Only `3` consecutive owner-unavailable runs park the card
-(`gave_up` with `owner_unavailable: true`, sticky). The worker also writes its exit code as the
+(`gave_up` with `owner_unavailable: true`, sticky). A managed worker that its
+own gateway stopped — a restart or shutdown signals every worker it runs, which
+exit `130`/`143` — is not a card failure either. The owner settles the
+admission `interrupted` with the stop cause it sent (`Gateway restarting` /
+`Gateway shutting down`); the crash sweep and the stale-claim reclaim read that
+cause, record `owner_stopped` on the run, and requeue the card to its prior lane
+without counting a failure, so a restart can never trip the breaker. The cause
+is the discriminator, not the exit code: a worker that exits `130` for a user's
+Stop, or with no owner at all, still counts. The worker also writes its exit code as the
 last line of its own log (`[kanban-worker-exit] rc=<code>`), so a per-tick
 `hermes kanban dispatch` process — which never reaped the worker and cannot
 read its exit status — books the same death the same way the gateway-embedded
