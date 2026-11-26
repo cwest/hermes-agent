@@ -2353,7 +2353,7 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, owner_stop_cause, reclaim_error
     for row in stale:
         if owner_reclaim_blocked(conn, row["id"]):
             continue
@@ -2384,6 +2384,7 @@ def release_stale_claims(
             if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
                 continue
             retry_status, error = _retry_status_for_run(conn, row["id"]), reclaim_error(conn, row["id"], row["claim_lock"])
+            stop_cause = owner_stop_cause(conn, row["id"])  # the owner's own restart ended it: never charged
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -2406,16 +2407,15 @@ def release_stale_claims(
                     "now": now,
                     "host_local": host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
-                    "retry_status": retry_status,
+                    "retry_status": retry_status, **({"owner_stopped": stop_cause} if stop_cause else {}),
                 },
             )
             reclaimed += 1
-        # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
-        # the run ended without a verdict, so it counts toward the breaker and a
-        # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
+        # Own txn, after the reclaim commit (as ``enforce_max_runtime``): a run with no verdict counts toward
+        # the breaker (a trip adds ``blocked`` + ``gave_up``) unless its owner's own restart ended it.
         _record_task_failure(
             conn, row["id"], error,
-            outcome="reclaimed", failure_limit=failure_limit,
+            outcome="reclaimed", failure_limit=failure_limit, infrastructure=bool(stop_cause),
             release_claim=False, end_run=False,
             event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
         )
