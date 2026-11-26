@@ -41,7 +41,7 @@ def test_promote_moves_a_triage_card_to_ready_with_an_audit_event(conn) -> None:
     payload = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'promoted_manual'", (tid,),
     ).fetchone()["payload"]
-    assert json.loads(payload) == {"actor": "ops", "reason": "spec is fine"}
+    assert json.loads(payload) == {"actor": "ops", "reason": "spec is fine", "from": "triage"}
 
 
 def test_promote_recovers_a_card_the_block_loop_breaker_escalated(conn) -> None:

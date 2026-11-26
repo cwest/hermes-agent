@@ -16,6 +16,10 @@ REQUEUE_KINDS = (
 )
 REQUEUE_KINDS_SQL = ", ".join(f"'{k}'" for k in REQUEUE_KINDS)
 
+# Lanes a card leaves only by a human decision. Moving a card out of one is that
+# decision, so it hands the card back even to the profile that already holds it.
+HUMAN_HELD_LANES = frozenset({"blocked", "triage"})
+
 
 def held_by_recent_success(conn: sqlite3.Connection, task_id: str, now: int, window: int) -> bool:
     """A completed run within ``window`` with no deliberate re-queue after it.
@@ -43,18 +47,40 @@ def is_requeue_event(kind: str, payload: Optional[str]) -> bool:
     return True
 
 
-def is_handoff_event(kind: str, payload: Optional[str]) -> bool:
-    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
-    a handoff. A no-op re-assign (dev→dev via CLI/dashboard/``reassign
-    --reclaim``), an unassign, or the dispatcher's own
-    ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
-    the very implementer that opened the PR. Events without ``from`` (written
-    before it was recorded) are not trusted as handoffs — fail closed."""
-    if kind != "assigned":
-        return True
-    from hermes_cli.kanban_db import _json_or
-    data = _json_or(payload, {})
-    if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
+def _moves_owner(data: dict) -> bool:
+    """A no-op re-assign (dev→dev via CLI/dashboard/``reassign --reclaim``), an
+    unassign, or the dispatcher's own ``kanban.default_assignee`` write would
+    otherwise lift ``active_pr`` for the very implementer that opened the PR."""
+    if data.get("source") == "kanban.default_assignee":
         return False
     to = data.get("assignee")
     return bool(to) and "from" in data and data["from"] != to
+
+
+def _leaves_human_lane(data: dict) -> bool:
+    """``todo -> ready`` is a dependency wait ending and a ``running -> ready``
+    drag is a reclaim: neither is anyone deciding the card should resume."""
+    return data.get("from") in HUMAN_HELD_LANES
+
+
+# Kinds whose payload decides whether they are a handoff. The other handoff
+# kinds (``unblocked``, the review bounces) are one by definition: only a
+# deliberate human or reviewer act writes them.
+_PAYLOAD_RULES = {
+    "assigned": _moves_owner,
+    "promoted_manual": _leaves_human_lane,
+    "status": _leaves_human_lane,
+}
+
+
+def is_handoff_event(kind: str, payload: Optional[str]) -> bool:
+    """Whether ``kind`` names a profile that must now work on the card's open PR:
+    an ``assigned`` to a DIFFERENT profile, a promotion or status move out of a
+    human-held lane, or a kind with no payload rule. Payloads written before
+    ``from`` was recorded are not trusted as handoffs: fail closed."""
+    rule = _PAYLOAD_RULES.get(kind)
+    if rule is None:
+        return True
+    from hermes_cli.kanban_db import _json_or
+    data = _json_or(payload, {})
+    return isinstance(data, dict) and rule(data)
