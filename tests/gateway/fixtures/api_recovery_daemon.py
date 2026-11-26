@@ -1,5 +1,9 @@
 """Hold only execution scheduling after a real API commit and HTTP ACK."""
 import runpy
+
+from tests.gateway.fixtures.fixture_lifetime import bound_to_parent
+
+bound_to_parent()
 from gateway.session_authority import SessionAuthority, admission_row
 
 schedule = SessionAuthority._schedule

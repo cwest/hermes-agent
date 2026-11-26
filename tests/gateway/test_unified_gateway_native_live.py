@@ -29,7 +29,10 @@ from urllib.parse import urlsplit
 import pytest
 from websockets.asyncio.client import connect
 
+from tests.gateway.fixtures.fixture_lifetime import reap, spawn
+
 ROOT = Path(__file__).resolve().parents[2]
+FIXTURES = ROOT / 'tests' / 'gateway' / 'fixtures'
 # Windows children need the system environment (Winsock, temp, PATHEXT) that the
 # hermetic test process still carries; POSIX only ever uses the first three.
 _CHILD_ENV_KEYS = ('PATH', 'LANG', 'TZ', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP',
@@ -163,9 +166,9 @@ def planned_stop(home, proc, desc):
 
 @contextmanager
 def daemon(home, env, log_name, *, fixture=None, expect_ready=True):
-    command = [sys.executable, str(ROOT / 'tests/gateway/fixtures' / fixture)] if fixture else [sys.executable, '-m', 'gateway.run']
+    command = [sys.executable, str(FIXTURES / (fixture or 'bounded_module.py'))] + ([] if fixture else ['gateway.run'])
     with (home.parent / log_name).open('w+', encoding='utf-8', errors='replace') as log:
-        proc = subprocess.Popen(command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        proc = spawn(command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         try:
             desc = {}
             deadline = time.monotonic() + 180
@@ -191,9 +194,7 @@ def daemon(home, env, log_name, *, fixture=None, expect_ready=True):
                 assert desc.get('state') == 'ready', (json.dumps(desc, default=str), proc.poll(), log.read()[-3000:], detail)
             yield proc, desc, log
         finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait(timeout=20)
+            reap(proc)
 
 
 def query(home, sql, args=()):
@@ -383,13 +384,14 @@ def test_native_gateway_runtime_live(harness):
             with exclusive_maintenance([home]):
                 pass
         with (home.parent / 'second.log').open('w+', encoding='utf-8', errors='replace') as log:
-            second = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=ROOT, env=env,
-                                      stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+            second = spawn([sys.executable, str(FIXTURES / 'bounded_module.py'), 'gateway.run'], cwd=ROOT, env=env,
+                           stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
             try:
                 code = second.wait(timeout=120)
             except subprocess.TimeoutExpired:
-                second.kill(); second.wait(timeout=20)
                 raise AssertionError('second gateway did not refuse while the first owns gateway.lock')
+            finally:
+                reap(second)
             log.flush(); log.seek(0)
             text = log.read()
         # One gateway per host: a second `gateway run` for a profile the live owner already serves
@@ -483,15 +485,18 @@ def test_native_safe_mode_cli_executes_in_managed_worker(harness):
     def safe_mode_cli_worker(owner, desc, harness):
         # Popen.pid is the venv launcher on Windows; the daemon's own pid comes from identify.
         gateway_pid = desc['pid']
-        command = [sys.executable, '-m', 'hermes_cli.main', 'chat', '--safe-mode', '--provider', 'custom',
-                   '--base-url', url, '--model', 'safe-fixture', '--api-key', 'fixture', '-Q', '-q', 'SAFE_PROBE_NATIVE']
-        proc = subprocess.Popen(command, cwd=harness['work'], env=env, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        command = [sys.executable, str(FIXTURES / 'bounded_module.py'), 'hermes_cli.main', 'chat', '--safe-mode',
+                   '--provider', 'custom', '--base-url', url, '--model', 'safe-fixture', '--api-key', 'fixture',
+                   '-Q', '-q', 'SAFE_PROBE_NATIVE']
+        proc = spawn(command, cwd=harness['work'], env=env, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             out, err = proc.communicate(timeout=180)
         except subprocess.TimeoutExpired:
-            proc.kill(); out, err = proc.communicate(timeout=10)
+            reap(proc); out, err = proc.communicate(timeout=10)
             raise AssertionError(('safe-mode CLI timed out', out, err))
+        finally:
+            reap(proc)
         out, err = out.decode('utf-8', 'replace'), err.decode('utf-8', 'replace')
         starts = [r for r in records(audit) if r['kind'] == 'start' and 'agent.managed_worker' in ' '.join(r['argv'])]
         evidence = {'owner_pid': owner.pid, 'gateway_pid': gateway_pid, 'worker_starts': starts,
