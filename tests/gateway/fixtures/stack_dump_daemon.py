@@ -14,6 +14,10 @@ from pathlib import Path
 import runpy
 import time
 
+from tests.gateway.fixtures.fixture_lifetime import bound_to_parent
+
+# The repeating dump rewrites stacks.txt forever: never let this outlive the test that started it.
+bound_to_parent()
 path = Path(os.environ['HERMES_HOME']) / 'logs' / 'stacks.txt'
 path.parent.mkdir(parents=True, exist_ok=True)
 delay = float(os.environ.get('UGW_STACK_DUMP_AFTER', '60'))
