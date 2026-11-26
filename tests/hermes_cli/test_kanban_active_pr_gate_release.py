@@ -194,6 +194,29 @@ def test_a_dashboard_drag_from_running_to_ready_stays_guarded(conn) -> None:
     assert kbd.check_respawn_guard(conn, tid) == "active_pr"
 
 
+def _reach_ready_by_specify(conn, tid: str) -> None:
+    assert kb.specify_triage_task(conn, tid, body="rewritten", author="operator")
+
+
+def _reach_ready_by_recompute(conn, tid: str) -> None:
+    kb.recompute_ready(conn)
+
+
+@pytest.mark.parametrize(("start", "to", "reach_ready"), [
+    ("blocked", "triage", _reach_ready_by_specify),
+    ("triage", "triage", _reach_ready_by_specify),
+    ("blocked", "todo", _reach_ready_by_recompute),
+])
+def test_a_drag_between_held_lanes_is_not_a_release(conn, start, to, reach_ready) -> None:
+    """Only a move that lands the card in ``ready`` releases it; a later automatic
+    promotion from the new lane proves no human decided it should resume."""
+    tid = _in_triage(conn) if start == "triage" else _parked_at_gate(conn)
+    assert _dashboard()._set_status_direct(conn, tid, to)
+    reach_ready(conn, tid)
+    assert kb.get_task(conn, tid).status == "ready"
+    assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
 def _rerun(conn, tid: str) -> None:
     assert kb.claim_task(conn, tid) is not None
 

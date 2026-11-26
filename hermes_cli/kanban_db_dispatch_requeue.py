@@ -63,20 +63,28 @@ def _leaves_human_lane(data: dict) -> bool:
     return data.get("from") in HUMAN_HELD_LANES
 
 
+def _releases_to_ready(data: dict) -> bool:
+    """A direct drag writes ``status`` for every lane, so ``blocked -> triage`` or
+    ``blocked -> todo`` leaves a held lane without releasing the card; whatever
+    later lands it in ``ready`` from there is automatic."""
+    return data.get("status") == "ready" and _leaves_human_lane(data)
+
+
 # Kinds whose payload decides whether they are a handoff. The other handoff
 # kinds (``unblocked``, the review bounces) are one by definition: only a
-# deliberate human or reviewer act writes them.
+# deliberate human or reviewer act writes them. ``promoted_manual`` always
+# lands in ``ready``.
 _PAYLOAD_RULES = {
     "assigned": _moves_owner,
     "promoted_manual": _leaves_human_lane,
-    "status": _leaves_human_lane,
+    "status": _releases_to_ready,
 }
 
 
 def is_handoff_event(kind: str, payload: Optional[str]) -> bool:
     """Whether ``kind`` names a profile that must now work on the card's open PR:
-    an ``assigned`` to a DIFFERENT profile, a promotion or status move out of a
-    human-held lane, or a kind with no payload rule. Payloads written before
+    an ``assigned`` to a DIFFERENT profile, a promotion out of a human-held lane, a
+    status move from one into ``ready``, or a kind with no payload rule. Payloads written before
     ``from`` was recorded are not trusted as handoffs: fail closed."""
     rule = _PAYLOAD_RULES.get(kind)
     if rule is None:
