@@ -3512,15 +3512,15 @@ def promote_task(
     if dry_run:
         return True, None
 
+    # Out of blocked/triage this is a human releasing a gate, not a retry: it clears the
+    # unblock-loop memory (``unblock`` keeps it) and ``from`` makes it an active_pr handoff.
+    released = cur_status in ("blocked", "triage")
     with write_txn(conn):
-        upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked', 'triage')", (task_id,),
-        )
-        if upd.rowcount != 1:
+        if conn.execute("UPDATE tasks SET status = 'ready'" + (
+                ", block_kind = NULL, block_recurrences = 0" if released else "")
+                + " WHERE id = ? AND status = ?", (task_id, cur_status)).rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
-
+        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason, "from": cur_status})
     return True, None
 
 
