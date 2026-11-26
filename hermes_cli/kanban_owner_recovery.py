@@ -45,6 +45,42 @@ def _admission_row(receipt):
     return (rows[0].status, rows[0].outcome) if rows else None
 
 
+def owner_stop_cause(conn, task_id):
+    """The stop reason the owner recorded when its own restart/shutdown interrupted the task's
+    CURRENT run, else None.
+
+    A gateway stopping signals every managed worker it runs and settles each admission
+    ``interrupted`` with the cause it sent (``Gateway restarting`` / ``Gateway shutting down``).
+    That record, not the worker's exit code, says the supervisor ended the attempt: a user's Stop
+    also settles ``interrupted`` and also exits 130, but carries no such cause.
+    """
+    receipt = _owner_receipt(conn, task_id)
+    if not receipt:
+        return None
+    from persistence.core.errors import STORE_FAILURES
+    from persistence_assembly import open_persistence_reader
+
+    try:
+        session_id, request_id = receipt['session_id'], receipt['request_id']
+        if session_id is None or request_id is None:
+            return None
+        with open_persistence_reader(Path(receipt['db'])) as owner:
+            rows = owner.admissions.match(session_id=session_id, request_id=request_id)
+            if not rows or rows[0].status != 'terminal' or rows[0].outcome != 'interrupted':
+                return None
+            saved = owner.admissions.settled_result(admission_id=rows[0].admission_id)
+    except (OSError, KeyError, TypeError, ValueError, *STORE_FAILURES):
+        return None
+    # The stored settlement is the ``{'result': ..., 'usage': ...}`` envelope
+    # (``session_results.prepare_result``); the stop cause lives on the inner turn result.
+    stored = saved.result if saved is not None else None
+    result = stored.get('result') if isinstance(stored, dict) else None
+    if not isinstance(result, dict):
+        return None
+    from gateway.session_bot_outcome import owner_stopped
+    return str(result['interrupt_message']) if owner_stopped(result) else None
+
+
 def owner_reclaim_paused(conn, task_id):
     """Missing/ambiguous owner receipts never authorize another attempt."""
     receipt = _owner_receipt(conn, task_id)
@@ -239,6 +275,13 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
             # Keep the worker's last output that _classify_dead_worker appended.
             dead.error_text = (f"pid {pid} exited cleanly after its managed worker was lost."
                                + dead.error_text.removeprefix(_PROTOCOL_VIOLATION_ERROR))
+    stop_cause = owner_stop_cause(conn, task_id)
+    if stop_cause and not (dead.rate_limited or dead.protocol_violation):
+        # The owner's own restart/shutdown ended the attempt, not the card: the reaper keeps it
+        # out of the breaker accounting.
+        dead.owner_stopped = stop_cause
+        dead.event_payload["owner_stopped"] = stop_cause
+        note = f"{note}: {stop_cause}, requeued without counting a failure"
     # Before the worker's own output: the stored error is capped, and the output may be long.
     from hermes_cli.kanban_db_dispatch import WORKER_OUTPUT_SEP
     head, sep, output = dead.error_text.partition(WORKER_OUTPUT_SEP)
