@@ -1,11 +1,14 @@
 """The ``active_pr`` respawn guard: a ready card whose recent comments carry a live GitHub PR
 URL is held, so the worker that opened the PR does not open a duplicate.
 
-A handoff after the newest PR comment (operator reassign, explicit unblock, reviewer
-``changes_requested``, review reopen) names the profile that must now work on THAT PR — a
-closer or the implementer finishing it, not a duplicate implementation (#111910). A
-crash/reclaim is not a handoff. A PR that is no longer live (closed, merged, never existed)
-cannot be duplicated, so it does not guard either.
+A handoff after the newest PR comment (operator reassign, reviewer ``changes_requested``,
+review reopen, or a human release of a parked card: unblock, or promote or drag out of
+``blocked``/``triage``) names the profile that must now work on THAT PR — a closer or the
+implementer finishing it, not a duplicate implementation (#111910). A crash/reclaim, an
+automatic promotion, a same-profile reassign and a triage rewrite (``specified``/
+``decomposed``, which the unattended auto-decomposer also writes) are not handoffs. A PR that
+is no longer live (closed, merged, never existed) cannot be duplicated, so it does not guard
+either.
 
 The guard keeps the implementer from re-spawning, so on its own it never moves the card. A
 worker interrupted after opening its PR (exit 130 from a gateway reload) left the card in
@@ -28,7 +31,8 @@ _PR_WINDOW = 86400  # 24 hours
 
 _PR_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+", re.IGNORECASE)
 
-_HANDOFF_KINDS = "('assigned', 'unblocked', 'changes_requested', 'review_reopened')"
+_HANDOFF_KINDS = ("('assigned', 'unblocked', 'changes_requested', 'review_reopened', "
+                  "'promoted_manual', 'status')")
 _REVIEW_BOUNCES = ("changes_requested", "review_reopened")
 
 # Run outcomes that end a worker without its say: the card is back in ``ready`` only because the
