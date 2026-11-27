@@ -43,7 +43,8 @@ def test_past_due_time_is_promoted_on_next_tick_and_emits_unblocked(kanban_home)
         tid = _scheduled(conn, reason="replay running", until=int(time.time()) - 60)
         kbd.dispatch_once(conn)
         assert kb.get_task(conn, tid).status == "ready"
-        assert _kinds(conn, tid)[-1] == "unblocked"
+        last = kb.list_events(conn, tid)[-1]
+        assert last.kind == "unblocked" and last.payload == {"source": "scheduled_until"}
 
 
 def test_future_due_time_is_left_scheduled(kanban_home):

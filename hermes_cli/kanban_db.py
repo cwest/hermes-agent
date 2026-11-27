@@ -3560,9 +3560,11 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, source: Optional[str] = None) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first. ``source``
+    (e.g. ``scheduled_until``) is recorded on the ``unblocked`` event so the
+    notifier can tell an automatic release from a human one."""
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3593,14 +3595,13 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+        payload: dict[str, Any] = (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready" else {}
         )
+        if source:
+            payload["source"] = source
+        _append_event(conn, task_id, "unblocked", payload or None)
         return True
 
 

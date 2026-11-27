@@ -17,6 +17,8 @@ from datetime import datetime, timezone, UTC
 from typing import Any, Optional
 
 _REASON_PREFIX_RE = re.compile(r"^\s*SCHEDULED_UNTIL=(\S+)")
+# ``unblocked`` payload ``source`` of a due-time release: the one unblock that wakes the origin.
+WAKE_SOURCE = "scheduled_until"
 
 
 def parse_due_time(value: float | str | None) -> Optional[int]:
@@ -93,4 +95,4 @@ def wake_due_scheduled(conn: sqlite3.Connection, now: Optional[int] = None) -> i
         "SELECT id FROM tasks WHERE status = 'scheduled' AND scheduled_until IS NOT NULL "
         "AND scheduled_until <= ? ORDER BY scheduled_until, id", (cutoff,),
     )]
-    return sum(1 for task_id in due if _kb.unblock_task(conn, task_id))
+    return sum(1 for task_id in due if _kb.unblock_task(conn, task_id, source=WAKE_SOURCE))
