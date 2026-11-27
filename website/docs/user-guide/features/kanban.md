@@ -573,6 +573,28 @@ Keep secrets, raw logs, tokens, OAuth material, and unrelated transcripts out of
 tests, say so explicitly in `summary` and use `metadata` for the evidence that
 does exist, such as source URLs, issue ids, or manual review steps.
 
+### Cards whose deliverable is an agent-instruction file
+
+Writes to `AGENTS.md`, `CLAUDE.md`, `SOUL.md`, `.cursorrules` (and any
+`security.protected_instruction_extra_patterns` match) always need a human
+approval, and a dispatched worker has nobody to answer, so the write fails
+closed. When such a file IS the card's deliverable, declare it in the body when
+you file the card:
+
+```text
+protected-writes: AGENTS.md, docs/CLAUDE.md
+```
+
+The card's own worker may then write exactly those paths, relative to the
+card's workspace, without a prompt. Everything else stays gated: undeclared
+files, the same name in another directory, any path outside the workspace
+(including through a symlink), delegate children and cron runs inside the
+worker, and stale runs. Entries with globs, `..` or an absolute path are
+ignored. The grant only holds for the body as filed: editing the card later
+(`hermes kanban edit`, triage specify) voids it for good, and a card created by
+a worker never carries one. Re-file the card to grant again. Each grant is
+recorded as a `protected_write_granted` event on the card.
+
 ### The worker lifecycle
 
 Every profile that works kanban tasks automatically gets the worker lifecycle — it's injected into the worker's system prompt at spawn (the `KANBAN_GUIDANCE` block), so there is **nothing to install or configure**. It teaches the worker the full lifecycle in **tool calls**, not CLI commands:
