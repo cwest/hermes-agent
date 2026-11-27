@@ -203,15 +203,20 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
     "kanban_schedule",
     (
         "Park your task as 'scheduled' while it waits for a time or external event. This ends the current run and makes the "
-        "task non-dispatchable until an orchestrator unblocks it; it does not "
-        "create a timer. Put any wake-up marker such as "
-        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
+        "task non-dispatchable until ``until`` passes (the dispatcher then "
+        "returns it to ready) or, with no ``until``, until an orchestrator "
+        "unblocks it. A leading ``SCHEDULED_UNTIL=<ISO8601>`` in ``reason`` "
+        "also sets the wake time."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "reason": _prop("string", (
             "Optional reason or machine-readable wake-up marker recorded on "
             "the completed run and scheduled event."
+        )),
+        "until": _prop("string", (
+            "Optional ISO-8601 wake time (e.g. 2026-06-01T09:00:00-05:00); "
+            "the first dispatcher tick after it returns the task to ready."
         )),
     },
     [],

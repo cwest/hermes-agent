@@ -796,3 +796,40 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def _scheduled_card_with_wake_sub(tmp_path, monkeypatch, *, until_offset):
+    import time as _time
+    from hermes_cli import kanban_db_scheduled as kbs
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "scheduled-wake.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="waits on a replay", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+                           delivery_mode="notify+wake")
+        assert kb.schedule_task(conn, tid, until=int(_time.time()) + until_offset)
+        kbs.wake_due_scheduled(conn)
+        if until_offset > 0:
+            assert kb.unblock_task(conn, tid)
+    finally:
+        conn.close()
+    return tid
+
+
+def test_due_time_release_pings_and_wakes_the_origin(tmp_path, monkeypatch):
+    """A card the dispatcher released at its due time wakes the origin thread;
+    otherwise the subscriber hears nothing until the worker's next outcome."""
+    tid = _scheduled_card_with_wake_sub(tmp_path, monkeypatch, until_offset=-60)
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1 and tid in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1
+
+
+def test_manual_unblock_stays_silent(tmp_path, monkeypatch):
+    _scheduled_card_with_wake_sub(tmp_path, monkeypatch, until_offset=3600)
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.sent == [] and adapter.handled == []
