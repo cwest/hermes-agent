@@ -24,6 +24,7 @@ from tools.binary_extensions import (
     is_pdf_path,
     is_sqlite_sidecar,
 )
+from tools.file_tools_kanban_grant import DeclaredGrant, grant_declared_protected_writes
 from tools.file_tools_paths import (
     _expand_tilde, _resolve_path_for_task, _ssh_path_escapes_home, _terminal_env_type_for_task)
 from tools.file_tools_read_tracking import _has_full_write_baseline, _is_own_blind_patch, _read_mtime_drifted
@@ -357,22 +358,25 @@ def _check_protected_instruction_write(paths: list[str], task_id: str = "default
         return None
     gated = {p: r for p in paths if (r := _protected_instruction_reason(p, task_id, enabled=enabled,
                                                                         extra_patterns=extra))}
-    gated = {p: r for p, r in gated.items() if p not in _card_granted_paths(list(gated), task_id)}
     if not gated:
         return None
-    return _request_protected_instruction_approval(list(gated.values()), task_id)
+    grant = _card_grant(list(gated), task_id)
+    remaining = [r for p, r in gated.items() if p not in grant.paths]
+    blocked = _request_protected_instruction_approval(remaining, task_id) if remaining else None
+    if blocked is None:
+        grant.record()
+    return blocked
 
 
-def _card_granted_paths(paths: list[str], task_id: str) -> set[str]:
+def _card_grant(paths: list[str], task_id: str) -> DeclaredGrant:
     """The paths a Kanban worker's own card declares as its deliverable (``protected-writes:``),
     judged by their realpath on this host; see ``tools.file_tools_kanban_grant``."""
-    if not paths or not _writes_host_filesystem(task_id):
-        return set()
-    from tools.file_tools_kanban_grant import grant_declared_protected_writes
+    if not _writes_host_filesystem(task_id):
+        return DeclaredGrant()
     try:
         targets = {p: os.path.realpath(_resolve_path_for_task(p, task_id)) for p in paths}
     except (OSError, ValueError, RuntimeError):
-        return set()
+        return DeclaredGrant()
     return grant_declared_protected_writes(targets)
 
 

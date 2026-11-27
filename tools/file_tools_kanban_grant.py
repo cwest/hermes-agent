@@ -31,6 +31,7 @@ the grant answers "no grant" and the normal fail-closed prompt runs.
 import logging
 import os
 import re
+from dataclasses import dataclass, field
 
 from agent.delegation_context import owned_kanban_task
 
@@ -80,33 +81,48 @@ def _owned_run(conn, kb, task_id: str):
     return task
 
 
-def grant_declared_protected_writes(targets: dict[str, str]) -> set[str]:
-    """Which of ``targets`` (path -> its realpath on this host) the owning worker's card grants.
+@dataclass(frozen=True)
+class DeclaredGrant:
+    """The declared deliverables a write may touch without the prompt: ``paths`` maps each
+    granted target key to its declared entry. Looking a grant up records nothing; ``record()``
+    logs it once the write actually goes ahead."""
 
-    Records one ``protected_write_granted`` event listing the granted entries; returns the
-    granted keys of ``targets`` (empty on any doubt)."""
+    task_id: str = ""
+    run_id: int | None = None
+    paths: dict[str, str] = field(default_factory=dict)
+
+    def record(self) -> None:
+        if not self.paths:
+            return
+        try:
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_db_connect as kbc
+            with kbc.connect_closing() as conn, kbc.write_txn(conn):
+                kb._append_event(conn, self.task_id, "protected_write_granted",
+                                 {"paths": sorted(set(self.paths.values()))}, run_id=self.run_id)
+        except Exception:  # the audit row is best-effort; the grant itself was already proven
+            logger.warning("could not record protected-writes grant for %s", self.task_id, exc_info=True)
+
+
+def grant_declared_protected_writes(targets: dict[str, str]) -> DeclaredGrant:
+    """Which of ``targets`` (path -> its realpath on this host) the owning worker's card grants
+    (an empty grant on any doubt)."""
     task_id = owned_kanban_task()
     if not task_id or not targets:
-        return set()
+        return DeclaredGrant()
     try:
         from hermes_cli import kanban_db as kb
         from hermes_cli import kanban_db_connect as kbc
         with kbc.connect_closing() as conn:
             task = _owned_run(conn, kb, task_id)
             if task is None or not task.workspace_path:
-                return set()
+                return DeclaredGrant()
             entries = declared_protected_writes(task.body)
-            if not entries:
-                return set()
             workspace = os.path.realpath(task.workspace_path)
-            by_path = {os.path.join(workspace, entry): entry for entry in entries}
+            # Entries use "/"; join part by part so the key matches realpath's native separator.
+            by_path = {os.path.join(workspace, *entry.split("/")): entry for entry in entries}
             granted = {key: by_path[real] for key, real in targets.items() if real in by_path}
-            if granted:
-                with kbc.write_txn(conn):
-                    kb._append_event(conn, task_id, "protected_write_granted",
-                                     {"paths": sorted(set(granted.values()))},
-                                     run_id=task.current_run_id)
-            return set(granted)
+            return DeclaredGrant(task_id, task.current_run_id, granted)
     except Exception:  # any doubt is "no grant": the caller falls back to the fail-closed prompt
         logger.warning("protected-writes grant check failed for %s; not granting", task_id, exc_info=True)
-        return set()
+        return DeclaredGrant()

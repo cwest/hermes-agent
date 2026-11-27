@@ -183,6 +183,68 @@ def test_patch_on_a_declared_file_is_allowed(headless_worker, tmp_path):
     assert (ws / "docs" / "CLAUDE.md").read_text() == "new line\n"
 
 
+def _grant_events(tid) -> list:
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        return [e.payload for e in kb.list_events(conn, tid) if e.kind == "protected_write_granted"]
+    finally:
+        conn.close()
+
+
+def _v4a_update(*paths) -> str:
+    hunks = "".join(f"*** Update File: {p}\n@@\n-old\n+new\n" for p in paths)
+    return f"*** Begin Patch\n{hunks}*** End Patch"
+
+
+def test_multi_file_patch_of_declared_files_records_one_grant(headless_worker, tmp_path):
+    from tools.file_tools import patch_tool
+
+    ws = tmp_path / "repo"
+    tid = headless_worker("protected-writes: AGENTS.md, CLAUDE.md\n", ws)
+    targets = [ws / "AGENTS.md", ws / "CLAUDE.md"]
+    for target in targets:
+        target.write_text("old\n")
+
+    res = json.loads(patch_tool(mode="patch", patch=_v4a_update(*targets)))
+
+    assert "error" not in res, res
+    assert [t.read_text() for t in targets] == ["new\n", "new\n"]
+    assert _grant_events(tid) == [{"paths": ["AGENTS.md", "CLAUDE.md"]}]
+
+
+def test_patch_mixing_declared_and_undeclared_files_is_refused_without_a_grant(headless_worker, tmp_path):
+    """One undeclared protected file blocks the whole patch, so the declared file was never
+    granted and no grant may be recorded."""
+    from tools.file_tools import patch_tool
+
+    ws = tmp_path / "repo"
+    tid = headless_worker("protected-writes: AGENTS.md\n", ws)
+    targets = [ws / "AGENTS.md", ws / "CLAUDE.md"]
+    for target in targets:
+        target.write_text("old\n")
+
+    res = json.loads(patch_tool(mode="patch", patch=_v4a_update(*targets)))
+
+    assert "BLOCKED" in res["error"]
+    assert [t.read_text() for t in targets] == ["old\n", "old\n"]
+    assert _grant_events(tid) == []
+
+
+@pytest.mark.platforms("windows")
+def test_nested_declaration_matches_the_native_windows_path(headless_worker, tmp_path):
+    ws = tmp_path / "repo"
+    headless_worker("protected-writes: docs/CLAUDE.md\n", ws)
+    (ws / "docs").mkdir()
+
+    res = _write(ws / "docs" / "CLAUDE.md")
+
+    assert "error" not in res, res
+    assert (ws / "docs" / "CLAUDE.md").read_text() == "# policy\n"
+
+
 def test_card_filed_by_a_worker_grants_nothing(headless_worker, tmp_path, monkeypatch):
     """An injected worker must not mint a grant by filing a child card that declares one."""
     from hermes_cli import kanban_db as kb
