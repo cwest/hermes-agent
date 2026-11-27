@@ -10,10 +10,11 @@ stays parked until someone unblocks it. ``kanban_db`` is reached late-bound
 
 from __future__ import annotations
 
+import math
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone, UTC
+from datetime import datetime, UTC
 from typing import Any, Optional
 
 _REASON_PREFIX_RE = re.compile(r"^\s*SCHEDULED_UNTIL=(\S+)")
@@ -28,11 +29,11 @@ def parse_due_time(value: float | str | None) -> Optional[int]:
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return int(value)
+        return int(value) if math.isfinite(value) else None
     text = value.strip()
     if not text:
         return None
-    if text.lstrip("-").isdigit():
+    if text.removeprefix("-").isdigit():
         return int(text)
     try:
         parsed = datetime.fromisoformat(text)

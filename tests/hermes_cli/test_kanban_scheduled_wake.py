@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone, UTC
+from datetime import datetime, UTC
 from pathlib import Path
 
 import pytest
@@ -11,6 +11,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.kanban_db_scheduled import parse_due_time
 
 
 @pytest.fixture
@@ -74,3 +75,15 @@ def test_scheduled_until_reason_prefix_sets_the_due_time(kanban_home):
         kbd.dispatch_once(conn)
         assert kb.get_task(conn, due).status == "ready"
         assert kb.get_task(conn, later).status == "scheduled"
+
+
+@pytest.mark.parametrize("value", ["--123", "-", "nan", "inf", "-inf", float("nan"), float("inf")])
+def test_malformed_due_time_parses_to_none(value):
+    assert parse_due_time(value) is None
+
+
+def test_unblock_clears_the_due_time(kanban_home):
+    with kbc.connect() as conn:
+        tid = _scheduled(conn, reason="replay running", until=int(time.time()) + 3600)
+        assert kb.unblock_task(conn, tid) is True
+        assert kb.get_task(conn, tid).scheduled_until is None

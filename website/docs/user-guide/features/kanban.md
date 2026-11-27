@@ -1080,7 +1080,7 @@ kanban:
 
 ### Scheduled cards and their wake time (`scheduled_until`)
 
-A card parked in **Scheduled** (`hermes kanban schedule`, the `kanban_schedule` worker tool, or a dashboard drag) waits on time, not on a human, and the dispatcher never spawns it. Give it a due time and it wakes on its own:
+A card parked in **Scheduled** (`hermes kanban schedule` or the `kanban_schedule` worker tool) waits on time, not on a human, and the dispatcher never spawns it. Give it a due time and it wakes on its own:
 
 ```bash
 hermes kanban schedule t_abc123 "replay still running" --until "2026-06-01T09:00:00-05:00"
