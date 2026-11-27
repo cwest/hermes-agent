@@ -327,6 +327,9 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
         _bulk_ids("schedule"),
+        _arg("--until", help="ISO-8601 wake time; the first dispatcher tick after it returns "
+                             "the task to ready. A leading SCHEDULED_UNTIL=<ISO8601> in the "
+                             "reason does the same. Omit to wait for `unblock`."),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),

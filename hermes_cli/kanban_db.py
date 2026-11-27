@@ -4187,7 +4187,7 @@ from hermes_cli.kanban_db_connect import (
     init_db,
     write_txn,
 )
-from hermes_cli.kanban_db_scheduled import schedule_task, wake_due_scheduled
+from hermes_cli.kanban_db_scheduled import parse_due_time, schedule_task, wake_due_scheduled
 from hermes_cli.kanban_db_workspace import (
     _cleanup_workspace,
     _is_managed_scratch_path,

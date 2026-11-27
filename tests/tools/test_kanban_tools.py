@@ -451,6 +451,7 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
     }
     with kbc.connect() as conn:
         assert kb.get_task(conn, worker_env).status == "scheduled"
+        assert kb.get_task(conn, worker_env).scheduled_until == 1789257600
         run = kb.latest_run(conn, worker_env)
         assert (run.outcome, run.summary) == ("scheduled", reason)
         assert any(
@@ -481,6 +482,20 @@ def test_schedule_rejects_invalid_reason_and_unowned_contexts(monkeypatch, worke
     with kbc.connect() as conn:
         assert kb.get_task(conn, worker_env).status == "running"
         assert kb.get_task(conn, other).status == "ready"
+
+
+def test_schedule_until_arg_sets_due_time_and_rejects_garbage(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    bad = json.loads(kt._handle_schedule({"until": "next tuesday-ish"}))
+    assert "until must be an ISO-8601" in bad["error"]
+    out = json.loads(kt._handle_schedule({"until": "2026-09-13T00:00:00Z", "reason": "replay"}))
+    assert out["status"] == "scheduled"
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.scheduled_until == 1789257600
 
 
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
