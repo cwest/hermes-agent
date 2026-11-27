@@ -1,6 +1,13 @@
 """The ``active_pr`` respawn guard: a ready card whose recent comments carry a live GitHub PR
 URL is held, so the worker that opened the PR does not open a duplicate.
 
+Only a link the card's own worker could have opened counts: a comment authored by a profile the
+card was ever assigned to or that worked one of its runs. Any other author's link (another card's
+worker citing its PR, a triager filing "address the review on PR X", a ``webhook:*`` head-push
+echo of the card's own PR after a review bounce) is a cross-reference, not evidence of an
+interrupted implementer, and spawning the assignee cannot duplicate a PR off it. Without that
+filter a ready card sat held behind such a comment until the PR happened to close.
+
 A handoff after the newest PR comment (operator reassign, reviewer ``changes_requested``,
 review reopen, or a human release of a parked card: unblock, or promote or drag out of
 ``blocked``/``triage``) names the profile that must now work on THAT PR — a closer or the
@@ -55,6 +62,9 @@ def _held_by(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[tuple
                    for t, c in _rows_since(conn, "task_comments", task_id, now - _PR_WINDOW,
                                            cols=", author, body", unreadable=now)]  # duplicate-PR risk: fail closed
     pr_comments = [(t, author, urls) for t, author, urls in pr_comments if urls]
+    if pr_comments:
+        owners = _card_owners(conn, task_id)
+        pr_comments = [c for c in pr_comments if _profile_key(_kb._lossy_text(c[1])) in owners]
     if not pr_comments:
         return None
     newest = max(t for t, _, _ in pr_comments)
@@ -63,6 +73,26 @@ def _held_by(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[tuple
     ordered = sorted(pr_comments, key=lambda c: c[0], reverse=True)
     live = _first_live_pr(url for _, _, urls in ordered for url in reversed(urls))
     return (live, newest) if live else None
+
+
+def _card_owners(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    """Profiles whose own PR a respawn could duplicate: every profile the card was ever assigned
+    to (an unassign or a reassign away can still route it back) and every profile that worked one
+    of its runs. A link any other author posts is a cross-reference to someone else's PR."""
+    names = [r[0] for r in conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ? UNION SELECT profile FROM task_runs WHERE task_id = ?",
+        (task_id, task_id),
+    )]
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('created', 'assigned')", (task_id,),
+    ):
+        payload = _kb._json_dict(row[0])
+        names += [payload.get("assignee"), payload.get("from")]
+    return {key for key in map(_profile_key, names) if key}
+
+
+def _profile_key(name: object) -> Optional[str]:
+    return _kb._canonical_assignee(name) if isinstance(name, str) and name.strip() else None
 
 
 def on_guard(conn: sqlite3.Connection, task_id: str, reason: str) -> bool:
@@ -88,7 +118,8 @@ def _route_stranded(conn: sqlite3.Connection, task_id: str, pr_url: str, pr_at: 
 
     Stranded = the latest run was interrupted after it started (the PR comment came from that
     run's window), no worker process of any run is still alive, and a reviewer other than the
-    assignee is on record. A PR link on a card no run ever worked is left to the guard."""
+    assignee is on record. The assignee's own PR link on a card no run ever worked holds the card
+    but is not routed: a reviewer must not get work nobody did."""
     run = conn.execute(
         "SELECT id, outcome, error, started_at FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC, id DESC LIMIT 1", (task_id,),
