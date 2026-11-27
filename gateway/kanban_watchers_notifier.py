@@ -19,6 +19,7 @@ from agent.i18n import t
 
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
 from gateway.wake import session_owned_by_profile
+from hermes_cli.kanban_db_scheduled import WAKE_SOURCE
 
 
 def _kbc():
@@ -47,7 +48,15 @@ def _pin_first():
 TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
-_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "unblocked")
+
+
+def _wakes(ev) -> bool:
+    """A human ``unblock`` is bookkeeping; a due-time release is the only signal
+    the origin gets that its scheduled card is running again."""
+    if ev.kind == "unblocked":
+        return (ev.payload or {}).get("source") == WAKE_SOURCE
+    return ev.kind in _WAKE_KINDS
 
 
 def diagnostic_event(ev) -> bool:
@@ -485,10 +494,12 @@ def _fmt_timed_out(ev, n) -> tuple:
     return t("gateway.kanban.ping.timed_out", head=n.head, span=span), None, None
 
 
-# archived / unblocked are claimed (so the cursor advances past them) but
-# intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
-# never wake the creator.
+# archived and a human unblock are claimed (so the cursor advances past them)
+# but intentionally silent, and never wake the creator; a due-time release does.
 _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+    "unblocked": lambda ev, n: (
+        t("gateway.kanban.ping.scheduled_wake", head=n.head) if _wakes(ev) else None, None, None,
+    ),
     "completed": _fmt_completed,
     "blocked": lambda ev, n: (
         t("gateway.kanban.ping.blocked", head=n.head, reason=_clip(ev, "reason", "gateway.kanban.ping.reason_suffix", 160)),
@@ -593,7 +604,7 @@ class _KanbanNotification:
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
-        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
+        self.wake_kinds = {ev.kind for ev in self.d["events"] if _wakes(ev)} if self.wake_agent else set()
         self.wake_diagnostic = all(diagnostic_event(ev) for ev in self.d["events"] if ev.kind in self.wake_kinds)
         if not self.wake_kinds:
             return
