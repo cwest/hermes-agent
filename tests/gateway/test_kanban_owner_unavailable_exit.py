@@ -44,7 +44,7 @@ def _store(tmp_path, error):
         raise error
 
     store = RuntimeSessionStore(rpc, {"session_id": "s1", "execution_id": "e1", "epoch": 1, "generation": 1},
-                                tmp_path / "outbox")
+                                tmp_path / "outbox", resend_budget_s=0.0)
     with pytest.raises(type(error)):
         store.try_acquire_session_turn_lease("s1", "holder")
     return store
