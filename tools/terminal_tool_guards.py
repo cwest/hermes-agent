@@ -680,6 +680,20 @@ def self_repo_block(
     return _blocked_json(msg, "blocked")
 
 
+def stray_board_db_block(*, command: str, cwd: str, workdir: Optional[str], session_key: str) -> Optional[str]:
+    """Refuse a sqlite3 open of a missing db under the kanban tree, which would create an empty
+    file the workspace scan reads as a board (see tools/kanban_db_path_guard). Local backend only."""
+    from tools.kanban_db_path_guard import stray_board_db_refusal
+    from tools.terminal_tool import _resolve_command_cwd
+
+    guard_cwd = _resolve_command_cwd(workdir=workdir, default_cwd=cwd, session_key=session_key)
+    reason = stray_board_db_refusal(command, guard_cwd)
+    if reason is None:
+        return None
+    logger.warning("Blocked sqlite3 open of a missing kanban db (command: %s)", _safe_command_preview(command))
+    return _blocked_json(f"Blocked: {reason}", "blocked")
+
+
 def locked_skill_block(*, command: str, cwd: str, workdir: Optional[str], session_key: str) -> Optional[str]:
     """Refuse commands that write into a skill the user locked, change the lock record, or run
     ``hermes curator unlock`` (see tools/skill_lock). Local backend only: a remote or container
