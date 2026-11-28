@@ -66,3 +66,39 @@ async def test_claim_and_verify_do_not_block_the_event_loop(tmp_path, monkeypatc
         child.stdin.close()
         child.wait(timeout=5)
         db.close()
+
+
+class _Stop(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('operation', ['delegation.complete', 'child.reserve'])
+@pytest.mark.parametrize('check', ['_claim', '_verify'])
+async def test_sibling_persist_targets_check_claims_off_the_event_loop(monkeypatch, operation, check):
+    """``delegation.*`` and ``child.reserve`` share the same claim check, so they must offload it too."""
+    from gateway import session_worker
+    from gateway.session_contract import SessionActor, SessionRef
+
+    loop = asyncio.get_running_loop()
+    ran_on_loop = []
+
+    def probe(*_args, **_kwargs):
+        done = threading.Event()
+        loop.call_soon_threadsafe(done.set)
+        ran_on_loop.append(not done.wait(5))
+        raise _Stop
+
+    monkeypatch.setattr(session_worker, '_claim', lambda *_a, **_k: object())
+    monkeypatch.setattr(session_worker, '_verify', lambda *_a, **_k: None)
+    monkeypatch.setattr(session_worker, check, probe)
+    worker = SimpleNamespace(authority=SimpleNamespace(),
+                             actor=SessionActor('human', 'p', frozenset({'worker:adopt'}), 't'))
+    params = {key: 'x' for key in session_worker._SCOPE} | {
+        'epoch': 1, 'sequence': 1, 'operation': operation, 'payload': {}}
+    from gateway.session_worker_child import worker_child_request
+    from gateway.session_worker_delegation import worker_delegation_request
+    handler = worker_child_request if operation == 'child.reserve' else worker_delegation_request
+    with pytest.raises(_Stop):
+        await handler(worker, SessionRef('p', 'owned'), params)
+    assert ran_on_loop == [False]
