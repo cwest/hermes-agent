@@ -450,14 +450,21 @@ jobs:
 
 def test_the_crash_cell_journey_lands_in_the_slice_that_checks_its_manifest():
     """run_tests_parallel partitions from the checkout alone, so the slice holding
-    test_crash_cells.py is fixed; it must be the one the workflow's manifest check runs on."""
+    test_crash_cells.py is fixed; it must be the one the workflow's manifest check runs on.
+    A job that runs one journey file per runner (a ``shard`` matrix) needs no worker cut, so
+    the rewrite leaves it unsliced and its check keeps upstream's per-shard gate."""
     sys.path.insert(0, str(ROOT))
     from scripts.run_tests_parallel import _discover_files, _slice_files
 
     wf = _yaml((ROOT / ".github" / "workflows" / "windows-install-update-e2e.yml").read_text())
     job = wf["jobs"]["install-update"]
-    count = len(job["strategy"]["matrix"]["slice"])
     check = next(s for s in job["steps"] if s["name"] == "Every crash cell ran")
+    matrix = job["strategy"]["matrix"]
+    if "slice" not in matrix:
+        assert "shard" in matrix and "HERMES_TEST_SLICE" not in str(job), job
+        assert check["if"] == "matrix.shard == 'test_crash_cells.py'"
+        return
+    count = len(matrix["slice"])
     picked = re.search(r"-ne '(\d+)/\d+'", check["run"])
     assert picked, check["run"]
     index = int(picked[1])
