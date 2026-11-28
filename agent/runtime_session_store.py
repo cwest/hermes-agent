@@ -16,6 +16,7 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,12 @@ class WorkerPersistenceError(RuntimeError):
 # Sticky store failures that mean the OWNER stopped answering (no receipt in time, no endpoint),
 # not that this worker's writes were refused: the turn failed for a reason outside the card.
 OWNER_SIDE_FAILURES = frozenset({'worker_receipt_timeout', 'owner_unavailable'})
+
+
+# How long a journaled write keeps being resent after its receipt is lost: past the owner's 60 s
+# transcript write patience, so a write the owner is still allowed to finish is never given up on.
+_RECEIPT_RESEND_BUDGET_S = 90.0
+_RECEIPT_RESEND_PAUSE_S = 1.0
 
 
 def owner_side_failure(store) -> bool:
@@ -233,10 +240,12 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     # The process's async-delegation ledger belongs to the adopted execution, never a reserved child.
     binds_delegation_ledger = True
 
-    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024):
+    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024,
+                 resend_budget_s=_RECEIPT_RESEND_BUDGET_S):
         self.rpc = rpc
         self.scope = dict(scope)
         self.max_bytes = max_bytes
+        self.resend_budget_s = resend_budget_s
         self.lock = threading.RLock()
         self.failure = None
         self.path = Path(outbox_dir) / 'pending.json'
@@ -346,7 +355,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             try:
                 while self.journal['pending']:
                     entry = self.journal['pending'][0]
-                    result = self.rpc('worker.persist', **self.scope, **entry)
+                    result = self._send_pending(entry)
                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
                     candidate = self._compression_receipt_journal(candidate, result)
                     self._save(candidate)
@@ -358,6 +367,27 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 raise
             self.failure = None
             return results
+
+    def _send_pending(self, entry):
+        """Send one journaled entry; on a lost receipt, resend the same entry until the budget runs out.
+
+        A late receipt (the owner's loop stalled, or its write queued behind another writer inside the
+        owner's own 60 s transcript patience) or a dropped connection leaves the outcome unknown, and
+        the owner settles an exact (execution, sequence, digest) resend by returning the stored receipt.
+        An owner refusal (``WorkerPersistenceError``) is final and is never resent.
+        """
+        from websockets.exceptions import ConnectionClosed
+        deadline = time.monotonic() + self.resend_budget_s
+        while True:
+            try:
+                return self.rpc('worker.persist', **self.scope, **entry)
+            except (TimeoutError, ConnectionClosed) as exc:
+                lost = isinstance(exc, ConnectionClosed) or str(exc) == 'worker_receipt_timeout'
+                if not lost or time.monotonic() >= deadline:
+                    raise
+                logger.warning('worker.persist sequence %s: %s; resending the same entry',
+                               entry['sequence'], exc or type(exc).__name__)
+                time.sleep(min(_RECEIPT_RESEND_PAUSE_S, max(0.0, deadline - time.monotonic())))
 
     def adopt(self, epoch):
         """Install only a separately verified worker.adopt result; never self-adopt."""
