@@ -44,6 +44,13 @@ def test_refuses_a_home_relative_spelling(kanban_root, monkeypatch):
     for spelling in ("~/home", "$HOME/home", "${HOME}/home"):
         command = f"sqlite3 {spelling}/kanban/boards/default/kanban.db .tables"
         assert stray_board_db_refusal(command, "/") is not None, spelling
+    # An inline-Python probe that builds the path with expanduser.
+    probe = (
+        'python -c "\nimport sqlite3,os\n'
+        "p=os.path.expanduser('~/home/kanban/boards/default/kanban.db')\n"
+        "c=sqlite3.connect(p);print(c.execute('select id from tasks').fetchall())\""
+    )
+    assert stray_board_db_refusal(probe, "/") is not None
 
 
 @pytest.mark.parametrize("command", [
