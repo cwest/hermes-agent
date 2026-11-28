@@ -16,10 +16,11 @@ import os
 import re
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs
 
 _SQLITE_RE = re.compile(r"\bsqlite3?\b", re.IGNORECASE)
 # A path-like run ending in ``.db``. ``kanban.db-wal`` and ``kanban.db.init.lock`` don't match.
-_DB_PATH_RE = re.compile(r"""(?P<path>[^\s'"`;|&()<>=:,]+\.db)(?![\w.-])(?P<query>\?[^\s'"`;|&()<>]*)?""")
+_DB_PATH_RE = re.compile(r"""(?P<path>[^\s'"`;|&()<>=:,]+\.db)(?![\w.-])(?P<query>\?[^\s'"`;|()<>]*)?""")
 
 
 def _expand(raw: str) -> Optional[str]:
@@ -40,20 +41,36 @@ def _kanban_paths() -> tuple[Path, Path]:
     return home / "kanban.db", home / "kanban"
 
 
+def _is_board_level(path: Path, default_db: Path, tree: Path) -> bool:
+    # Only where a board db lives or gets guessed: <home>/kanban.db, <home>/kanban/*.db,
+    # <home>/kanban/boards/*.db and <home>/kanban/boards/<slug>/*.db. A task workspace
+    # under workspaces/ is the task's own tree, where a new db is legitimate.
+    boards = tree / "boards"
+    return (
+        path == default_db
+        or path.parent in (tree, boards)
+        or path.parent.parent == boards
+    )
+
+
+def _is_read_only_uri(query: Optional[str]) -> bool:
+    return "ro" in parse_qs((query or "").lstrip("?")).get("mode", [])
+
+
 def stray_board_db_refusal(command: str, cwd: str) -> Optional[str]:
-    """Refusal text when *command* would open a missing ``*.db`` under the kanban tree."""
+    """Refusal text when *command* would open a missing ``*.db`` where a board db would live."""
     if not command or not _SQLITE_RE.search(command):
         return None
     default_db, tree = _kanban_paths()
     for match in _DB_PATH_RE.finditer(command):
-        if "mode=ro" in (match.group("query") or ""):
+        if _is_read_only_uri(match.group("query")):
             continue  # a read-only URI open fails on a missing path instead of creating it
         raw = _expand(match.group("path"))
         if raw is None:
             continue
         path = Path(cwd or os.getcwd(), raw) if not os.path.isabs(raw) else Path(raw)
         path = path.resolve(strict=False)
-        if path != default_db and not path.is_relative_to(tree):
+        if not _is_board_level(path, default_db, tree):
             continue
         if path.exists():
             continue

@@ -71,6 +71,40 @@ def test_lets_safe_commands_through(kanban_root, command):
     assert stray_board_db_refusal(command.format(home=kanban_root), str(kanban_root)) is None
 
 
+@pytest.mark.parametrize("workspace", [
+    ("kanban", "workspaces", "t_demo"),
+    ("kanban", "boards", "ops", "workspaces", "t_demo"),
+    ("kanban", "boards", "default", "workspaces", "t_demo", "nested"),
+])
+@pytest.mark.parametrize("command", [
+    "sqlite3 test.db 'create table t(x)'",
+    "python3 -c \"import sqlite3; sqlite3.connect('app.db')\"",
+])
+def test_a_new_db_inside_a_task_workspace_is_allowed(kanban_root, workspace, command):
+    cwd = kanban_root.joinpath(*workspace)
+    cwd.mkdir(parents=True)
+    assert stray_board_db_refusal(command, str(cwd)) is None
+    assert stray_board_db_refusal(command.replace("test.db", f"{cwd}/test.db")
+                                  .replace("app.db", f"{cwd}/app.db"), "/") is None
+
+
+def test_a_multi_parameter_read_only_uri_is_allowed(kanban_root):
+    command = ("python3 -c \"import sqlite3;sqlite3.connect("
+               "'file:{home}/kanban/default.db?cache=shared&mode=ro', uri=True)\"")
+    assert stray_board_db_refusal(command.format(home=kanban_root), "/") is None
+
+
+def test_a_read_write_uri_is_still_refused(kanban_root):
+    command = ("python3 -c \"import sqlite3;sqlite3.connect("
+               "'file:{home}/kanban/default.db?cache=shared&mode=rwc', uri=True)\"")
+    assert stray_board_db_refusal(command.format(home=kanban_root), "/") is not None
+
+
+def test_a_missing_db_directly_under_boards_is_refused(kanban_root):
+    command = f"sqlite3 {kanban_root}/kanban/boards/default.db .tables"
+    assert stray_board_db_refusal(command, "/") is not None
+
+
 def test_an_existing_named_board_db_is_allowed(kanban_root):
     board_db = kanban_root / "kanban" / "boards" / "ops" / "kanban.db"
     board_db.parent.mkdir(parents=True)
