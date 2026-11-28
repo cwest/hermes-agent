@@ -126,7 +126,8 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     ``kanban_db_path`` follows ``HERMES_KANBAN_DB`` and would collapse every
     slug onto the pinned file, so the scan uses the on-disk layout: the
     default board at ``<home>/kanban.db`` and named boards at
-    ``<home>/kanban/boards/<slug>/kanban.db``.
+    ``<home>/kanban/boards/<slug>/kanban.db``. ``boards/default/`` holds only
+    metadata, so a ``kanban.db`` found there is a stray file, not a board.
     """
     from hermes_cli.kanban_db_connect import _main_db_file  # late: import cycle
 
@@ -136,7 +137,7 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     root = _kb.boards_root()
     if root.is_dir():
         for child in root.iterdir():
-            if child.is_dir():
+            if child.is_dir() and child.name != _kb.DEFAULT_BOARD:
                 candidates.append(child / "kanban.db")
     found: list[Path] = []
     seen: set[Path] = set()
@@ -158,6 +159,12 @@ def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
+        # No tasks table (e.g. a 0-byte file) means no task can use the path.
+        # A file that is not a database still raises and fails closed.
+        if other.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'"
+        ).fetchone() is None:
+            return False
         return _conn_uses_path(other, task_id, key, exclude_task_id=False)
     finally:
         other.close()

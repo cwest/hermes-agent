@@ -221,3 +221,52 @@ def test_cleanup_workspace_keeps_scratch_when_other_boards_cannot_be_listed(boar
         kbw._cleanup_workspace(conn, archived)
         assert _deferred_reasons(conn, archived) == ["shared", "shared", "unknown"]
     assert (shared / "note.txt").read_text(encoding="utf-8") == "still needed"
+
+
+def _archived_scratch_on_default() -> tuple[str, Path]:
+    ws = kb.workspaces_root() / "reapable"
+    ws.mkdir(parents=True)
+    (ws / "note.txt").write_text("done with", encoding="utf-8")
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="archived on default")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='archived', workspace_kind='scratch', "
+                "workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+    return tid, ws
+
+
+@pytest.mark.parametrize("slug", ["default", "stub"])
+def test_cleanup_workspace_ignores_an_empty_sibling_board_db(board, caplog, slug):
+    """A 0-byte ``boards/<slug>/kanban.db`` (the sqlite3 CLI leaves one behind
+    when it opens a missing path) has no ``tasks`` table, so it cannot hold a
+    workspace. ``default`` keeps its DB at ``<home>/kanban.db``; its board dir
+    is metadata only and is never a sibling."""
+    from hermes_cli import kanban_db_workspace as kbw
+
+    stub = kb.boards_root() / slug / "kanban.db"
+    stub.parent.mkdir(parents=True)
+    stub.touch()
+    tid, ws = _archived_scratch_on_default()
+    with kbc.connect_closing() as conn:
+        kbw._cleanup_workspace(conn, tid)
+        assert _deferred_reasons(conn, tid) == []
+    assert not ws.exists()
+    assert "Cannot read board db" not in caplog.text
+    assert stub.stat().st_size == 0
+
+
+def test_cleanup_workspace_still_refuses_on_a_corrupt_sibling_board_db(board):
+    """An unreadable board DB is not the same as an empty one: fail closed."""
+    from hermes_cli import kanban_db_workspace as kbw
+
+    bad = kb.boards_root() / "broken" / "kanban.db"
+    bad.parent.mkdir(parents=True)
+    bad.write_bytes(b"not a sqlite database" * 64)
+    tid, ws = _archived_scratch_on_default()
+    with kbc.connect_closing() as conn:
+        kbw._cleanup_workspace(conn, tid)
+        assert _deferred_reasons(conn, tid) == ["unknown"]
+    assert (ws / "note.txt").exists()
